@@ -14,6 +14,9 @@ extern volatile bool tdeck_prog_mode;
 extern volatile bool tdeck_prog_key_exit;
 // While the screen is dark/locked, a keypress requests a wake (alternate to trackball).
 extern volatile bool tdeck_wake_request;
+// Alt+C on the T-Deck keyboard emits a dedicated byte (0x0C, see the C3 keyboard firmware):
+// a touch-independent request to (re)run screen calibration, handled by the launcher's poll.
+extern volatile bool tdeck_calib_request;
 
 I2CKeyboardInputDriver::KeyboardList I2CKeyboardInputDriver::i2cKeyboardList;
 
@@ -46,6 +49,16 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
     for (auto &keyboardDef : i2cKeyboardList) {
         keyboardDef->driver->readKeyboard(keyboardDef->address, indev, data);
         if (data->state == LV_INDEV_STATE_PRESSED) {
+            // Alt+C (the T-Deck keyboard firmware emits 0x0C for this exact combo) requests screen
+            // calibration — a keyboard escape hatch for when the touchscreen is miscalibrated. Only
+            // acted on while the screen is awake (not gated); the launcher poll runs it from the
+            // lock pad. Swallow the byte so it never types onto the UI.
+            if (data->key == 0x0C && !tdeck_input_gated) {
+                tdeck_calib_request = true;
+                data->state = LV_INDEV_STATE_RELEASED;
+                data->key = 0;
+                break;
+            }
             // In programming mode, any key requests an exit (see the poll timer in
             // enterProgrammingMode) — a reliable escape that doesn't rely on the touchscreen.
             if (tdeck_prog_mode)
@@ -55,6 +68,18 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // so we record the request and swallow the key below.
             if (tdeck_input_gated) {
                 tdeck_wake_request = true;
+                break;
+            }
+            // Keys belong to the screen the user is looking at. The keyboard group's focused
+            // object can linger on ANOTHER screen (e.g. the Meshtastic chat input stays focused
+            // after leaving the Mesh app), so typing on the lock pad or launcher would silently
+            // land in that chat box. Swallow any key whose focused target isn't on the screen
+            // that's actually on display.
+            lv_group_t *grp = lv_indev_get_group(indev);
+            lv_obj_t *focused = grp ? lv_group_get_focused(grp) : NULL;
+            if (focused && lv_obj_get_screen(focused) != lv_screen_active()) {
+                data->state = LV_INDEV_STATE_RELEASED;
+                data->key = 0;
                 break;
             }
             // If any keyboard reports a key press, we stop reading further

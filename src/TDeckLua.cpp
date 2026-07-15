@@ -21,10 +21,13 @@ extern "C" {
 #include "lauxlib.h"
 }
 
-// --- bridges into the device-ui side (drawing) --------------------------------
+// --- bridges into the device-ui side (drawing + the app-folder file store) -----
 extern "C" void tdeck_ui_label(int id, int x, int y, const char *text, uint32_t color);
-extern "C" void tdeck_ui_box(int id, int x, int y, int w, int h, uint32_t color);
+extern "C" void tdeck_ui_box(int id, int x, int y, int w, int h, uint32_t color, int radius);
+extern "C" void tdeck_ui_line(int id, int x1, int y1, int x2, int y2, int thickness, uint32_t color);
 extern "C" void tdeck_ui_hide(int id);
+extern "C" int tdeck_appfs_read(const char *name, char *buf, int cap);
+extern "C" bool tdeck_appfs_write(const char *name, const char *data, int len);
 // --- other firmware helpers ---------------------------------------------------
 void playBeep();                              // buzz.cpp (C++ linkage)
 extern "C" void tdeck_beep_gain(float gain);  // TDeckBeep.cpp — temporarily boost buzzer volume
@@ -66,7 +69,50 @@ static int api_screen_box(lua_State *L)
     int w = (int)luaL_checkinteger(L, 4);
     int h = (int)luaL_checkinteger(L, 5);
     uint32_t color = (uint32_t)luaL_optinteger(L, 6, 0xFFFFFF);
-    tdeck_ui_box(id, x, y, w, h, color);
+    int radius = (int)luaL_optinteger(L, 7, 4); // pass w (or more) with w==h for a circle
+    tdeck_ui_box(id, x, y, w, h, color, radius);
+    return 0;
+}
+
+// store.read(name) -> file contents as a string, or nil if it doesn't exist.
+// Jailed to the app's own /apps/<name>/ folder (enforced device-ui side).
+static int api_store_read(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    static char buf[4096];
+    int n = tdeck_appfs_read(name, buf, sizeof(buf));
+    if (n < 0)
+        lua_pushnil(L);
+    else
+        lua_pushlstring(L, buf, (size_t)n);
+    return 1;
+}
+
+// store.write(name, content) -> true/false. Content capped at 4KB.
+static int api_store_write(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    size_t len = 0;
+    const char *data = luaL_checklstring(L, 2, &len);
+    if (len > 4096) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    lua_pushboolean(L, tdeck_appfs_write(name, data, (int)len));
+    return 1;
+}
+
+// screen.line(id, x1, y1, x2, y2, thickness, color) — an angled thick bar.
+static int api_screen_line(lua_State *L)
+{
+    int id = (int)luaL_checkinteger(L, 1);
+    int x1 = (int)luaL_checkinteger(L, 2);
+    int y1 = (int)luaL_checkinteger(L, 3);
+    int x2 = (int)luaL_checkinteger(L, 4);
+    int y2 = (int)luaL_checkinteger(L, 5);
+    int thickness = (int)luaL_optinteger(L, 6, 4);
+    uint32_t color = (uint32_t)luaL_optinteger(L, 7, 0xFFFFFF);
+    tdeck_ui_line(id, x1, y1, x2, y2, thickness, color);
     return 0;
 }
 
@@ -132,13 +178,19 @@ extern "C" int tdeck_lua_app_start(const char *script)
     luaL_requiref(AppL, LUA_TABLIBNAME, luaopen_table, 1);
     lua_pop(AppL, 1);
 
-    static const luaL_Reg screenLib[] = {
-        {"label", api_screen_label}, {"box", api_screen_box}, {"hide", api_screen_hide}, {nullptr, nullptr}};
+    static const luaL_Reg screenLib[] = {{"label", api_screen_label},
+                                         {"box", api_screen_box},
+                                         {"line", api_screen_line},
+                                         {"hide", api_screen_hide},
+                                         {nullptr, nullptr}};
     static const luaL_Reg deviceLib[] = {{"beep", api_device_beep}, {"time", api_device_time}, {nullptr, nullptr}};
+    static const luaL_Reg storeLib[] = {{"read", api_store_read}, {"write", api_store_write}, {nullptr, nullptr}};
     luaL_newlib(AppL, screenLib);
     lua_setglobal(AppL, "screen");
     luaL_newlib(AppL, deviceLib);
     lua_setglobal(AppL, "device");
+    luaL_newlib(AppL, storeLib);
+    lua_setglobal(AppL, "store");
 
     if (luaL_dostring(AppL, script) != LUA_OK) {
         lua_close(AppL);

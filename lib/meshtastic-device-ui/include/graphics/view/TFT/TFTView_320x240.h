@@ -323,12 +323,15 @@ class TFTView_320x240 : public MeshtasticView
     void createSettingsScreen(void);
     void openSettings(void);
     void setMeshEnabled(bool on);
-    void setGpsEnabled(bool on);             // Settings: GPS on / off (off saves battery)
-    void cycleGpsInterval(void);             // Settings: cycle how often the GPS checks (live, no reboot)
-    void updateGpsIntervalLabel(void);       // refresh that button's label from the current config
+    void setGpsEnabled(bool on);             // Settings: GPS on (= always searching) / off (saves battery)
     lv_obj_t *gps_switch = nullptr;          // the on/off switch on the settings screen
-    lv_obj_t *gps_interval_btn = nullptr;    // "Check every" cycle button
-    lv_obj_t *gps_interval_label = nullptr;
+    void cycleLocPrecision(void);            // Settings: how exactly others see you (Exact/Rough/Off)
+    void updateLocPrecisionLabel(void);      // refresh that button's label from the channel config
+    lv_obj_t *loc_precision_label = nullptr; // "Share location" cycle-button label
+    lv_obj_t *timeout_btn_label = nullptr;   // "Screen timeout" cycle-button label
+    lv_obj_t *mute_switch = nullptr;         // "Sound" on/off (mutes game/timer beeps)
+    void cycleScreenTimeout(void);           // advance to the next timeout choice + persist
+    void updateTimeoutBtnLabel(void);        // refresh the cycle-button text
     bool gpsEnabled = true;                  // single source of truth for the GPS toggle
     bool meshEnabled = true;                 // single source of truth (toggle + status icon read this)
     lv_obj_t *settings_screen = nullptr;
@@ -371,6 +374,7 @@ class TFTView_320x240 : public MeshtasticView
     // top-bar battery % (fed by updateMetrics for the own node) + paged 2x3 app grid
     lv_obj_t *launcher_battery_label = nullptr;
     lv_obj_t *launcher_mem_label = nullptr;  // diagnostic: free RAM + lowest-since-boot
+    lv_obj_t *launcher_unread_label = nullptr; // top-bar unread-message count, next to "mesh"
     lv_obj_t *launcher_pager = nullptr;      // horizontal snap-scroll container of app pages
     lv_obj_t *launcher_dots = nullptr;       // page indicator dots (only if >1 page)
     int launcherBatPct = -1;                 // last known battery %, -1 = unknown yet
@@ -384,6 +388,7 @@ class TFTView_320x240 : public MeshtasticView
     void handleHomeGesture(void);            // runs on every trackball double-click
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
+    void startCalibrationFromLock(void);     // Alt+C from the pad: run touch calibration, then re-lock
     void submitLockPad(void);                // OK pressed on the pad
     void updateLockDisplay(void);            // refresh the masked digits label
     uint32_t effectiveLockPin(void);         // stored PIN, or the 7272 default when unset
@@ -391,6 +396,7 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *lockpad_screen = nullptr;
     lv_obj_t *lock_digits_label = nullptr;
     lv_obj_t *lock_title_label = nullptr;
+    lv_obj_t *lockpad_unread_label = nullptr; // top-left unread count, mirrors the launcher's
     char lockDigits[9] = {};                 // digits typed on the pad (max 8)
     uint8_t lockLen = 0;
     bool lockSetMode = false;                // true = pad is choosing a NEW pin

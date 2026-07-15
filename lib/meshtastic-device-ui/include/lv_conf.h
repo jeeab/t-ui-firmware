@@ -529,7 +529,8 @@
 #define LV_FONT_CUSTOM_DECLARE LV_FONT_DECLARE(ui_font_montserrat_12) LV_FONT_DECLARE(ui_font_montserrat_14) LV_FONT_DECLARE(ui_font_montserrat_16) LV_FONT_DECLARE(ui_font_montserrat_20)
 
 /*Always set a default font*/
-#define LV_FONT_DEFAULT &ui_font_montserrat_14
+// T-UI: bumped 14 -> 16 (Jake wanted the general font slightly larger; same Montserrat family)
+#define LV_FONT_DEFAULT &ui_font_montserrat_16
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.

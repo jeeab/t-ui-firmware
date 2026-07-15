@@ -126,6 +126,8 @@ void playTones(const ToneDuration *tone_durations, int size)
     }
 }
 
+// (T-UI's Settings "Sound" toggle now drives config.device.buzzer_mode — see TDeckBeep.cpp —
+// which playTones above already honors, so no extra gate is needed here.)
 void playBeep()
 {
     ToneDuration melody[] = {{NOTE_B3, DURATION_1_16}};

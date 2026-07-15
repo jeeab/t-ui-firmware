@@ -126,6 +126,10 @@ extern "C" const char *tdeck_prev_reason_str(void);
 extern "C" bool tdeck_prev_reason_bad(void);
 extern "C" uint32_t tdeck_prev_psram_low(void);
 extern "C" uint32_t tdeck_prev_heap_low(void);
+// Sound toggle (TDeckBeep.cpp): drives Meshtastic's buzzer_mode — one switch for game/timer
+// beeps AND message-notification sounds. Persists in the device config (no reboot).
+extern "C" bool tdeck_sound_get_enabled(void);
+extern "C" void tdeck_sound_set_enabled(bool on);
 #if defined(INPUTDRIVER_ENCODER_TYPE)
 // Set by the trackball driver on a double-click; polled by the launcher to go Home.
 extern volatile bool tb_home_request;
@@ -144,6 +148,10 @@ volatile bool tdeck_prog_key_exit = false; // a keypress in programming mode req
 //  Polled alongside the trackball double-click so the keyboard is an alternate, more reliable
 //  wake (the trackball button is stiff in Jake's 3D case). Wakes + shows the PIN pad, same path.
 volatile bool tdeck_wake_request = false;
+//  tdeck_calib_request -> Alt+C was pressed (keyboard emits 0x0C). Polled by the launcher to run
+//  touch-screen calibration from the lock pad — a touch-independent fix when the screen is
+//  miscalibrated (set by the keyboard driver, see I2CKeyboardInputDriver.cpp).
+volatile bool tdeck_calib_request = false;
 
 #define LV_COLOR_HEX(C)                                                                                                          \
     {                                                                                                                            \
@@ -614,7 +622,8 @@ void TFTView_320x240::createLauncher(void)
     lv_label_set_text(launcher_mem_label, "T-Deck");
     lv_obj_set_style_text_color(launcher_mem_label, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_set_style_text_font(launcher_mem_label, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_align(launcher_mem_label, LV_ALIGN_TOP_MID, 0, 6);
+    // Offset right of center: leaves room on the left for the unread-message count near "mesh".
+    lv_obj_align(launcher_mem_label, LV_ALIGN_TOP_MID, 40, 6);
     // Tap the readout for a full, readable diagnostics popup (the top-bar text is
     // cramped; this is the "hard to see the numbers" fix).
     lv_obj_add_flag(launcher_mem_label, LV_OBJ_FLAG_CLICKABLE);
@@ -635,9 +644,10 @@ void TFTView_320x240::createLauncher(void)
                          (unsigned long)(tdeck_prev_psram_low() / 1024));
                 lv_obj_set_style_text_color(THIS->launcher_mem_label, lv_color_hex(0xff453a), LV_PART_MAIN);
             } else {
-                snprintf(buf, sizeof(buf), "ram %luk/%luk  ps %luk/%luk",
-                         (unsigned long)(tdeck_free_heap() / 1024), (unsigned long)(tdeck_min_free_heap() / 1024),
-                         (unsigned long)(tdeck_free_psram() / 1024), (unsigned long)(tdeck_min_free_psram() / 1024));
+                // Fast RAM only (free / lowest-since-boot). PSRAM was dropped from the top bar to
+                // make room for the unread-message count; it's still in the tap-to-open diagnostics.
+                snprintf(buf, sizeof(buf), "ram %luk/%luk", (unsigned long)(tdeck_free_heap() / 1024),
+                         (unsigned long)(tdeck_min_free_heap() / 1024));
                 lv_obj_set_style_text_color(THIS->launcher_mem_label, lv_color_hex(0xffffff), LV_PART_MAIN);
             }
             lv_label_set_text(THIS->launcher_mem_label, buf);
@@ -657,6 +667,16 @@ void TFTView_320x240::createLauncher(void)
     lv_label_set_text(mstatus, "mesh");
     lv_obj_set_style_text_color(mstatus, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align_to(mstatus, mesh_status_icon, LV_ALIGN_OUT_RIGHT_MID, 5, 0);
+
+    // Unread-message count, sitting just right of "mesh". Green so a new message stands out; blank
+    // when there are none. Fed by updateUnreadMessages() (incremented on arrival, cleared to 0 the
+    // moment the messages are opened — so checking your messages clears this count).
+    launcher_unread_label = lv_label_create(launcher_screen);
+    lv_obj_set_style_text_color(launcher_unread_label, lv_color_hex(0x30d158), LV_PART_MAIN);
+    lv_obj_set_style_text_font(launcher_unread_label, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align_to(launcher_unread_label, mesh_status_icon, LV_ALIGN_OUT_RIGHT_MID, 50, 0);
+    lv_label_set_text(launcher_unread_label, "");
+    updateUnreadMessages(); // reflect any count that already accrued before the grid was built
 
     // battery percentage (top-right); fed by updateMetrics()->updateLauncherBattery().
     launcher_battery_label = lv_label_create(launcher_screen);
@@ -703,6 +723,20 @@ void TFTView_320x240::createLauncher(void)
         },
         60, NULL);
 #endif
+
+    // Poll the Alt+C calibration request (keyboard-driven, so NOT gated on the trackball). When the
+    // lock pad is up, Alt+C runs touch calibration then re-shows the pad — a reliable way to fix a
+    // miscalibrated screen without needing a working touch to reach Settings.
+    lv_timer_create(
+        [](lv_timer_t *) {
+            if (!tdeck_calib_request)
+                return;
+            tdeck_calib_request = false;
+            // Only from the lock pad (the requested entry point, and the first screen after a wake).
+            if (THIS->lockpad_screen && lv_screen_active() == THIS->lockpad_screen)
+                THIS->startCalibrationFromLock();
+        },
+        60, NULL);
 
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
     // The SD card often isn't mounted yet the instant the grid first builds — which leaves
@@ -1150,7 +1184,7 @@ void TFTView_320x240::setMeshEnabled(bool on)
 }
 
 /**
- * @brief The GPS on/off switch. On = GPS searching on its "Check every" schedule
+ * @brief The GPS on/off switch. On = GPS always searching (continuous)
  *        (Continuous = always looking); off = GPS powered down (saves battery).
  *        Applied live in the firmware via the control bridge — no reboot. Keeps the
  *        local config mirror in sync so the Maps "N sats / GPS off" readout stays correct.
@@ -1158,11 +1192,15 @@ void TFTView_320x240::setMeshEnabled(bool on)
 void TFTView_320x240::setGpsEnabled(bool on)
 {
     gpsEnabled = on;
-    tdeck_gps_set_enabled(on); // enable/disable the GPS driver in the firmware (deferred, no reboot)
+    if (on)
+        tdeck_gps_set_interval(10); // <= the driver's always-on threshold: on means ALWAYS searching
+    tdeck_gps_set_enabled(on);      // enable/disable the GPS driver in the firmware (deferred, no reboot)
 
     // Mirror the firmware config locally so the Maps screen and switch don't drift.
     db.config.position.gps_mode = on ? meshtastic_Config_PositionConfig_GpsMode_ENABLED
                                      : meshtastic_Config_PositionConfig_GpsMode_DISABLED;
+    if (on)
+        db.config.position.gps_update_interval = 10;
 
     if (gps_switch) {
         if (on)
@@ -1233,6 +1271,9 @@ void TFTView_320x240::createSettingsScreen(void)
         LV_EVENT_VALUE_CHANGED, NULL);
 
     lv_obj_t *hint = lv_label_create(settings_screen);
+    lv_obj_set_width(hint, 288);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(hint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(hint, "Off = radio parked, no messages");
     lv_obj_set_style_text_color(hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 16, 76);
@@ -1254,6 +1295,9 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_center(pinBtnLbl);
 
     lv_obj_t *pinHint = lv_label_create(settings_screen);
+    lv_obj_set_width(pinHint, 288);
+    lv_label_set_long_mode(pinHint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(pinHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(pinHint, "Lock: double-click on Home. Default 1234");
     lv_obj_set_style_text_color(pinHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(pinHint, LV_ALIGN_TOP_LEFT, 16, 136);
@@ -1285,7 +1329,7 @@ void TFTView_320x240::createSettingsScreen(void)
         },
         LV_EVENT_ALL, NULL);
 
-    // "GPS" row — on = searching on the "Check every" schedule; off = powered down
+    // "GPS" row — on = always searching (continuous); off = powered down
     lv_obj_t *gpsLbl = lv_label_create(settings_screen);
     lv_label_set_text(gpsLbl, "GPS");
     lv_obj_set_style_text_color(gpsLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
@@ -1306,28 +1350,31 @@ void TFTView_320x240::createSettingsScreen(void)
         },
         LV_EVENT_VALUE_CHANGED, NULL);
 
-    // "Check every" row — how often the GPS looks for your location (live, no reboot)
-    lv_obj_t *gpsIntLbl = lv_label_create(settings_screen);
-    lv_label_set_text(gpsIntLbl, "Check every");
-    lv_obj_set_style_text_color(gpsIntLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(gpsIntLbl, LV_ALIGN_TOP_LEFT, 16, 240);
+    // "Share location" row — Meshtastic's own per-channel position precision (primary channel).
+    // Exact = 32 bits, Rough = 13 (~1.5 km area, the Meshtastic default), Off = never send.
+    // On public-key channels the firmware itself clamps anything finer than ~350 m — rule kept.
+    lv_obj_t *locLbl = lv_label_create(settings_screen);
+    lv_label_set_text(locLbl, "Share location");
+    lv_obj_set_style_text_color(locLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 240);
 
-    gps_interval_btn = lv_btn_create(settings_screen);
-    lv_obj_set_size(gps_interval_btn, 112, 32);
-    lv_obj_align(gps_interval_btn, LV_ALIGN_TOP_RIGHT, -16, 234);
-    lv_obj_set_style_radius(gps_interval_btn, 8, LV_PART_MAIN);
+    lv_obj_t *locBtn = lv_btn_create(settings_screen);
+    lv_obj_set_size(locBtn, 112, 32);
+    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 234);
+    lv_obj_set_style_radius(locBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
-        gps_interval_btn, [](lv_event_t *e) { THIS->cycleGpsInterval(); }, LV_EVENT_CLICKED, NULL);
-    gps_interval_label = lv_label_create(gps_interval_btn);
-    lv_obj_center(gps_interval_label);
-    updateGpsIntervalLabel();
+        locBtn, [](lv_event_t *) { THIS->cycleLocPrecision(); }, LV_EVENT_CLICKED, NULL);
+    loc_precision_label = lv_label_create(locBtn);
+    lv_obj_center(loc_precision_label);
+    updateLocPrecisionLabel();
 
     lv_obj_t *gpsHint = lv_label_create(settings_screen);
     lv_obj_set_width(gpsHint, 288); // bounded + wrapped so it never runs off-screen
     lv_label_set_long_mode(gpsHint, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(gpsHint, "Continuous = always looking. Uses the most battery.");
+    lv_obj_set_style_text_font(gpsHint, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(gpsHint, "GPS on = always searching, even while asleep. Share location = how exactly others on the mesh see you.");
     lv_obj_set_style_text_color(gpsHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 274);
+    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 276);
 
     // ---- WiFi section ----
     lv_obj_t *wifiHdr = lv_label_create(settings_screen);
@@ -1397,6 +1444,9 @@ void TFTView_320x240::createSettingsScreen(void)
     updateWifiStatus();
 
     lv_obj_t *wifiHint = lv_label_create(settings_screen);
+    lv_obj_set_width(wifiHint, 288);
+    lv_label_set_long_mode(wifiHint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(wifiHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(wifiHint, "Set the name + password, then turn WiFi on.\nIt restarts the device and pauses Bluetooth.");
     lv_obj_set_style_text_color(wifiHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 472);
@@ -1420,10 +1470,54 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(shareBtnLbl, "Open");
     lv_obj_center(shareBtnLbl);
 
+    // "Screen timeout" row — how long until the screen dims to dark (then PIN to wake).
+    // Cycle button; persists in uiConfig like brightness.
+    lv_obj_t *toLbl = lv_label_create(settings_screen);
+    lv_label_set_text(toLbl, "Screen timeout");
+    lv_obj_set_style_text_color(toLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 554);
+
+    lv_obj_t *toBtn = lv_btn_create(settings_screen);
+    lv_obj_set_size(toBtn, 112, 32);
+    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 548);
+    lv_obj_set_style_radius(toBtn, 8, LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        toBtn, [](lv_event_t *) { THIS->cycleScreenTimeout(); }, LV_EVENT_CLICKED, NULL);
+    timeout_btn_label = lv_label_create(toBtn);
+    lv_obj_center(timeout_btn_label);
+    updateTimeoutBtnLabel();
+
+    // "Sound" row — off = mute the beeps (games, metronome, timer alarm, Lua apps).
+    lv_obj_t *sndLbl = lv_label_create(settings_screen);
+    lv_label_set_text(sndLbl, "Sound");
+    lv_obj_set_style_text_color(sndLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 596);
+
+    mute_switch = lv_switch_create(settings_screen);
+    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 590);
+    if (tdeck_sound_get_enabled())
+        lv_obj_add_state(mute_switch, LV_STATE_CHECKED); // switch ON = sound ON
+    lv_obj_add_event_cb(
+        mute_switch,
+        [](lv_event_t *e) {
+            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+            // drives Meshtastic's own buzzer_mode: covers game/timer beeps AND message alerts
+            tdeck_sound_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *sndHint = lv_label_create(settings_screen);
+    lv_obj_set_width(sndHint, 288);
+    lv_label_set_long_mode(sndHint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(sndHint, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(sndHint, "Off = silence everything, including message alerts.");
+    lv_obj_set_style_text_color(sndHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 624);
+
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 552);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 662);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -1576,43 +1670,64 @@ void TFTView_320x240::closeFileShare(void)
     fileshare_ftp_up = false;
 }
 
-// GPS check-frequency presets (seconds) + display names. "Continuous" (<= the driver's
-// 10s always-on threshold) keeps the receiver awake and always looking; the longer
-// presets let the GPS chip nap between checks to save battery. Applied live via the
-// TDeckGpsControl bridge — unlike the admin config path, no reboot.
-namespace {
-const uint32_t kGpsSecs[] = {10, 60, 300, 900, 1800};
-const char *kGpsNames[] = {"Continuous", "1 min", "5 min", "15 min", "30 min"};
-const int kGpsCount = 5;
-int gpsIndexForSecs(uint32_t secs)
+// "Share location" — Meshtastic's own per-channel position precision, applied to the
+// primary channel with the exact same admin path the channel-mute long-press uses (no
+// reboot). Exact = 32 bits, Rough = 13 (~1.5 km area, the Meshtastic default), Off = 0
+// (never send position). NOTE the firmware independently clamps public-key channels to
+// ~350 m (MAX_POSITION_PRECISION_PUBLIC_KEY) — "Exact" is only truly exact on a private
+// channel, which is Meshtastic's privacy rule, not ours to bypass.
+void TFTView_320x240::updateLocPrecisionLabel(void)
 {
-    int best = 0; // default to "Continuous"
-    uint32_t bestDiff = 0xffffffff;
-    for (int i = 0; i < kGpsCount; i++) {
-        uint32_t d = secs > kGpsSecs[i] ? secs - kGpsSecs[i] : kGpsSecs[i] - secs;
-        if (d < bestDiff) {
-            bestDiff = d;
-            best = i;
-        }
+    if (!loc_precision_label)
+        return;
+    uint32_t p = db.channel[0].settings.module_settings.position_precision;
+    lv_label_set_text(loc_precision_label, p == 0 ? "Off" : (p >= 24 ? "Exact" : "Rough"));
+}
+
+void TFTView_320x240::cycleLocPrecision(void)
+{
+    uint32_t p = db.channel[0].settings.module_settings.position_precision;
+    uint32_t next = (p >= 24) ? 13 : (p == 0 ? 32 : 0); // Exact -> Rough -> Off -> Exact
+    db.channel[0].settings.module_settings.position_precision = next;
+    db.channel[0].settings.has_module_settings = true;
+    db.channel[0].has_settings = true;
+    updateChannelConfig(db.channel[0]);
+    controller->sendConfig(db.channel[0], ownNode);
+    updateLocPrecisionLabel();
+}
+
+// Settings "Screen timeout" cycle. 0 = never dim.
+namespace
+{
+constexpr uint32_t kTimeoutSecs[] = {15, 30, 60, 120, 300, 0};
+constexpr const char *kTimeoutNames[] = {"15 sec", "30 sec", "1 min", "2 min", "5 min", "Never"};
+constexpr int kTimeoutCount = sizeof(kTimeoutSecs) / sizeof(kTimeoutSecs[0]);
+
+int timeoutIndexForSecs(uint32_t secs)
+{
+    for (int i = 0; i < kTimeoutCount; i++) {
+        if (kTimeoutSecs[i] == secs)
+            return i;
     }
-    return best;
+    return 1; // unknown stored value -> treat as the 30s default
 }
 } // namespace
 
-void TFTView_320x240::updateGpsIntervalLabel(void)
+void TFTView_320x240::updateTimeoutBtnLabel(void)
 {
-    if (!gps_interval_label)
+    if (!timeout_btn_label)
         return;
-    lv_label_set_text(gps_interval_label, kGpsNames[gpsIndexForSecs(db.config.position.gps_update_interval)]);
+    lv_label_set_text(timeout_btn_label, kTimeoutNames[timeoutIndexForSecs(db.uiConfig.screen_timeout)]);
 }
 
-void TFTView_320x240::cycleGpsInterval(void)
+void TFTView_320x240::cycleScreenTimeout(void)
 {
-    int idx = gpsIndexForSecs(db.config.position.gps_update_interval);
-    idx = (idx + 1) % kGpsCount;
-    db.config.position.gps_update_interval = kGpsSecs[idx]; // local mirror for the label
-    tdeck_gps_set_interval(kGpsSecs[idx]);                   // live apply + persist, no reboot
-    updateGpsIntervalLabel();
+    int idx = timeoutIndexForSecs(db.uiConfig.screen_timeout);
+    idx = (idx + 1) % kTimeoutCount;
+    db.uiConfig.screen_timeout = kTimeoutSecs[idx];
+    setTimeout(kTimeoutSecs[idx]);          // live apply (display driver + MUI settings label)
+    controller->storeUIConfig(db.uiConfig); // survives reboot
+    updateTimeoutBtnLabel();
 }
 
 // -----------------------------------------------------------------------------
@@ -3933,6 +4048,14 @@ void TFTView_320x240::showLockPad(bool setMode)
         lv_obj_set_style_text_color(lock_title_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_align(lock_title_label, LV_ALIGN_TOP_MID, 0, 6);
 
+        // Unread-message count in the pad's top-left corner (same green "N msgs" as the launcher
+        // top bar) — so a glance at the locked device tells you if anything came in.
+        lockpad_unread_label = lv_label_create(lockpad_screen);
+        lv_obj_set_style_text_color(lockpad_unread_label, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_set_style_text_font(lockpad_unread_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(lockpad_unread_label, LV_ALIGN_TOP_LEFT, 8, 6);
+        lv_label_set_text(lockpad_unread_label, "");
+
         lock_digits_label = lv_label_create(lockpad_screen);
         lv_obj_set_style_text_color(lock_digits_label, lv_color_hex(0x30d158), LV_PART_MAIN);
         lv_obj_set_style_text_font(lock_digits_label, &ui_font_montserrat_20, LV_PART_MAIN);
@@ -3964,7 +4087,33 @@ void TFTView_320x240::showLockPad(bool setMode)
 
     lv_label_set_text(lock_title_label, setMode ? "Set a new PIN, then OK" : "Enter PIN");
     updateLockDisplay();
+    updateUnreadMessages(); // pad may have just been created — pull in any count that already accrued
     lv_screen_load_anim(lockpad_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+}
+
+// Alt+C shortcut from the lock pad: run the touch-screen calibration (same routine as the Settings
+// button), then re-show the lock pad. This only bypasses the PIN to *reach* calibration — it does
+// NOT unlock the device; the user still enters their PIN afterwards (now with a working touch).
+void TFTView_320x240::startCalibrationFromLock(void)
+{
+    uint16_t *parameters = (uint16_t *)db.uiConfig.calibration_data.bytes;
+    memset(parameters, 0, 16);                       // clear existing data so calibrate() runs the
+    displaydriver->calibrate(parameters);            // interactive "tap the marker" routine (blocking)
+    db.uiConfig.calibration_data.size = 16;
+    controller->storeUIConfig(db.uiConfig);          // persist the fresh calibration across reboots
+
+    // Back to the PIN pad (still locked). calibrate() drew straight to the panel BEHIND LVGL's
+    // back — and since lockpad_screen is already the active screen, showLockPad()'s screen-load is
+    // a no-op and LVGL sees nothing to repaint (the pad only reappeared on the next touch). So
+    // explicitly invalidate everything and repaint NOW for a clean, instant handoff.
+    lockState = LOCK_ENTRY;
+    lockLen = 0;
+    lockDigits[0] = 0;
+    tdeck_hold_dark = false;
+    tdeck_input_gated = false;
+    showLockPad(false);
+    lv_obj_invalidate(lockpad_screen); // full-screen damage: repaint over the calibration leftovers
+    lv_refr_now(NULL);                 // ...and flush it to the panel immediately
 }
 
 void TFTView_320x240::lockpad_event(lv_event_t *e)
@@ -10222,11 +10371,17 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
     newMessage(from, container, ch, buf);
 
     if (!restore) {
-        // display msg popup if not already viewing the messages
-        if (container != activeMsgContainer || activePanel != objects.messages_panel) {
+        // "Viewing" a chat requires the Meshtastic screen to actually be on display AND lit.
+        // The chat panel stays "active" behind the launcher/apps/lock screen after leaving the
+        // Mesh app, so without these checks messages arriving for that chat were treated as
+        // already read (unread counter + popup went dead after the first visit).
+        bool onMeshScreen = lv_screen_active() == objects.main_screen && !tdeck_input_gated && !tdeck_hold_dark;
+        bool viewingThisChat =
+            onMeshScreen && activePanel == objects.messages_panel && container == activeMsgContainer;
+        if (!viewingThisChat) {
             unreadMessages++;
             updateUnreadMessages();
-            if (activePanel != objects.messages_panel && db.uiConfig.alert_enabled &&
+            if ((!onMeshScreen || activePanel != objects.messages_panel) && db.uiConfig.alert_enabled &&
                 !db.channel[ch].settings.module_settings.is_muted) {
                 showMessagePopup(from, to, ch, lv_label_get_text(nodes[from]->LV_OBJ_IDX(node_lbl_idx)));
             }
@@ -10945,6 +11100,19 @@ void TFTView_320x240::updateUnreadMessages(void)
         lv_obj_set_style_bg_img_src(objects.home_mail_button, &img_home_mail_button_image, LV_PART_MAIN | LV_STATE_DEFAULT);
     }
     lv_label_set_text(objects.home_mail_label, buf);
+
+    // Mirror the count into the launcher top bar (next to "mesh") and the lock pad's top-left;
+    // blank when there are none, so both clear the moment messages are opened (unreadMessages is
+    // reset to 0 on that path).
+    char top[24];
+    if (unreadMessages > 0)
+        snprintf(top, sizeof(top), unreadMessages == 1 ? "%lu msg" : "%lu msgs", (unsigned long)unreadMessages);
+    else
+        top[0] = '\0';
+    if (launcher_unread_label)
+        lv_label_set_text(launcher_unread_label, top);
+    if (lockpad_unread_label)
+        lv_label_set_text(lockpad_unread_label, top);
 }
 
 /**

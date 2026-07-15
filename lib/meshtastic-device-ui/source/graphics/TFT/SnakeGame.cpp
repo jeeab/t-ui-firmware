@@ -7,21 +7,23 @@
 // global gesture handles it; nothing here needs to). After a game over, tap the
 // field (or press Enter) to play again.
 //
-// Rendering is one small lv_obj per occupied cell: each tick creates one 10x10
+// Rendering is one small lv_obj per occupied cell: each tick creates one 12x12
 // square at the new head and deletes the one at the vacated tail — no canvas,
 // no big draw buffer.
 // -----------------------------------------------------------------------------
+#include "graphics/common/SdCard.h" // SDFs — high score persists on the SD card
 #include "lvgl.h"
 #include <cstdio>
+#include <cstdlib>
 #include <string.h>
 
 extern "C" void snake_open(void);
 
 namespace
 {
-constexpr int kCell = 10;
-constexpr int kCols = 32;
-constexpr int kRows = 22; // 320x220 field below a 20px header
+constexpr int kCell = 12; // bigger snake (was 10)
+constexpr int kCols = 26;
+constexpr int kRows = 18; // 312x216 field below a 24px header
 constexpr int kMax = kCols * kRows;
 constexpr uint32_t kStartPeriodMs = 160;
 constexpr uint32_t kMinPeriodMs = 70;
@@ -29,6 +31,7 @@ constexpr uint32_t kMinPeriodMs = 70;
 lv_obj_t *screen = nullptr;
 lv_obj_t *field = nullptr;
 lv_obj_t *scoreLbl = nullptr;
+lv_obj_t *bestLbl = nullptr; // all-time best, always visible top-right
 lv_obj_t *hintLbl = nullptr;
 lv_obj_t *keyCatcher = nullptr; // invisible focused widget that receives WASD
 lv_timer_t *tick = nullptr;
@@ -41,6 +44,37 @@ lv_obj_t *foodObj = nullptr;
 int dir = 0, nextDir = 0; // 0 none, 1 up, 2 down, 3 left, 4 right
 bool alive = true;
 int score = 0;
+int best = 0; // all-time high score, loaded from / saved to the SD card
+
+// High score lives at /apps/snake/hiscore.txt — same .txt-in-the-app-folder
+// pattern the Lua games use. (A folder with no main.lua never becomes a tile.)
+constexpr const char *kBestPath = "/apps/snake/hiscore.txt";
+
+void loadBest(void)
+{
+    FsFile f = SDFs.open(kBestPath, O_RDONLY);
+    if (!f)
+        return;
+    char buf[16] = {0};
+    int n = f.read((uint8_t *)buf, sizeof(buf) - 1);
+    f.close();
+    if (n > 0)
+        best = atoi(buf);
+}
+
+void saveBest(void)
+{
+    SDFs.mkdir("/apps");
+    SDFs.mkdir("/apps/snake");
+    FsFile f = SDFs.open(kBestPath, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!f)
+        return;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", best);
+    f.write((const uint8_t *)buf, strlen(buf));
+    f.sync();
+    f.close();
+}
 
 // swipe-steer state: track where a touch starts and its latest point so a drag
 // across the field turns the snake in the dominant direction of the swipe
@@ -65,9 +99,11 @@ lv_obj_t *makeSquare(int c, uint32_t color)
 
 void updateScore(void)
 {
-    char buf[32];
+    char buf[24];
     snprintf(buf, sizeof(buf), "Snake  ·  %d", score);
     lv_label_set_text(scoreLbl, buf);
+    snprintf(buf, sizeof(buf), "Best %d", best);
+    lv_label_set_text(bestLbl, buf);
 }
 
 void spawnFood(void)
@@ -115,8 +151,15 @@ void resetGame(void)
 void gameOver(void)
 {
     alive = false;
-    char buf[48];
-    snprintf(buf, sizeof(buf), "Game over  ·  score %d  ·  tap to retry", score);
+    char buf[56];
+    if (score > best) {
+        best = score;
+        saveBest();
+        updateScore(); // header shows the new best immediately
+        snprintf(buf, sizeof(buf), "NEW BEST %d!  ·  tap to retry", score);
+    } else {
+        snprintf(buf, sizeof(buf), "Game over  ·  score %d  ·  tap to retry", score);
+    }
     lv_label_set_text(hintLbl, buf);
     // head flashes white so you can see where it went wrong
     int head = body[headIdx];
@@ -263,14 +306,14 @@ void buildScreen(void)
     lv_obj_set_style_text_color(scoreLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(scoreLbl, LV_ALIGN_TOP_LEFT, 6, 3);
 
-    hintLbl = lv_label_create(screen);
-    lv_obj_set_style_text_color(hintLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(hintLbl, LV_ALIGN_TOP_RIGHT, -6, 3);
+    bestLbl = lv_label_create(screen);
+    lv_obj_set_style_text_color(bestLbl, lv_color_hex(0xffd60a), LV_PART_MAIN);
+    lv_obj_align(bestLbl, LV_ALIGN_TOP_RIGHT, -6, 3);
 
     field = lv_obj_create(screen);
     lv_obj_remove_style_all(field);
     lv_obj_set_size(field, kCols * kCell, kRows * kCell);
-    lv_obj_set_pos(field, 0, 20);
+    lv_obj_set_pos(field, (320 - kCols * kCell) / 2, 24);
     lv_obj_set_style_bg_color(field, lv_color_hex(0x0d0d0f), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(field, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_clear_flag(field, LV_OBJ_FLAG_SCROLLABLE);
@@ -279,6 +322,12 @@ void buildScreen(void)
     lv_obj_add_event_cb(field, fieldPressed, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(field, fieldPressing, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(field, fieldReleased, LV_EVENT_RELEASED, NULL);
+
+    // status/hint messages float centered over the field (created after it = drawn on top);
+    // labels aren't clickable, so retry-taps still reach the field underneath
+    hintLbl = lv_label_create(screen);
+    lv_obj_set_style_text_color(hintLbl, lv_color_hex(0xd0d0d5), LV_PART_MAIN);
+    lv_obj_align(hintLbl, LV_ALIGN_CENTER, 0, 0);
 
     // invisible key sink: lives in the input group so keyboard chars reach the game
     keyCatcher = lv_obj_create(screen);
@@ -304,6 +353,7 @@ void buildScreen(void)
         screen, [](lv_event_t *) { lv_timer_pause(tick); }, LV_EVENT_SCREEN_UNLOADED, NULL);
 
     memset(cellObj, 0, sizeof(cellObj));
+    loadBest();
     resetGame();
 }
 } // namespace

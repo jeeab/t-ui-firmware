@@ -10,6 +10,15 @@ built on top of the open-source [Meshtastic](https://meshtastic.org) mesh-radio 
 This repository is the complete, buildable source for the firmware that installer ships,
 published to comply with the GPL-3.0 license of the Meshtastic project it builds on.
 
+## 📌 First things to know (after installing)
+
+- **The screen locks when it sleeps. The default unlock code is `1234`** — change it in
+  *Settings → Lock PIN*.
+- **Taps landing in the wrong spot? Press `Alt + C`** on the keyboard to re-run touch
+  calibration. Works even on the lock screen.
+- **Double-click the trackball** to wake the screen and to go Home from anywhere.
+- The first start sits on the Meshtastic logo for **15–20 seconds** — normal, don't unplug.
+
 ## What this is based on
 
 - Base: [meshtastic/firmware](https://github.com/meshtastic/firmware), `develop` branch,
@@ -27,9 +36,13 @@ Map tiles are user data loaded onto the SD card.
 
 - `lib/meshtastic-device-ui/source/graphics/TFT/TFTView_320x240.cpp` (+ header) — the
   launcher itself: home grid with pages/reorder, settings screen (mesh kill switch,
-  lock PIN, brightness, GPS on/off + check interval, Wi-Fi, FTP file share), lock/PIN
-  wake gating, Files 2.0 (copy/paste/trash), standalone Maps app with saved pins,
-  crash diagnostics readout, dynamic SD-card app tiles.
+  lock PIN, brightness, GPS on/off — on = always searching, location-sharing precision
+  [Exact/Rough/Off via Meshtastic's per-channel position precision], Wi-Fi, FTP file
+  share, screen timeout, one Sound switch driving Meshtastic's `buzzer_mode` for beeps
+  AND message alerts), lock/PIN wake gating, unread-message counter on the home bar +
+  lock screen, Files 2.0 (copy/paste/trash/folders), standalone Maps app with saved
+  named pins, crash diagnostics readout, Alt+C touch recalibration, dynamic SD-card
+  app tiles.
 - New device-ui app modules: `SnakeGame.cpp`, `StopwatchApp.cpp`, `NotesApp.cpp`,
   `CalculatorApp.cpp`, `LuaApp.cpp`.
 - New firmware bridges in `src/`: `TDeckMeshSwitch.cpp` (radio kill switch),
