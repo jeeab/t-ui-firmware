@@ -74,13 +74,18 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // object can linger on ANOTHER screen (e.g. the Meshtastic chat input stays focused
             // after leaving the Mesh app), so typing on the lock pad or launcher would silently
             // land in that chat box. Swallow any key whose focused target isn't on the screen
-            // that's actually on display.
+            // that's actually on display — EXCEPT targets on the overlay layers (lv_layer_top/
+            // lv_layer_sys), which float above every screen and are always visible when focused
+            // (the pin-rename and new-folder entry boxes live there).
             lv_group_t *grp = lv_indev_get_group(indev);
             lv_obj_t *focused = grp ? lv_group_get_focused(grp) : NULL;
-            if (focused && lv_obj_get_screen(focused) != lv_screen_active()) {
-                data->state = LV_INDEV_STATE_RELEASED;
-                data->key = 0;
-                break;
+            if (focused) {
+                lv_obj_t *scr = lv_obj_get_screen(focused);
+                if (scr != lv_screen_active() && scr != lv_layer_top() && scr != lv_layer_sys()) {
+                    data->state = LV_INDEV_STATE_RELEASED;
+                    data->key = 0;
+                    break;
+                }
             }
             // If any keyboard reports a key press, we stop reading further
             return;
