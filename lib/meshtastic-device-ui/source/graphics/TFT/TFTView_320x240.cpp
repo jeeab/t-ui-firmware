@@ -542,6 +542,17 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 21, 2, 4, 8, 0xffd60a, 2);
         icBox(ic, 7, 7, 9, 4, 0xffd60a, 2);
         icBox(ic, 30, 7, 9, 4, 0xffd60a, 2);
+    } else if (!strcmp(name, "Pinball")) { // bumper ring + ball + two angled flippers
+        icRing(ic, 15, 1, 16, 0xff2d55, 3);
+        icBox(ic, 20, 19, 7, 7, 0xffffff, LV_RADIUS_CIRCLE);
+        lv_obj_t *lf = icBox(ic, 5, 31, 17, 5, 0xff9f0a, 2);
+        lv_obj_set_style_transform_pivot_x(lf, 0, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(lf, 2, LV_PART_MAIN);
+        lv_obj_set_style_transform_rotation(lf, 200, LV_PART_MAIN); // 20 deg, tip slopes to center
+        lv_obj_t *rf = icBox(ic, 25, 31, 17, 5, 0xff9f0a, 2);
+        lv_obj_set_style_transform_pivot_x(rf, 17, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(rf, 2, LV_PART_MAIN);
+        lv_obj_set_style_transform_rotation(rf, -200, LV_PART_MAIN);
     } else if (!strcmp(name, "Stopwatch")) { // ring + top button + hand
         icRing(ic, 10, 8, 26, color, 3);
         icBox(ic, 20, 2, 6, 6, color, 1);
@@ -749,6 +760,10 @@ void TFTView_320x240::createLauncher(void)
             if (sdCard) {
                 tries = 0;
                 lv_timer_delete(t);
+                // Seed bundled apps HERE, now that the card is actually mounted — the earlier
+                // createLauncher call runs before SD is up and silently installs nothing, which
+                // left deleted (or never-installed) bundled apps missing forever.
+                lua_seed_bundled();
                 THIS->scanUserApps();
                 THIS->rebuildAppGrid();
             } else if (++tries > 20) {
