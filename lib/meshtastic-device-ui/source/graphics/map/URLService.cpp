@@ -8,6 +8,7 @@
 
 #include "HTTPClient.h" // not available on Linux/Portduino
 #include "WiFi.h"
+#include "WiFiClientSecure.h"
 
 // from ConvertPNG.c
 extern "C" {
@@ -41,7 +42,17 @@ bool URLService::load(const char *name, void *img)
     }
 
     http.setReuse(false);
-    if (!http.begin(url.c_str())) {
+    bool began;
+    if (strncmp(url.c_str(), "https", 5) == 0) {
+        // https tile servers (Google, USGS): TLS without cert pinning — it's public
+        // map data, and the S3 has no room for a CA bundle here.
+        static WiFiClientSecure secureClient;
+        secureClient.setInsecure();
+        began = http.begin(secureClient, url.c_str());
+    } else {
+        began = http.begin(url.c_str());
+    }
+    if (!began) {
         ILOG_ERROR("ERROR begin %s", url.c_str());
         return false;
     }

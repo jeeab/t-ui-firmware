@@ -20,6 +20,7 @@
 #include <esp_system.h>
 
 #include "concurrency/OSThread.h" // currentThread — names the thread a stalled main loop is stuck in
+#include "SPILock.h" // spiLock — the one lock every SPI/flash user waits on; a wedged holder = the freeze
 
 extern "C" uint32_t tdeck_free_heap(void)
 {
@@ -67,9 +68,13 @@ static volatile uint32_t s_lastLoopMs = 0; // 0 = loop hasn't started yet (don't
 static uint32_t s_stallWrittenForMs = 0;   // last stall duration persisted (0 = none this stall)
 static uint32_t s_prevStallMs = 0;         // read back at boot
 static char s_prevStallThread[24] = {0};
+static volatile void *s_loopTask = nullptr; // the main loop's task handle (for eTaskGetState)
+static char s_prevStallLock[40] = {0};      // spiLock holder + loop state at stall time
 
 extern "C" void tdeck_loop_heartbeat(void)
 {
+    if (!s_loopTask)
+        s_loopTask = (void *)xTaskGetCurrentTaskHandle();
     s_lastLoopMs = millis();
     if (s_stallWrittenForMs) { // loop recovered: the stall didn't kill us — clear the record
         s_stallWrittenForMs = 0;
@@ -77,6 +82,7 @@ extern "C" void tdeck_loop_heartbeat(void)
         if (p.begin("tdeckdiag", false)) {
             p.remove("stlms");
             p.remove("stlth");
+            p.remove("stlck");
             p.end();
         }
     }
@@ -90,6 +96,13 @@ extern "C" uint32_t tdeck_prev_stall_ms(void)
 extern "C" const char *tdeck_prev_stall_thread(void)
 {
     return s_prevStallThread;
+}
+
+// "who held spiLock (+ for how long) and the loop task's state" at stall time,
+// e.g. "mui 63s loop=B" (UI task held it, main loop Blocked) or "free loop=R".
+extern "C" const char *tdeck_prev_stall_lock(void)
+{
+    return s_prevStallLock;
 }
 
 // Capture-once at boot: read WHY we restarted and last session's saved lows,
@@ -109,12 +122,14 @@ extern "C" void tdeck_diag_boot(void)
         s_prevHeapLow = p.getULong("hpl", 0);
         s_prevStallMs = p.getULong("stlms", 0);
         p.getString("stlth", s_prevStallThread, sizeof(s_prevStallThread));
+        p.getString("stlck", s_prevStallLock, sizeof(s_prevStallLock));
         p.end();
     }
     if (s_prevStallMs) { // consume the stall record so it only describes the LAST session
         if (p.begin("tdeckdiag", false)) {
             p.remove("stlms");
             p.remove("stlth");
+            p.remove("stlck");
             p.end();
         }
     }
@@ -168,10 +183,44 @@ extern "C" void tdeck_diag_tick(void)
         if (stuck > 15000 && stuck > s_stallWrittenForMs + 15000) {
             s_stallWrittenForMs = stuck;
             const concurrency::OSThread *t = concurrency::OSThread::currentThread;
+            // The freeze's WHY: who holds spiLock (both observed stalls — GPS and
+            // RadioIf — can only block forever on it), how long they've held it,
+            // and whether the main loop is Blocked (mutex wait) or Running (spin).
+            char lockInfo[40];
+            {
+                char loopState = '?';
+                if (s_loopTask) {
+                    switch (eTaskGetState((TaskHandle_t)s_loopTask)) {
+                    case eRunning:
+                        loopState = 'R'; // actually executing = spinning, not lock-blocked
+                        break;
+                    case eReady:
+                        loopState = 'r'; // wants cpu = spinning
+                        break;
+                    case eBlocked:
+                        loopState = 'B'; // waiting on a lock/queue — the mutex theory
+                        break;
+                    case eSuspended:
+                        loopState = 'S';
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                void *ow = spiLock ? (void *)spiLock->owner : nullptr;
+                if (ow) {
+                    uint32_t heldMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - spiLock->lockedAtMs;
+                    snprintf(lockInfo, sizeof(lockInfo), "%s %lus loop=%c", pcTaskGetName((TaskHandle_t)ow),
+                             (unsigned long)(heldMs / 1000), loopState);
+                } else {
+                    snprintf(lockInfo, sizeof(lockInfo), "free loop=%c", loopState);
+                }
+            }
             Preferences p;
             if (p.begin("tdeckdiag", false)) {
                 p.putULong("stlms", stuck);
                 p.putString("stlth", t ? t->ThreadName.c_str() : "?");
+                p.putString("stlck", lockInfo);
                 p.end();
             }
         }

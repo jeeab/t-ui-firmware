@@ -4,7 +4,10 @@
 #include <algorithm>
 
 std::vector<std::tuple<std::string, std::string>> TileProvider::urlTemplates = {
-    {"URL: Google Maps", "https://mt0.google.com/vt?lyrs=m&x={x}&s=&y={y}&z={z}"}};
+    {"URL: Google Maps", "https://mt0.google.com/vt?lyrs=m&x={x}&s=&y={y}&z={z}"},
+    // index 1: official US government topo — public domain, bulk-download friendly.
+    // NOTE the {z}/{y}/{x} order (ArcGIS convention) and that tiles are JPEG.
+    {"URL: USGS Topo", "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}"}};
 
 std::string TileProvider::url(const char *filename)
 {

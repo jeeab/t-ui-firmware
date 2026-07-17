@@ -24,10 +24,13 @@ void Lock::lock()
     if (xSemaphoreTake(handle, portMAX_DELAY) == false) {
         abort();
     }
+    owner = (void *)xTaskGetCurrentTaskHandle();
+    lockedAtMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
 void Lock::unlock()
 {
+    owner = nullptr;
     if (xSemaphoreGive(handle) == false) {
         abort();
     }

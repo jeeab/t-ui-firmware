@@ -27,6 +27,15 @@ class Lock
     // Must not be called from an ISR.
     void unlock();
 
+#ifdef HAS_FREE_RTOS
+    // Freeze diagnostics: which task holds this lock and since when (FreeRTOS tick
+    // ms). Maintained by lock()/unlock(); read by the T-Deck stall detector so a
+    // main-loop freeze can name a wedged lock holder (this Lock is a binary
+    // semaphore with portMAX_DELAY — one never-released hold stalls every waiter).
+    volatile void *owner = nullptr;
+    volatile uint32_t lockedAtMs = 0;
+#endif
+
   private:
 #ifdef HAS_FREE_RTOS
     SemaphoreHandle_t handle;

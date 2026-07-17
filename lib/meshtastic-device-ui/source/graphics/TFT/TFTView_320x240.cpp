@@ -30,6 +30,10 @@
 #include <random>
 #include <sstream>
 #include <time.h>
+#ifdef ARDUINO_ARCH_ESP32
+#include <HTTPClient.h> // Maps: USGS region downloader (tile fetch over on-demand WiFi)
+#include <WiFiClientSecure.h>
+#endif
 
 #if defined(ARCH_PORTDUINO)
 #include "PortduinoFS.h"
@@ -131,6 +135,8 @@ extern "C" uint32_t tdeck_prev_heap_low(void);
 // how long it was stuck and which OSThread it was stuck inside.
 extern "C" uint32_t tdeck_prev_stall_ms(void);
 extern "C" const char *tdeck_prev_stall_thread(void);
+extern "C" const char *tdeck_prev_stall_lock(void); // spiLock holder + loop state at stall time
+void playBeep(); // buzz.cpp (C++ linkage) — completion chirp for the map downloader
 // Sound toggle (TDeckBeep.cpp): drives Meshtastic's buzzer_mode — one switch for game/timer
 // beeps AND message-notification sounds. Persists in the device config (no reboot).
 extern "C" bool tdeck_sound_get_enabled(void);
@@ -2227,10 +2233,27 @@ void TFTView_320x240::openMaps(void)
         lv_obj_align(maps_sats_label, LV_ALIGN_TOP_MID, 14, 9);
         maps_sats_timer = lv_timer_create([](lv_timer_t *) { THIS->updateMapsSats(); }, 1000, NULL);
 
+        // gear cog, bottom-right over the map: style picker + region downloader
+        maps_gear_btn = lv_btn_create(maps_screen);
+        lv_obj_set_size(maps_gear_btn, 36, 36);
+        lv_obj_set_style_radius(maps_gear_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_gear_btn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_gear_btn, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_align(maps_gear_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+        {
+            lv_obj_t *gl = lv_label_create(maps_gear_btn);
+            lv_label_set_text(gl, LV_SYMBOL_SETTINGS);
+            lv_obj_set_style_text_color(gl, lv_color_hex(0xffffff), LV_PART_MAIN);
+            lv_obj_center(gl);
+        }
+        lv_obj_add_event_cb(
+            maps_gear_btn, [](lv_event_t *) { THIS->openMapsMenu(); }, LV_EVENT_CLICKED, NULL);
+
         // Leaving the Maps app? Drop its tile cache to free RAM; it rebuilds on return.
         lv_obj_add_event_cb(
             maps_screen,
             [](lv_event_t *) {
+                THIS->closeMapsMenu();
                 if (THIS->userMap)
                     THIS->userMap->releaseTiles();
             },
@@ -2366,6 +2389,577 @@ void TFTView_320x240::mapsShowNotice(const char *msg)
     lv_obj_align(maps_notice, LV_ALIGN_TOP_MID, 0, 60);
     lv_obj_clear_flag(maps_notice, LV_OBJ_FLAG_HIDDEN);
     maps_notice_until = lv_tick_get() + 2500;
+}
+
+// ===== Maps app: style picker (gear) + USGS region downloader =============================
+namespace {
+// slippy-map tile math (float is plenty at our zooms)
+inline float lon2tx(float lon, uint8_t z) { return (lon + 180.0f) / 360.0f * exp2f(z); }
+inline float lat2ty(float lat, uint8_t z)
+{
+    float r = lat * (float)M_PI / 180.0f;
+    return (1.0f - asinhf(tanf(r)) / (float)M_PI) / 2.0f * exp2f(z);
+}
+inline float tx2lon(float x, uint8_t z) { return x / exp2f(z) * 360.0f - 180.0f; }
+inline float ty2lat(float y, uint8_t z)
+{
+    float v = (float)M_PI * (1.0f - 2.0f * y / exp2f(z));
+    return atanf(sinhf(v)) * 180.0f / (float)M_PI;
+}
+// x/y tile index ranges of a lat/lon box at zoom z (clamped to the world)
+inline void boxTiles(float latN, float latS, float lonW, float lonE, uint8_t z, uint32_t &x0, uint32_t &x1, uint32_t &y0,
+                     uint32_t &y1)
+{
+    float n = exp2f(z);
+    auto clampf = [&](float v) { return v < 0 ? 0.0f : (v >= n ? n - 1 : v); };
+    x0 = (uint32_t)clampf(floorf(lon2tx(lonW, z)));
+    x1 = (uint32_t)clampf(floorf(lon2tx(lonE, z)));
+    y0 = (uint32_t)clampf(floorf(lat2ty(latN, z)));
+    y1 = (uint32_t)clampf(floorf(lat2ty(latS, z)));
+}
+
+const char *kUsgsStyle = "USGS-Topo";
+const char *kUsgsUrlTemplate = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}";
+
+#ifdef ARDUINO_ARCH_ESP32
+// One TLS connection reused for the whole download (a handshake per tile would be
+// brutally slow and heap-hungry). Created on start, freed on stop — TLS holds ~45KB
+// of heap while alive, which the mesh needs back afterwards.
+WiFiClientSecure *mapdlClient = nullptr;
+
+void mapdlTilePath(char *buf, size_t cap, uint8_t z, uint32_t x, uint32_t y)
+{
+    snprintf(buf, cap, "%s/%s/%u/%lu/%lu.jpg", MapTileSettings::getPrefix(), kUsgsStyle, (unsigned)z, (unsigned long)x,
+             (unsigned long)y);
+}
+
+bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
+{
+    if (!mapdlClient) {
+        mapdlClient = new WiFiClientSecure();
+        mapdlClient->setInsecure(); // public map data; no room for a CA bundle
+    }
+    char url[144];
+    snprintf(url, sizeof(url), "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/%u/%lu/%lu",
+             (unsigned)z, (unsigned long)y, (unsigned long)x); // ArcGIS order: z/y/x
+    HTTPClient http;
+    http.setReuse(true); // keep-alive on the shared client
+    http.setConnectTimeout(8000);
+    http.setTimeout(8000);
+    if (!http.begin(*mapdlClient, url))
+        return false;
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        http.end();
+        return false;
+    }
+    int len = http.getSize();
+    if (len <= 0 || len > 262144) {
+        http.end();
+        return false;
+    }
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        http.end();
+        return false;
+    }
+    WiFiClient *stream = http.getStreamPtr();
+    int got = 0;
+    uint8_t idle = 0;
+    while (got < len) {
+        size_t avail = stream->available();
+        if (!avail) {
+            if (++idle > 100) // ~1s of silence mid-body = give up on this tile
+                break;
+            delay(10);
+            continue;
+        }
+        idle = 0;
+        size_t want = len - got;
+        if (want > avail)
+            want = avail;
+        int r = stream->read(buf + got, want);
+        if (r <= 0)
+            break;
+        got += r;
+    }
+    http.end();
+    bool ok = (got == len);
+    if (ok) {
+        char dir[104], path[120];
+        snprintf(dir, sizeof(dir), "%s/%s/%u/%lu", MapTileSettings::getPrefix(), kUsgsStyle, (unsigned)z, (unsigned long)x);
+        SDFs.mkdir(dir); // SdFat creates missing parents
+        mapdlTilePath(path, sizeof(path), z, x, y);
+        FsFile f = SDFs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        ok = false;
+        if (f) {
+            ok = (f.write(buf, (size_t)len) == (size_t)len);
+            f.close();
+        }
+    }
+    heap_caps_free(buf);
+    return ok;
+}
+
+// Make the USGS style folder self-describing so the style picker (and the mesh map's
+// picker) can wire it up from the card alone: .url = browse-fill server, .format = jpg.
+void mapdlWriteMeta(void)
+{
+    char p[104];
+    snprintf(p, sizeof(p), "%s/%s", MapTileSettings::getPrefix(), kUsgsStyle);
+    SDFs.mkdir(p);
+    snprintf(p, sizeof(p), "%s/%s/.url", MapTileSettings::getPrefix(), kUsgsStyle);
+    FsFile f = SDFs.open(p, O_WRONLY | O_CREAT | O_TRUNC);
+    if (f) {
+        f.print(kUsgsUrlTemplate);
+        f.print("\n");
+        f.close();
+    }
+    snprintf(p, sizeof(p), "%s/%s/.format", MapTileSettings::getPrefix(), kUsgsStyle);
+    f = SDFs.open(p, O_WRONLY | O_CREAT | O_TRUNC);
+    if (f) {
+        f.print("jpg\n");
+        f.close();
+    }
+}
+#endif // ARDUINO_ARCH_ESP32
+} // namespace
+
+// Switch the Maps app to a tile style (a folder under /maps). Reads the style's
+// optional .format (jpg/png, default png) and .url (browse-fill server) files, so a
+// downloaded style Just Works. persist=true remembers it across reboots.
+void TFTView_320x240::mapsApplyStyle(const char *style, bool persist)
+{
+    MapTileSettings::setTileStyle(style);
+
+    char fmt[8] = "png";
+    {
+        char path[104];
+        snprintf(path, sizeof(path), "%s/%s/.format", MapTileSettings::getPrefix(), style);
+        FsFile f = SDFs.open(path, O_RDONLY);
+        if (f) {
+            int n = f.read((uint8_t *)fmt, sizeof(fmt) - 1);
+            if (n > 0) {
+                fmt[n] = 0;
+                for (char *c = fmt; *c; c++) {
+                    if (*c == '\r' || *c == '\n') {
+                        *c = 0;
+                        break;
+                    }
+                }
+            }
+            f.close();
+        }
+    }
+    if (!fmt[0])
+        strcpy(fmt, "png");
+    MapTileSettings::setTileFormat(fmt);
+
+    // browse-fill: point the backup fetcher at this style's own server, exactly like
+    // the mesh map's style dropdown does. No .url file = no fetching, no SD writes.
+    std::string url = sdCard ? sdCard->getUrlProvider(MapTileSettings::getPrefix(), style) : std::string{};
+    if (!url.empty()) {
+        std::string provider = std::string("URL: ") + style;
+        int entry = TileProvider::addTemplate(provider, url);
+        TileProvider::selectTemplate(entry);
+    }
+    MapTileSettings::setSaveOK(!url.empty());
+
+    if (persist) {
+        strncpy(db.uiConfig.map_data.style, style, sizeof(db.uiConfig.map_data.style) - 1);
+        db.uiConfig.map_data.style[sizeof(db.uiConfig.map_data.style) - 1] = 0;
+        db.uiConfig.has_map_data = true;
+        controller->storeUIConfig(db.uiConfig);
+    }
+
+    if (userMap)
+        userMap->setZoom(MapTileSettings::getZoomLevel()); // re-center + full tile rebuild
+    meshMapStale = true; // the mesh map shares this state; it re-syncs on next load
+}
+
+void TFTView_320x240::closeMapsMenu(void)
+{
+    if (maps_style_ovl) {
+        lv_obj_delete(maps_style_ovl);
+        maps_style_ovl = nullptr;
+    }
+}
+
+// The gear menu: pick a map style (folders under /maps) or open the region downloader.
+void TFTView_320x240::openMapsMenu(void)
+{
+    if (!maps_screen || maps_style_ovl)
+        return;
+    maps_style_ovl = lv_obj_create(maps_screen);
+    lv_obj_set_size(maps_style_ovl, 250, 206);
+    lv_obj_center(maps_style_ovl);
+    lv_obj_set_style_bg_color(maps_style_ovl, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_border_color(maps_style_ovl, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_set_style_radius(maps_style_ovl, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(maps_style_ovl, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(maps_style_ovl, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(maps_style_ovl, 6, LV_PART_MAIN);
+
+    auto row = [&](const char *txt, uint32_t color, lv_event_cb_t cb, void *ud) {
+        lv_obj_t *b = lv_btn_create(maps_style_ovl);
+        lv_obj_set_width(b, LV_PCT(100));
+        lv_obj_set_height(b, 36);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+        lv_obj_t *l = lv_label_create(b);
+        lv_label_set_text(l, txt);
+        lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
+        lv_obj_center(l);
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+        return b;
+    };
+
+    lv_obj_t *title = lv_label_create(maps_style_ovl);
+    lv_label_set_text(title, "Map style");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+
+    // one row per style folder on the card; checkmark = the active one
+    static char styleNames[6][24]; // callback user_data must outlive this function
+    int i = 0;
+    if (sdCard) {
+        std::set<std::string> styles = sdCard->loadMapStyles(MapTileSettings::getPrefix());
+        for (auto &s : styles) {
+            if (i >= 6)
+                break;
+            strncpy(styleNames[i], s.c_str(), sizeof(styleNames[0]) - 1);
+            styleNames[i][sizeof(styleNames[0]) - 1] = 0;
+            char withSlash[26];
+            snprintf(withSlash, sizeof(withSlash), "%s/", styleNames[i]);
+            bool current = (strcmp(withSlash, MapTileSettings::getTileStyle()) == 0);
+            char lbl[36];
+            snprintf(lbl, sizeof(lbl), "%s%s", current ? LV_SYMBOL_OK " " : "", styleNames[i]);
+            row(lbl, 0xffffff,
+                [](lv_event_t *e) {
+                    const char *style = (const char *)lv_event_get_user_data(e);
+                    THIS->closeMapsMenu();
+                    THIS->mapsApplyStyle(style, true);
+                    char msg[40];
+                    snprintf(msg, sizeof(msg), "map: %s", style);
+                    THIS->mapsShowNotice(msg);
+                },
+                styleNames[i]);
+            i++;
+        }
+    }
+    if (i == 0) {
+        lv_obj_t *none = lv_label_create(maps_style_ovl);
+        lv_label_set_text(none, "no styles found on card");
+        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
+
+    row(mapdl_running ? "Download progress..." : "Download this area (USGS)", 0x30d158,
+        [](lv_event_t *) {
+            THIS->closeMapsMenu();
+            THIS->openMapDownload();
+        },
+        NULL);
+    row("Close", 0x8e8e93, [](lv_event_t *) { THIS->closeMapsMenu(); }, NULL);
+}
+
+uint32_t TFTView_320x240::mapdlCountTiles(uint8_t zmin, uint8_t zmax) const
+{
+    uint32_t total = 0;
+    for (uint8_t z = zmin; z <= zmax; z++) {
+        uint32_t x0, x1, y0, y1;
+        boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, z, x0, x1, y0, y1);
+        total += (x1 - x0 + 1) * (y1 - y0 + 1);
+    }
+    return total;
+}
+
+void TFTView_320x240::mapdlUpdateEstimate(void)
+{
+    if (!mapdl_screen || mapdl_running)
+        return;
+    mapdl_zmin = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
+    mapdl_zmax = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
+    if (mapdl_zmax < mapdl_zmin) { // keep the range sane instead of erroring
+        mapdl_zmax = mapdl_zmin;
+        lv_dropdown_set_selected(mapdl_zmax_dd, mapdl_zmax - 10);
+    }
+    uint32_t tiles = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
+    uint32_t mb10 = tiles * 20 / 102; // ~20KB/tile, shown in tenths of MB
+    uint32_t mins = tiles / 180 + 1;  // ~3 tiles/s
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%lu tiles  ~%lu.%lu MB  ~%lu min", (unsigned long)tiles, (unsigned long)(mb10 / 10),
+             (unsigned long)(mb10 % 10), (unsigned long)mins);
+    lv_label_set_text(mapdl_status, buf);
+}
+
+// The download-area screen. The box is whatever the map was showing when this opened.
+void TFTView_320x240::openMapDownload(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (!mapdl_running && userMap && maps_map_container) {
+        float clat = 0, clon = 0;
+        userMap->getCenter(clat, clon);
+        uint8_t z = MapTileSettings::getZoomLevel();
+        float xt = lon2tx(clon, z), yt = lat2ty(clat, z);
+        float halfX = lv_obj_get_width(maps_map_container) / 2.0f / 256.0f;
+        float halfY = lv_obj_get_height(maps_map_container) / 2.0f / 256.0f;
+        mapdl_lonW = tx2lon(xt - halfX, z);
+        mapdl_lonE = tx2lon(xt + halfX, z);
+        mapdl_latN = ty2lat(yt - halfY, z);
+        mapdl_latS = ty2lat(yt + halfY, z);
+    }
+
+    if (!mapdl_screen) {
+        mapdl_screen = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(mapdl_screen, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_clear_flag(mapdl_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(mapdl_screen);
+        lv_label_set_text(title, "Download map area");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+        mapdl_status = lv_label_create(mapdl_screen);
+        lv_obj_set_style_text_color(mapdl_status, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_align(mapdl_status, LV_ALIGN_TOP_MID, 0, 36);
+        lv_label_set_text(mapdl_status, "");
+
+        mapdl_info = lv_label_create(mapdl_screen);
+        lv_obj_set_width(mapdl_info, 300);
+        lv_label_set_long_mode(mapdl_info, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(mapdl_info, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_align(mapdl_info, LV_ALIGN_TOP_LEFT, 12, 62);
+        lv_label_set_text(mapdl_info, "Area: what the map was showing.\nSource: USGS Topo (free, public domain).\n"
+                                      "Screen can turn off - the download keeps going.");
+
+        lv_obj_t *l1 = lv_label_create(mapdl_screen);
+        lv_label_set_text(l1, "Detail:");
+        lv_obj_set_style_text_color(l1, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(l1, LV_ALIGN_LEFT_MID, 12, 28);
+
+        mapdl_zmin_dd = lv_dropdown_create(mapdl_screen);
+        lv_dropdown_set_options(mapdl_zmin_dd, "10\n11\n12\n13\n14\n15");
+        lv_dropdown_set_selected(mapdl_zmin_dd, 0);
+        lv_obj_set_width(mapdl_zmin_dd, 70);
+        lv_obj_align(mapdl_zmin_dd, LV_ALIGN_LEFT_MID, 70, 28);
+        lv_obj_add_event_cb(
+            mapdl_zmin_dd, [](lv_event_t *) { THIS->mapdlUpdateEstimate(); }, LV_EVENT_VALUE_CHANGED, NULL);
+
+        lv_obj_t *l2 = lv_label_create(mapdl_screen);
+        lv_label_set_text(l2, "to");
+        lv_obj_set_style_text_color(l2, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(l2, LV_ALIGN_LEFT_MID, 148, 28);
+
+        mapdl_zmax_dd = lv_dropdown_create(mapdl_screen);
+        lv_dropdown_set_options(mapdl_zmax_dd, "10\n11\n12\n13\n14\n15");
+        lv_dropdown_set_selected(mapdl_zmax_dd, 5);
+        lv_obj_set_width(mapdl_zmax_dd, 70);
+        lv_obj_align(mapdl_zmax_dd, LV_ALIGN_LEFT_MID, 172, 28);
+        lv_obj_add_event_cb(
+            mapdl_zmax_dd, [](lv_event_t *) { THIS->mapdlUpdateEstimate(); }, LV_EVENT_VALUE_CHANGED, NULL);
+
+        mapdl_btn = lv_btn_create(mapdl_screen);
+        lv_obj_set_size(mapdl_btn, 130, 40);
+        lv_obj_set_style_bg_color(mapdl_btn, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_align(mapdl_btn, LV_ALIGN_BOTTOM_LEFT, 12, -10);
+        mapdl_btn_lbl = lv_label_create(mapdl_btn);
+        lv_label_set_text(mapdl_btn_lbl, "Start");
+        lv_obj_set_style_text_color(mapdl_btn_lbl, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_center(mapdl_btn_lbl);
+        lv_obj_add_event_cb(
+            mapdl_btn,
+            [](lv_event_t *) {
+                if (THIS->mapdl_running)
+                    THIS->mapdlStop(false);
+                else
+                    THIS->mapdlStart();
+            },
+            LV_EVENT_CLICKED, NULL);
+
+        mapdl_use_btn = lv_btn_create(mapdl_screen);
+        lv_obj_set_size(mapdl_use_btn, 150, 40);
+        lv_obj_set_style_bg_color(mapdl_use_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+        lv_obj_align(mapdl_use_btn, LV_ALIGN_BOTTOM_MID, 30, -10);
+        lv_obj_t *ubl = lv_label_create(mapdl_use_btn);
+        lv_label_set_text(ubl, "Use this map");
+        lv_obj_set_style_text_color(ubl, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_center(ubl);
+        lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(
+            mapdl_use_btn,
+            [](lv_event_t *) {
+                THIS->mapsApplyStyle(kUsgsStyle, true);
+                THIS->openMaps();
+            },
+            LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *back = lv_btn_create(mapdl_screen);
+        lv_obj_set_size(back, 70, 40);
+        lv_obj_set_style_bg_color(back, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_align(back, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+        lv_obj_t *bl = lv_label_create(back);
+        lv_label_set_text(bl, "Back");
+        lv_obj_set_style_text_color(bl, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_center(bl);
+        // Back just leaves the screen — a running download keeps going headless.
+        lv_obj_add_event_cb(
+            back, [](lv_event_t *) { THIS->openMaps(); }, LV_EVENT_CLICKED, NULL);
+    }
+
+    lv_screen_load_anim(mapdl_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    if (mapdl_running) {
+        lv_label_set_text(mapdl_btn_lbl, "Stop");
+        lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(mapdl_btn_lbl, "Start");
+        mapdlUpdateEstimate();
+    }
+#endif // ARDUINO_ARCH_ESP32
+}
+
+void TFTView_320x240::mapdlStart(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (mapdl_running)
+        return;
+    mapdl_zmin = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
+    mapdl_zmax = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
+    if (mapdl_zmax < mapdl_zmin)
+        mapdl_zmax = mapdl_zmin;
+    mapdl_total = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
+    mapdl_done = mapdl_failed = mapdl_skipped = 0;
+    mapdl_z = mapdl_zmin;
+    uint32_t x0, x1, y0, y1;
+    boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, mapdl_z, x0, x1, y0, y1);
+    mapdl_x = x0;
+    mapdl_y = y0;
+
+    // WiFi: use it if it's already up, otherwise bring it up on-demand (fileshare pattern)
+    bool already = tdeck_wifi_connected();
+    mapdl_own_wifi = !already;
+    mapdl_wifi_up = already;
+    if (!already && !tdeck_wifi_connect_now(db.config.network.wifi_ssid, db.config.network.wifi_psk)) {
+        lv_label_set_text(mapdl_status, "No Wi-Fi network saved");
+        lv_label_set_text(mapdl_info, "Set one first: Settings -> Wi-Fi -> Network + Password, then come back here.");
+        return;
+    }
+    mapdl_deadline = lv_tick_get() + 25000;
+    mapdl_running = true;
+    lv_label_set_text(mapdl_btn_lbl, "Stop");
+    lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+    if (!already)
+        lv_label_set_text(mapdl_status, "Turning Wi-Fi on...");
+
+    mapdlWriteMeta(); // style folder is self-describing even if we stop early
+
+    if (!mapdl_timer)
+        mapdl_timer = lv_timer_create([](lv_timer_t *) { THIS->mapdlPump(); }, 50, NULL);
+#endif
+}
+
+void TFTView_320x240::mapdlStop(bool finished)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (mapdl_timer) {
+        lv_timer_delete(mapdl_timer);
+        mapdl_timer = nullptr;
+    }
+    if (mapdlClient) { // free the TLS heap (~45KB) the moment we're done with it
+        delete mapdlClient;
+        mapdlClient = nullptr;
+    }
+    if (mapdl_own_wifi && mapdl_wifi_up)
+        tdeck_wifi_disconnect_now();
+    if (mapdl_own_wifi && !mapdl_wifi_up)
+        tdeck_wifi_disconnect_now(); // half-connected attempt: tear it down too
+    mapdl_running = false;
+    mapdl_wifi_up = false;
+    if (mapdl_screen) {
+        lv_label_set_text(mapdl_btn_lbl, "Start");
+        char buf[96];
+        if (finished)
+            snprintf(buf, sizeof(buf), "Done! %lu new, %lu had, %lu failed", (unsigned long)mapdl_done,
+                     (unsigned long)mapdl_skipped, (unsigned long)mapdl_failed);
+        else
+            snprintf(buf, sizeof(buf), "Stopped at %lu of %lu tiles", (unsigned long)(mapdl_done + mapdl_skipped),
+                     (unsigned long)mapdl_total);
+        lv_label_set_text(mapdl_status, buf);
+        lv_label_set_text(mapdl_info, finished ? "Tiles are saved on the SD card.\nTap \"Use this map\" to switch to it."
+                                               : "Everything fetched so far is saved.\nStart again to continue where it left off.");
+        lv_obj_clear_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (finished)
+        playBeep();
+#endif
+}
+
+// One pump tick: advance WiFi bring-up, then fetch AT MOST one tile (each HTTP round
+// trip blocks the UI task briefly; one per tick keeps touch/redraw usable). Runs on
+// the LVGL task on purpose: ALL SdFat access stays on one task.
+void TFTView_320x240::mapdlPump(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (!mapdl_running)
+        return;
+
+    if (!mapdl_wifi_up) {
+        if (tdeck_wifi_connected()) {
+            mapdl_wifi_up = true;
+            if (lv_screen_active() == mapdl_screen)
+                lv_label_set_text(mapdl_status, "Connected, downloading...");
+        } else if (lv_tick_get() > mapdl_deadline) {
+            if (mapdl_screen) {
+                lv_label_set_text(mapdl_status, "Couldn't connect to Wi-Fi");
+                lv_label_set_text(mapdl_info, "Check the network + password in Settings -> Wi-Fi, then try again.");
+            }
+            mapdlStop(false);
+        }
+        return;
+    }
+
+    uint32_t x0, x1, y0, y1;
+    boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, mapdl_z, x0, x1, y0, y1);
+
+    // skip already-downloaded tiles fast (up to 32 per tick), fetch at most one
+    for (int step = 0; step < 32; step++) {
+        if (mapdl_y > y1) { // advance the cursor: y fastest, then x, then zoom
+            mapdl_y = y0;
+            mapdl_x++;
+        }
+        if (mapdl_x > x1) {
+            if (mapdl_z >= mapdl_zmax) {
+                mapdlStop(true);
+                return;
+            }
+            mapdl_z++;
+            boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, mapdl_z, x0, x1, y0, y1);
+            mapdl_x = x0;
+            mapdl_y = y0;
+        }
+
+        char path[120];
+        mapdlTilePath(path, sizeof(path), mapdl_z, mapdl_x, mapdl_y);
+        if (SDFs.exists(path)) {
+            mapdl_skipped++;
+            mapdl_y++;
+            continue;
+        }
+        if (mapdlFetch(mapdl_z, mapdl_x, mapdl_y))
+            mapdl_done++;
+        else
+            mapdl_failed++;
+        mapdl_y++;
+        break; // one HTTP fetch per tick
+    }
+
+    if (mapdl_screen && lv_screen_active() == mapdl_screen) {
+        char buf[96];
+        uint32_t seen = mapdl_done + mapdl_skipped + mapdl_failed;
+        uint32_t left = (mapdl_total > seen) ? (mapdl_total - seen) : 0;
+        snprintf(buf, sizeof(buf), "%lu / %lu tiles  (~%lu min left)", (unsigned long)seen, (unsigned long)mapdl_total,
+                 (unsigned long)(left / 180 + 1));
+        lv_label_set_text(mapdl_status, buf);
+    }
+#endif
 }
 
 // ===== Maps app: user pins (live only on the Maps app's own map) ==========================
@@ -2742,10 +3336,10 @@ void TFTView_320x240::showDiagnostics(void)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
     lv_obj_t *body = lv_label_create(ov);
-    char stall[64] = "";
+    char stall[112] = "";
     if (tdeck_prev_stall_ms()) // the freeze detector's verdict from the previous session
-        snprintf(stall, sizeof(stall), "\nLoop stalled in %s for %lus", tdeck_prev_stall_thread(),
-                 (unsigned long)(tdeck_prev_stall_ms() / 1000));
+        snprintf(stall, sizeof(stall), "\nLoop stalled in %s for %lus\nspiLock: %s", tdeck_prev_stall_thread(),
+                 (unsigned long)(tdeck_prev_stall_ms() / 1000), tdeck_prev_stall_lock());
     char buf[384];
     snprintf(buf, sizeof(buf),
              "Last restart:  %s%s\n\n"
@@ -2783,11 +3377,13 @@ void TFTView_320x240::logDiagBoot(void)
     done = true;
     if (!tdeck_prev_reason_bad()) // only log real faults, not clean power-ons/restarts
         return;
-    char line[160];
+    char line[200];
     if (tdeck_prev_stall_ms())
-        snprintf(line, sizeof(line), "restart=%s  stalled_in=%s  stalled_for=%lus  psram_low=%luk  ram_low=%luk",
+        snprintf(line, sizeof(line),
+                 "restart=%s  stalled_in=%s  stalled_for=%lus  spilock=[%s]  psram_low=%luk  ram_low=%luk",
                  tdeck_prev_reason_str(), tdeck_prev_stall_thread(), (unsigned long)(tdeck_prev_stall_ms() / 1000),
-                 (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024));
+                 tdeck_prev_stall_lock(), (unsigned long)(tdeck_prev_psram_low() / 1024),
+                 (unsigned long)(tdeck_prev_heap_low() / 1024));
     else
         snprintf(line, sizeof(line), "restart=%s  psram_low=%luk  ram_low=%luk", tdeck_prev_reason_str(),
                  (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024));

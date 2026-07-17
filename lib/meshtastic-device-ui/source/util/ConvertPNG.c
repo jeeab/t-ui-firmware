@@ -106,6 +106,7 @@ static void stbi_arena_reset(void) {}
 #endif
 
 #define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG // USGS Topo (and satellite) tile servers serve JPEG
 #define STBI_NO_STDIO
 #define STB_IMAGE_IMPLEMENTATION
 #include "graphics/map/stb_image.h"

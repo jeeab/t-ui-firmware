@@ -319,6 +319,36 @@ class TFTView_320x240 : public MeshtasticView
     lv_timer_t *maps_sats_timer = nullptr;  // drives updateMapsSats while Maps is on screen
     lv_obj_t *maps_notice = nullptr;        // the transient message label
     uint32_t maps_notice_until = 0;         // lv_tick deadline to hide it (0 = hidden)
+    // Maps: style picker (gear cog) + USGS region downloader
+    void openMapsMenu(void);                    // gear -> style list + "Download this area"
+    void closeMapsMenu(void);
+    void mapsApplyStyle(const char *style, bool persist); // set style + per-style .format/.url wiring
+    lv_obj_t *maps_gear_btn = nullptr;
+    lv_obj_t *maps_style_ovl = nullptr;
+    void openMapDownload(void);   // capture the current viewport as the download box + show the screen
+    void mapdlUpdateEstimate(void);
+    void mapdlStart(void);
+    void mapdlStop(bool finished);
+    void mapdlPump(void);                       // one WiFi/fetch step per timer tick (UI task = SD-safe)
+    uint32_t mapdlCountTiles(uint8_t zmin, uint8_t zmax) const;
+    lv_obj_t *mapdl_screen = nullptr;
+    lv_obj_t *mapdl_status = nullptr;   // big status line ("Connecting…" / "1234 / 5220 tiles")
+    lv_obj_t *mapdl_info = nullptr;     // detail text
+    lv_obj_t *mapdl_btn = nullptr;      // Start / Stop
+    lv_obj_t *mapdl_btn_lbl = nullptr;
+    lv_obj_t *mapdl_use_btn = nullptr;  // "Use this map now" (shown when done)
+    lv_obj_t *mapdl_zmin_dd = nullptr;  // detail range dropdowns
+    lv_obj_t *mapdl_zmax_dd = nullptr;
+    lv_timer_t *mapdl_timer = nullptr;  // the pump; independent of which screen is showing
+    bool mapdl_running = false;
+    bool mapdl_own_wifi = false;        // we brought WiFi up -> we take it down
+    bool mapdl_wifi_up = false;
+    float mapdl_latN = 0, mapdl_latS = 0, mapdl_lonW = 0, mapdl_lonE = 0; // captured viewport box
+    uint8_t mapdl_zmin = 10, mapdl_zmax = 15;
+    uint8_t mapdl_z = 0;                            // zoom level currently being fetched
+    uint32_t mapdl_x = 0, mapdl_y = 0;              // next tile cursor within mapdl_z
+    uint32_t mapdl_total = 0, mapdl_done = 0, mapdl_failed = 0, mapdl_skipped = 0;
+    uint32_t mapdl_deadline = 0;                    // WiFi association timeout
     // mesh kill switch + a settings screen reachable from the grid
     void createSettingsScreen(void);
     void openSettings(void);
