@@ -29,6 +29,17 @@ extern "C" void tdeck_lua_app_touch(int x, int y);
 extern "C" void tdeck_lua_app_drag(int x, int y);
 extern "C" void tdeck_lua_app_stop(void);
 
+// Multi-touch reader, installed by LGFXDriver<LGFX>::init (it owns the touch
+// hardware handle). Null until the display driver comes up.
+int (*tdeck_touch_reader)(unsigned short *xs, unsigned short *ys, int max) = nullptr;
+
+// Bridge for the firmware-side Lua engine: device.touches() lands here. Returns the
+// number of fingers on the screen (up to `max`), or -1 when no reader is installed.
+extern "C" int tdeck_touch_read(unsigned short *xs, unsigned short *ys, int max)
+{
+    return tdeck_touch_reader ? tdeck_touch_reader(xs, ys, max) : -1;
+}
+
 namespace
 {
 lv_obj_t *luaScreen = nullptr;

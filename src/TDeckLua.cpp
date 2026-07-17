@@ -28,6 +28,10 @@ extern "C" void tdeck_ui_line(int id, int x1, int y1, int x2, int y2, int thickn
 extern "C" void tdeck_ui_hide(int id);
 extern "C" int tdeck_appfs_read(const char *name, char *buf, int cap);
 extern "C" bool tdeck_appfs_write(const char *name, const char *data, int len);
+// Multi-touch: read up to `max` fingers currently on the screen (the GT911 tracks
+// several; LVGL only ever consumes one). Returns the count, or -1 if no reader is
+// wired up (pre-16.4 device-ui). Lets games use both halves of the screen at once.
+extern "C" int tdeck_touch_read(unsigned short *xs, unsigned short *ys, int max);
 // --- other firmware helpers ---------------------------------------------------
 void playBeep();                              // buzz.cpp (C++ linkage)
 extern "C" void tdeck_beep_gain(float gain);  // TDeckBeep.cpp — temporarily boost buzzer volume
@@ -143,6 +147,23 @@ static int api_device_time(lua_State *L)
     return 1;
 }
 
+// device.touches() -> n, x1, y1, x2, y2 — every finger on the screen right now (up
+// to 2). n is 0 when nothing is touching. Poll it from on_tick for true multi-touch
+// (e.g. pinball holding both flippers); on_touch/on_drag stay single-point.
+static int api_device_touches(lua_State *L)
+{
+    unsigned short xs[2], ys[2];
+    int n = tdeck_touch_read(xs, ys, 2);
+    if (n < 0)
+        n = 0;
+    lua_pushinteger(L, n);
+    for (int i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)xs[i]);
+        lua_pushinteger(L, (lua_Integer)ys[i]);
+    }
+    return 1 + 2 * n;
+}
+
 static void call_optional(const char *fn)
 {
     if (!AppL)
@@ -183,7 +204,8 @@ extern "C" int tdeck_lua_app_start(const char *script)
                                          {"line", api_screen_line},
                                          {"hide", api_screen_hide},
                                          {nullptr, nullptr}};
-    static const luaL_Reg deviceLib[] = {{"beep", api_device_beep}, {"time", api_device_time}, {nullptr, nullptr}};
+    static const luaL_Reg deviceLib[] = {
+        {"beep", api_device_beep}, {"time", api_device_time}, {"touches", api_device_touches}, {nullptr, nullptr}};
     static const luaL_Reg storeLib[] = {{"read", api_store_read}, {"write", api_store_write}, {nullptr, nullptr}};
     luaL_newlib(AppL, screenLib);
     lua_setglobal(AppL, "screen");

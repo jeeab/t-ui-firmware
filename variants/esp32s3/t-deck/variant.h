@@ -38,7 +38,11 @@
 #define BUTTON_ACTIVE_LOW true
 #define BUTTON_ACTIVE_PULLUP true
 
-#define GPS_DEFAULT_NOT_PRESENT 1
+// GPS_DEFAULT_NOT_PRESENT removed for the T-Deck launcher fork: stock defines it
+// because the base T-Deck ships without GPS, but ours has one, and that default
+// left fresh configs stuck in NOT_PRESENT — the state the Settings GPS switch
+// couldn't recover from. Without it a fresh config defaults to ENABLED (same as
+// t-deck-pro); if the chip really is absent the probe just marks it off for the boot.
 #define GPS_RX_PIN 44
 #define GPS_TX_PIN 43
 

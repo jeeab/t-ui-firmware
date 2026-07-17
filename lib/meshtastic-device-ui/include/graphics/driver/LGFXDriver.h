@@ -218,11 +218,43 @@ template <class LGFX> void LGFXDriver<LGFX>::touchpad_read(lv_indev_t *indev_dri
     }
 }
 
+// Multi-touch reader slot (defined in TFT/LuaApp.cpp; feeds device.touches()).
+extern int (*tdeck_touch_reader)(unsigned short *xs, unsigned short *ys, int max);
+
 template <class LGFX> void LGFXDriver<LGFX>::init(DeviceGUI *gui)
 {
     ILOG_DEBUG("LGFXDriver<LGFX>::init...");
     init_lgfx();
     TFTDriver<LGFX>::init(gui);
+
+    // Install the multi-touch reader for Lua apps: read up to 2 fingers straight
+    // from the touch controller (the GT911 tracks several). LVGL's own input feed
+    // stays single-point; the controller driver caches reads, so polling from the
+    // Lua tick alongside LVGL's poll is safe.
+    tdeck_touch_reader = [](unsigned short *xs, unsigned short *ys, int max) -> int {
+        if (tdeck_input_gated)
+            return 0; // screen dark/locked: apps see no touches, same as LVGL
+#ifdef CUSTOM_TOUCH_DRIVER
+        uint16_t tx = 0, ty = 0;
+        if (max >= 1 && lgfx->getTouchXY(&tx, &ty)) {
+            xs[0] = tx;
+            ys[0] = ty;
+            return 1;
+        }
+        return 0;
+#else
+        lgfx::touch_point_t tp[2];
+        int want = max < 2 ? max : 2;
+        int n = (int)lgfx->getTouch(tp, (uint_fast8_t)want);
+        if (n > want)
+            n = want;
+        for (int i = 0; i < n; i++) {
+            xs[i] = (unsigned short)tp[i].x;
+            ys[i] = (unsigned short)tp[i].y;
+        }
+        return n;
+#endif
+    };
 
     // LVGL: setup display device driver
     ILOG_DEBUG("LVGL display driver init...");

@@ -980,7 +980,12 @@ void setup()
     if (sensor_detected == false) {
 #endif
         if (HAS_GPS) {
-            if (config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT) {
+            // T-Deck launcher: create the GPS driver even when the saved config says
+            // NOT_PRESENT (stock default for the GPS-less base T-Deck; ours has GPS).
+            // While NOT_PRESENT the driver skips its probe and sleeps, but it has to
+            // exist for the Settings GPS switch to turn it on live — otherwise the
+            // switch has nothing to talk to until a reboot, and silently does nothing.
+            {
                 gps = GPS::createGps();
                 if (gps) {
                     gpsStatus->observe(&gps->newStatus);
