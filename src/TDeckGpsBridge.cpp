@@ -23,6 +23,13 @@ extern "C" bool tdeck_gps_has_lock(void)
     return gpsStatus && gpsStatus->getHasLock();
 }
 
+// Position dilution of precision x100 (e.g. 250 = PDOP 2.5); 0 = unknown. Lets the
+// UI tell a solid fix from a marginal one (3 sats "locked" can be blocks off).
+extern "C" uint32_t tdeck_gps_dop(void)
+{
+    return gpsStatus ? gpsStatus->getDOP() : 0;
+}
+
 // Current fix (1e-7 degrees, same scale the UI already uses). Returns false
 // until there's a usable position. getLatitude()/getLongitude() also cover the
 // fixed-position config case, where hasLock may stay false.

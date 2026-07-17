@@ -24,12 +24,12 @@ MapPanel::MapPanel(lv_obj_t *p, ITileService *s)
  */
 void MapPanel::redraw(void)
 {
-    static int16_t x = INT16_MAX;
-    static int16_t y = INT16_MAX;
+    // per-instance redraw progress (was function-local statics shared across
+    // BOTH map panels — see the member declarations for the story)
+    int16_t &x = redrawX;
+    int16_t &y = redrawY;
 
     constexpr uint32_t RETRY_MS = 10000;
-    // tile hash -> next retry time (lv_tick_get ms)
-    static std::unordered_map<uint32_t, uint32_t> failedTilesRetryAt;
 
     auto tickDue = [](uint32_t now, uint32_t due) -> bool {
         return (int32_t)(now - due) >= 0; // wrap-safe

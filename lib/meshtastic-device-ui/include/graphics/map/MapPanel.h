@@ -88,6 +88,14 @@ class MapPanel
     bool redrawCompleted = true;
     bool locked = false; // map follows GPS location
 
+    // Incremental-redraw progress + failed-tile retry schedule. These were
+    // function-local STATICS in redraw(), shared by every MapPanel instance —
+    // with two panels alive (mesh map + Maps app, often showing the same tile
+    // coordinates) they corrupted each other's progress and retry bookkeeping.
+    int16_t redrawX = INT16_MAX;
+    int16_t redrawY = INT16_MAX;
+    std::unordered_map<uint32_t, uint32_t> failedTilesRetryAt; // tile hash -> next retry (lv_tick ms)
+
     int16_t widthPixel;  // visible panel width
     int16_t heightPixel; // visible panel height
     int16_t xOffset;     // pixel offset x panel to upper left corner of (fully visible) upper left tile

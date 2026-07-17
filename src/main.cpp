@@ -1276,11 +1276,16 @@ extern "C" void tdeck_gps_control_service(void);
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
+// Main-loop heartbeat for the freeze detector (TDeckMemInfo.cpp): if this loop stops
+// iterating, the UI task records how long + which OSThread it's stuck in, so the 90s
+// app-watchdog "FROZE (task)" reboots finally say WHERE the loop froze.
+extern "C" void tdeck_loop_heartbeat(void);
 
 void loop()
 {
     runASAP = false;
 
+    tdeck_loop_heartbeat();
     tdeck_mesh_switch_service();
     tdeck_gps_control_service();
     tdeck_sound_service();

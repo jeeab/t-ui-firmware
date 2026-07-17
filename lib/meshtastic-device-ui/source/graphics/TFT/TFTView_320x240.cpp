@@ -74,6 +74,7 @@ extern "C" bool tdeck_get_mesh_enabled(void);
 extern "C" uint32_t tdeck_gps_num_sats(void);
 extern "C" bool tdeck_gps_has_lock(void);
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
+extern "C" uint32_t tdeck_gps_dop(void); // PDOP x100, 0 = unknown
 // GPS on/off + check-interval control bridge (src/TDeckGpsControl.cpp) — applied
 // live with no reboot.
 extern "C" void tdeck_gps_set_enabled(bool on);
@@ -126,6 +127,10 @@ extern "C" const char *tdeck_prev_reason_str(void);
 extern "C" bool tdeck_prev_reason_bad(void);
 extern "C" uint32_t tdeck_prev_psram_low(void);
 extern "C" uint32_t tdeck_prev_heap_low(void);
+// Freeze detector: if the previous session's main loop stalled before the reboot,
+// how long it was stuck and which OSThread it was stuck inside.
+extern "C" uint32_t tdeck_prev_stall_ms(void);
+extern "C" const char *tdeck_prev_stall_thread(void);
 // Sound toggle (TDeckBeep.cpp): drives Meshtastic's buzzer_mode — one switch for game/timer
 // beeps AND message-notification sounds. Persists in the device config (no reboot).
 extern "C" bool tdeck_sound_get_enabled(void);
@@ -606,6 +611,26 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 18, 15, 10, 8, color, 1);
         icBox(ic, 21, 6, 5, 9, color, 1);
         icBox(ic, 26, 13, 6, 6, 0xffffff, 2);      // the bob, off to one side
+    } else if (!strcmp(name, "Dice")) { // white die showing 5, red die showing 3
+        icBox(ic, 3, 2, 20, 20, 0xf2f2f2, 5);
+        icBox(ic, 6, 5, 4, 4, 0x1c1c1e, LV_RADIUS_CIRCLE);
+        icBox(ic, 16, 5, 4, 4, 0x1c1c1e, LV_RADIUS_CIRCLE);
+        icBox(ic, 11, 10, 4, 4, 0x1c1c1e, LV_RADIUS_CIRCLE);
+        icBox(ic, 6, 15, 4, 4, 0x1c1c1e, LV_RADIUS_CIRCLE);
+        icBox(ic, 16, 15, 4, 4, 0x1c1c1e, LV_RADIUS_CIRCLE);
+        icBox(ic, 23, 17, 20, 20, 0xff453a, 5);
+        icBox(ic, 26, 20, 4, 4, 0xffffff, LV_RADIUS_CIRCLE);
+        icBox(ic, 31, 25, 4, 4, 0xffffff, LV_RADIUS_CIRCLE);
+        icBox(ic, 36, 30, 4, 4, 0xffffff, LV_RADIUS_CIRCLE);
+    } else if (!strcmp(name, "Reaction")) { // lightning bolt (two slanted strokes)
+        lv_obj_t *b1 = icBox(ic, 20, 1, 8, 19, 0xffd60a, 2);
+        lv_obj_set_style_transform_pivot_x(b1, 4, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(b1, 9, LV_PART_MAIN);
+        lv_obj_set_style_transform_rotation(b1, 250, LV_PART_MAIN); // 25 deg lean
+        lv_obj_t *b2 = icBox(ic, 15, 20, 8, 19, 0xffd60a, 2);
+        lv_obj_set_style_transform_pivot_x(b2, 4, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(b2, 9, LV_PART_MAIN);
+        lv_obj_set_style_transform_rotation(b2, 250, LV_PART_MAIN);
     } else { // fallback: a colored rounded square
         icBox(ic, 11, 8, 24, 24, color, 6);
     }
@@ -651,8 +676,12 @@ void TFTView_320x240::createLauncher(void)
             // For the first ~20s after a fault, flash WHY we last restarted (red) so
             // it can't be missed; then settle into the live heap/PSRAM readout.
             if (tdeck_prev_reason_bad() && lv_tick_get() < 20000) {
-                snprintf(buf, sizeof(buf), "last: %s  ps low %luk", tdeck_prev_reason_str(),
-                         (unsigned long)(tdeck_prev_psram_low() / 1024));
+                if (tdeck_prev_stall_ms()) // freeze detector caught it in the act: name the culprit
+                    snprintf(buf, sizeof(buf), "last: %s in %s (%lus)", tdeck_prev_reason_str(),
+                             tdeck_prev_stall_thread(), (unsigned long)(tdeck_prev_stall_ms() / 1000));
+                else
+                    snprintf(buf, sizeof(buf), "last: %s  ps low %luk", tdeck_prev_reason_str(),
+                             (unsigned long)(tdeck_prev_psram_low() / 1024));
                 lv_obj_set_style_text_color(THIS->launcher_mem_label, lv_color_hex(0xff453a), LV_PART_MAIN);
             } else {
                 // Fast RAM only (free / lowest-since-boot). PSRAM was dropped from the top bar to
@@ -964,6 +993,15 @@ void TFTView_320x240::buildAppGrid(void)
         if (!app->panel)
             return;
         lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+        // Fresh install, no LoRa region yet: Meshtastic already locked its sidebar
+        // and queued the first-run setup panel (requestSetup), but the launcher was
+        // covering it. Re-present setup instead of Home, or the user lands on a
+        // dead-sidebar Home with no way to ever set the region (brother's install).
+        if (app->panel == &objects.home_panel &&
+            THIS->db.config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+            THIS->requestSetup();
+            return;
+        }
         THIS->ui_set_active(*app->button, *app->panel, *app->topPanel);
     };
     // long-press any tile -> open the Arrange screen (reorder apps). Set the suppress flag
@@ -2284,8 +2322,15 @@ void TFTView_320x240::updateMapsSats(void)
         lv_obj_set_style_text_color(maps_sats_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     } else {
         bool lock = tdeck_gps_has_lock();
-        lv_label_set_text_fmt(maps_sats_label, "%u sats", (unsigned)tdeck_gps_num_sats());
-        lv_obj_set_style_text_color(maps_sats_label, lv_color_hex(lock ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
+        uint32_t sats = tdeck_gps_num_sats();
+        lv_label_set_text_fmt(maps_sats_label, "%u sats", (unsigned)sats);
+        // Green only when the fix is trustworthy. A 3-sat "lock" (or bad satellite
+        // geometry, PDOP > 5) is a marginal 2D fix that can sit blocks away — show
+        // it AMBER so a wandering dot reads as "weak signal", not a broken map.
+        uint32_t dop = tdeck_gps_dop();
+        bool weak = sats < 4 || dop > 500;
+        lv_obj_set_style_text_color(maps_sats_label, lv_color_hex(!lock ? 0x8e8e93 : (weak ? 0xff9f0a : 0x30d158)),
+                                    LV_PART_MAIN);
         // Keep the "you are here" dot on the RAW GPS fix — the same source the "Me"
         // button uses — instead of the mesh node position, which Meshtastic snaps to
         // a privacy grid (that mismatch is why the dot sat in the wrong spot).
@@ -2697,14 +2742,18 @@ void TFTView_320x240::showDiagnostics(void)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
     lv_obj_t *body = lv_label_create(ov);
-    char buf[320];
+    char stall[64] = "";
+    if (tdeck_prev_stall_ms()) // the freeze detector's verdict from the previous session
+        snprintf(stall, sizeof(stall), "\nLoop stalled in %s for %lus", tdeck_prev_stall_thread(),
+                 (unsigned long)(tdeck_prev_stall_ms() / 1000));
+    char buf[384];
     snprintf(buf, sizeof(buf),
-             "Last restart:  %s\n\n"
+             "Last restart:  %s%s\n\n"
              "Fast RAM   free %luk   low %luk\n"
              "PSRAM      free %luk   low %luk\n\n"
              "Previous run's worst:\n"
              "   fast %luk    psram %luk",
-             tdeck_prev_reason_str(), (unsigned long)(tdeck_free_heap() / 1024),
+             tdeck_prev_reason_str(), stall, (unsigned long)(tdeck_free_heap() / 1024),
              (unsigned long)(tdeck_min_free_heap() / 1024), (unsigned long)(tdeck_free_psram() / 1024),
              (unsigned long)(tdeck_min_free_psram() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024),
              (unsigned long)(tdeck_prev_psram_low() / 1024));
@@ -2734,9 +2783,14 @@ void TFTView_320x240::logDiagBoot(void)
     done = true;
     if (!tdeck_prev_reason_bad()) // only log real faults, not clean power-ons/restarts
         return;
-    char line[128];
-    snprintf(line, sizeof(line), "restart=%s  psram_low=%luk  ram_low=%luk", tdeck_prev_reason_str(),
-             (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024));
+    char line[160];
+    if (tdeck_prev_stall_ms())
+        snprintf(line, sizeof(line), "restart=%s  stalled_in=%s  stalled_for=%lus  psram_low=%luk  ram_low=%luk",
+                 tdeck_prev_reason_str(), tdeck_prev_stall_thread(), (unsigned long)(tdeck_prev_stall_ms() / 1000),
+                 (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024));
+    else
+        snprintf(line, sizeof(line), "restart=%s  psram_low=%luk  ram_low=%luk", tdeck_prev_reason_str(),
+                 (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024));
     diagLog(line);
 }
 

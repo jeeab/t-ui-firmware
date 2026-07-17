@@ -39,6 +39,8 @@ struct UObj {
     int type; // 0 = label, 1 = box, 2 = line
     lv_obj_t *obj;
     lv_point_precise_t pts[2]; // line endpoints (lv_line keeps a pointer to these — must persist)
+    int32_t cp[5];             // last-drawn geometry — lets a repeat call skip LVGL entirely
+    uint32_t ccol;             // last-drawn color
 };
 UObj uobjs[80];
 constexpr int kMaxObj = 80;
@@ -64,10 +66,10 @@ UObj *findOrCreateSlot(int id, int type)
         o = lv_label_create(luaScreen);
     } else if (type == 2) {
         o = lv_line_create(luaScreen);
-        lv_obj_set_pos(o, 0, 0);          // points are absolute screen coords
-        lv_obj_set_size(o, 320, 240);     // full field so a line never clips
+        // pos/size are set per draw to the line's own bounding box — a full-screen
+        // object here made every flipper move invalidate the whole 320x240
         lv_obj_set_style_pad_all(o, 0, 0);
-        lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0); // it spans the screen — never fill it
+        lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(o, 0, 0);
     } else {
         o = lv_obj_create(luaScreen);
@@ -78,13 +80,9 @@ UObj *findOrCreateSlot(int id, int type)
     uobjs[uobjCount].id = id;
     uobjs[uobjCount].type = type;
     uobjs[uobjCount].obj = o;
+    uobjs[uobjCount].cp[0] = INT32_MIN; // never matches -> first draw always lands
+    uobjs[uobjCount].ccol = 0;
     return &uobjs[uobjCount++];
-}
-
-lv_obj_t *findOrCreate(int id, int type)
-{
-    UObj *s = findOrCreateSlot(id, type);
-    return s ? s->obj : nullptr;
 }
 
 void tickCb(lv_timer_t *) { tdeck_lua_app_tick(33); }
@@ -178,6 +176,8 @@ void runFromSd(const char *dir, const char *path, const char *bundled)
     else
         lv_timer_resume(luaTick);
 
+    // PRESSED (finger lands), not CLICKED (finger lifts) — a flipper that fires on
+    // release feels like lag; every app here wants the tap the moment it happens.
     lv_obj_add_event_cb(
         luaScreen,
         [](lv_event_t *) {
@@ -188,7 +188,7 @@ void runFromSd(const char *dir, const char *path, const char *bundled)
             lv_indev_get_point(d, &p);
             tdeck_lua_app_touch((int)p.x, (int)p.y);
         },
-        LV_EVENT_CLICKED, NULL);
+        LV_EVENT_PRESSED, NULL);
     // Continuous position while the finger is down + moving -> on_drag (paddle steering, etc.)
     lv_obj_add_event_cb(
         luaScreen,
@@ -522,20 +522,41 @@ end
 // ---- drawing bridges the Lua toolbox calls (from src/TDeckLua.cpp) -----------
 extern "C" void tdeck_ui_label(int id, int x, int y, const char *text, uint32_t color)
 {
-    lv_obj_t *o = findOrCreate(id, 0);
-    if (!o)
+    UObj *s = findOrCreateSlot(id, 0);
+    if (!s)
         return;
+    lv_obj_t *o = s->obj;
+    if (!text)
+        text = "";
+    // Games redraw everything every tick; only touch LVGL when something changed,
+    // or every repeat call invalidates (repaints) the area for nothing.
+    if (s->cp[0] == x && s->cp[1] == y && s->ccol == color && !lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN) &&
+        strcmp(lv_label_get_text(o), text) == 0)
+        return;
+    s->cp[0] = x;
+    s->cp[1] = y;
+    s->ccol = color;
     lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(o, text ? text : "");
+    lv_label_set_text(o, text);
     lv_obj_set_pos(o, x, y);
     lv_obj_set_style_text_color(o, lv_color_hex(color), 0);
 }
 
 extern "C" void tdeck_ui_box(int id, int x, int y, int w, int h, uint32_t color, int radius)
 {
-    lv_obj_t *o = findOrCreate(id, 1);
-    if (!o)
+    UObj *s = findOrCreateSlot(id, 1);
+    if (!s)
         return;
+    lv_obj_t *o = s->obj;
+    if (s->cp[0] == x && s->cp[1] == y && s->cp[2] == w && s->cp[3] == h && s->cp[4] == radius && s->ccol == color &&
+        !lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN))
+        return; // unchanged — e.g. redrawing all bumpers when only one flashed
+    s->cp[0] = x;
+    s->cp[1] = y;
+    s->cp[2] = w;
+    s->cp[3] = h;
+    s->cp[4] = radius;
+    s->ccol = color;
     lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_pos(o, x, y);
     lv_obj_set_size(o, w, h);
@@ -552,11 +573,30 @@ extern "C" void tdeck_ui_line(int id, int x1, int y1, int x2, int y2, int thickn
     UObj *s = findOrCreateSlot(id, 2);
     if (!s)
         return;
+    if (s->cp[0] == x1 && s->cp[1] == y1 && s->cp[2] == x2 && s->cp[3] == y2 && s->cp[4] == thickness &&
+        s->ccol == color && !lv_obj_has_flag(s->obj, LV_OBJ_FLAG_HIDDEN))
+        return; // unchanged (a resting flipper redrawn every tick) — skip the repaint
+    s->cp[0] = x1;
+    s->cp[1] = y1;
+    s->cp[2] = x2;
+    s->cp[3] = y2;
+    s->cp[4] = thickness;
+    s->ccol = color;
     lv_obj_clear_flag(s->obj, LV_OBJ_FLAG_HIDDEN);
-    s->pts[0].x = x1;
-    s->pts[0].y = y1;
-    s->pts[1].x = x2;
-    s->pts[1].y = y2;
+    // Size the object to the line's own bounding box (pad covers the rounded caps),
+    // with the points relative to it — so moving a flipper repaints a small patch,
+    // not the whole screen.
+    int pad = thickness / 2 + 2;
+    int ox = (x1 < x2 ? x1 : x2) - pad;
+    int oy = (y1 < y2 ? y1 : y2) - pad;
+    int w = (x1 > x2 ? x1 - x2 : x2 - x1) + pad * 2;
+    int h = (y1 > y2 ? y1 - y2 : y2 - y1) + pad * 2;
+    lv_obj_set_pos(s->obj, ox, oy);
+    lv_obj_set_size(s->obj, w, h);
+    s->pts[0].x = x1 - ox;
+    s->pts[0].y = y1 - oy;
+    s->pts[1].x = x2 - ox;
+    s->pts[1].y = y2 - oy;
     lv_line_set_points(s->obj, s->pts, 2);
     lv_obj_set_style_line_width(s->obj, thickness, 0);
     lv_obj_set_style_line_color(s->obj, lv_color_hex(color), 0);
