@@ -29,6 +29,21 @@ bool URLService::load(const char *name, void *img)
         return false;
     }
 
+    // Browse-fill runs on the UI task, so a fetch is a screen freeze for its whole
+    // duration (TLS handshake + GET). It's a bonus feature, never worth wrecking the
+    // panning feel: skip while any input is held down (mid-drag/mid-press) and allow
+    // at most ~2 attempts a second. Skipped tiles show the no-tile image and
+    // MapPanel's retry sweep picks them up once the user goes idle.
+    for (lv_indev_t *i = lv_indev_get_next(NULL); i; i = lv_indev_get_next(i)) {
+        if (lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED)
+            return false;
+    }
+    static uint32_t s_lastAttempt = 0;
+    uint32_t now = lv_tick_get();
+    if (now - s_lastAttempt < 500)
+        return false;
+    s_lastAttempt = now;
+
     struct LvFreeGuard {
         uint8_t *&ptr;
         ~LvFreeGuard() { lv_free(ptr); }
@@ -42,6 +57,9 @@ bool URLService::load(const char *name, void *img)
     }
 
     http.setReuse(false);
+    // hard caps: a dead server may cost at most ~2.5s of UI, not the 5s+ defaults
+    http.setConnectTimeout(2500);
+    http.setTimeout(2500);
     bool began;
     if (strncmp(url.c_str(), "https", 5) == 0) {
         // https tile servers (Google, USGS): TLS without cert pinning — it's public

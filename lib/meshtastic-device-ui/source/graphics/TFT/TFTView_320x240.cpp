@@ -3052,6 +3052,14 @@ void TFTView_320x240::mapdlPump(void)
         return;
     }
 
+    // each fetch blocks the UI task for its duration — while the user is actively
+    // touching (dragging a map, playing a game), sit this tick out; idle ticks do
+    // the fetching. Costs a little download speed only while the screen is in use.
+    for (lv_indev_t *i = lv_indev_get_next(NULL); i; i = lv_indev_get_next(i)) {
+        if (lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED)
+            return;
+    }
+
     uint32_t x0, x1, y0, y1;
     boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, mapdl_z, x0, x1, y0, y1);
 

@@ -36,7 +36,8 @@ struct TileCacheEntry {
     lv_image_header_t header;
     uint32_t stamp = 0;
 };
-constexpr int kTileCacheSlots = 10; // > the ~6 tiles ever visible at once
+constexpr int kTileCacheSlots = 18; // two full screens' worth (~9 visible) — zooming
+                                    // back to the previous level stays instant
 TileCacheEntry s_tileCache[kTileCacheSlots];
 uint32_t s_tileStamp = 0;
 
