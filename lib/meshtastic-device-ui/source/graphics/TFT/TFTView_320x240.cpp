@@ -2203,12 +2203,16 @@ void TFTView_320x240::openMaps(void)
                 lv_screen_load_anim(THIS->launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
         });
         barBtn("-", 34, LV_ALIGN_TOP_LEFT, 66, 0x2c2c2e, [](lv_event_t *) {
-            if (THIS->userMap)
+            if (THIS->userMap) {
                 THIS->userMap->setZoom(MapTileSettings::getZoomLevel() - 1);
+                THIS->updateMapsZoom();
+            }
         });
         barBtn("+", 34, LV_ALIGN_TOP_LEFT, 104, 0x2c2c2e, [](lv_event_t *) {
-            if (THIS->userMap)
+            if (THIS->userMap) {
                 THIS->userMap->setZoom(MapTileSettings::getZoomLevel() + 1);
+                THIS->updateMapsZoom();
+            }
         });
         barBtn("Me", 44, LV_ALIGN_TOP_RIGHT, -66, 0x30d158, [](lv_event_t *) {
             if (!THIS->userMap)
@@ -2241,17 +2245,32 @@ void TFTView_320x240::openMaps(void)
         lv_obj_set_style_bg_opa(maps_gear_btn, LV_OPA_80, LV_PART_MAIN);
         lv_obj_align(maps_gear_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
         {
-            // draw a mini gear (ring + 4 nubs) like the Settings tile icon — this
-            // build's font has no symbol glyphs, so LV_SYMBOL_SETTINGS renders blank
+            // draw a mini gear, 8 teeth (4 cardinal + 4 diagonal), like a real cog —
+            // this build's font has no symbol glyphs, so LV_SYMBOL_SETTINGS renders blank
             lv_obj_set_style_pad_all(maps_gear_btn, 0, LV_PART_MAIN);
             icRing(maps_gear_btn, 10, 10, 16, 0xffffff, 3);
-            icBox(maps_gear_btn, 16, 5, 4, 6, 0xffffff, 1);
-            icBox(maps_gear_btn, 16, 25, 4, 6, 0xffffff, 1);
-            icBox(maps_gear_btn, 5, 16, 6, 4, 0xffffff, 1);
-            icBox(maps_gear_btn, 25, 16, 6, 4, 0xffffff, 1);
+            icBox(maps_gear_btn, 16, 5, 4, 6, 0xffffff, 1);  // top
+            icBox(maps_gear_btn, 16, 25, 4, 6, 0xffffff, 1); // bottom
+            icBox(maps_gear_btn, 5, 16, 6, 4, 0xffffff, 1);  // left
+            icBox(maps_gear_btn, 25, 16, 6, 4, 0xffffff, 1); // right
+            icBox(maps_gear_btn, 8, 8, 4, 4, 0xffffff, 1);   // diagonals
+            icBox(maps_gear_btn, 24, 8, 4, 4, 0xffffff, 1);
+            icBox(maps_gear_btn, 8, 24, 4, 4, 0xffffff, 1);
+            icBox(maps_gear_btn, 24, 24, 4, 4, 0xffffff, 1);
         }
         lv_obj_add_event_cb(
             maps_gear_btn, [](lv_event_t *) { THIS->openMapsMenu(); }, LV_EVENT_CLICKED, NULL);
+
+        // zoom level readout, bottom-left over the map
+        maps_zoom_label = lv_label_create(maps_screen);
+        lv_obj_set_style_text_color(maps_zoom_label, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_zoom_label, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_zoom_label, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_set_style_pad_hor(maps_zoom_label, 6, LV_PART_MAIN);
+        lv_obj_set_style_pad_ver(maps_zoom_label, 2, LV_PART_MAIN);
+        lv_obj_set_style_radius(maps_zoom_label, 6, LV_PART_MAIN);
+        lv_obj_align(maps_zoom_label, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+        updateMapsZoom();
 
         // Leaving the Maps app? Drop its tile cache to free RAM; it rebuilds on return.
         lv_obj_add_event_cb(
@@ -2336,8 +2355,17 @@ void TFTView_320x240::openMaps(void)
 
 // 1 Hz while the Maps screen is up: sats-in-view from the GPS driver; also expires
 // the transient notice so it needs no timer of its own.
+// Bottom-left zoom readout. Cheap enough to refresh from the 1s sats timer as a
+// catch-all (style switches, Me-button re-centers...) plus instantly from the +/-.
+void TFTView_320x240::updateMapsZoom(void)
+{
+    if (maps_zoom_label)
+        lv_label_set_text_fmt(maps_zoom_label, "z%u", (unsigned)MapTileSettings::getZoomLevel());
+}
+
 void TFTView_320x240::updateMapsSats(void)
 {
+    updateMapsZoom();
     if (!maps_sats_label || lv_screen_active() != maps_screen)
         return;
 
@@ -2422,8 +2450,44 @@ inline void boxTiles(float latN, float latS, float lonW, float lonE, uint8_t z, 
     y1 = (uint32_t)clampf(floorf(lat2ty(latS, z)));
 }
 
-const char *kUsgsStyle = "USGS-Topo";
-const char *kUsgsUrlTemplate = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}";
+// Downloadable tile sources. Only services whose terms allow bulk downloads make this
+// list (government mapping agencies, basically). The template is {z}/{y}/{x} form —
+// mapdlBuildUrl fills it — and doubles as the .url browse-fill line written to the
+// card. estKB feeds the size/time estimate (USGS jpg ≈ 20KB, TopPlus png ≈ 35KB).
+struct MapDlSource {
+    const char *label;  // shown in the Source dropdown, region-prefixed
+    const char *folder; // style folder under /maps
+    const char *urlTemplate;
+    const char *ext; // tile format written to .format ("jpg"/"png")
+    uint8_t estKB;   // typical tile size for the estimate
+};
+const MapDlSource kMapDlSources[] = {
+    {"(US) USGS Topo", "USGS-Topo", "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
+     "jpg", 20},
+    {"(EU) TopPlusOpen", "TopPlusOpen",
+     "https://sgx.geodatenzentrum.de/wmts_topplus_open/tile/1.0.0/web/default/WEBMERCATOR/{z}/{y}/{x}.png", "png", 35},
+};
+int s_mapdlSrcIdx = 0; // which source the download screen has selected
+inline const MapDlSource &mapdlSrc(void)
+{
+    return kMapDlSources[s_mapdlSrcIdx];
+}
+
+// Fill a {z}/{y}/{x} template with real numbers.
+void mapdlBuildUrl(char *out, size_t cap, const char *tpl, uint8_t z, uint32_t x, uint32_t y)
+{
+    size_t o = 0;
+    for (const char *p = tpl; *p && o + 12 < cap; p++) {
+        if (p[0] == '{' && p[2] == '}') {
+            unsigned long v = (p[1] == 'z') ? z : (p[1] == 'y') ? y : x;
+            o += snprintf(out + o, cap - o, "%lu", v);
+            p += 2;
+        } else {
+            out[o++] = *p;
+        }
+    }
+    out[o] = 0;
+}
 
 #ifdef ARDUINO_ARCH_ESP32
 // One TLS connection reused for the whole download (a handshake per tile would be
@@ -2433,8 +2497,8 @@ WiFiClientSecure *mapdlClient = nullptr;
 
 void mapdlTilePath(char *buf, size_t cap, uint8_t z, uint32_t x, uint32_t y)
 {
-    snprintf(buf, cap, "%s/%s/%u/%lu/%lu.jpg", MapTileSettings::getPrefix(), kUsgsStyle, (unsigned)z, (unsigned long)x,
-             (unsigned long)y);
+    snprintf(buf, cap, "%s/%s/%u/%lu/%lu.%s", MapTileSettings::getPrefix(), mapdlSrc().folder, (unsigned)z, (unsigned long)x,
+             (unsigned long)y, mapdlSrc().ext);
 }
 
 bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
@@ -2443,9 +2507,8 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
         mapdlClient = new WiFiClientSecure();
         mapdlClient->setInsecure(); // public map data; no room for a CA bundle
     }
-    char url[144];
-    snprintf(url, sizeof(url), "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/%u/%lu/%lu",
-             (unsigned)z, (unsigned long)y, (unsigned long)x); // ArcGIS order: z/y/x
+    char url[160];
+    mapdlBuildUrl(url, sizeof(url), mapdlSrc().urlTemplate, z, x, y);
     HTTPClient http;
     http.setReuse(true); // keep-alive on the shared client
     http.setConnectTimeout(8000);
@@ -2491,7 +2554,8 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
     bool ok = (got == len);
     if (ok) {
         char dir[104], path[120];
-        snprintf(dir, sizeof(dir), "%s/%s/%u/%lu", MapTileSettings::getPrefix(), kUsgsStyle, (unsigned)z, (unsigned long)x);
+        snprintf(dir, sizeof(dir), "%s/%s/%u/%lu", MapTileSettings::getPrefix(), mapdlSrc().folder, (unsigned)z,
+                 (unsigned long)x);
         SDFs.mkdir(dir); // SdFat creates missing parents
         mapdlTilePath(path, sizeof(path), z, x, y);
         FsFile f = SDFs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
@@ -2510,19 +2574,20 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
 void mapdlWriteMeta(void)
 {
     char p[104];
-    snprintf(p, sizeof(p), "%s/%s", MapTileSettings::getPrefix(), kUsgsStyle);
+    snprintf(p, sizeof(p), "%s/%s", MapTileSettings::getPrefix(), mapdlSrc().folder);
     SDFs.mkdir(p);
-    snprintf(p, sizeof(p), "%s/%s/.url", MapTileSettings::getPrefix(), kUsgsStyle);
+    snprintf(p, sizeof(p), "%s/%s/.url", MapTileSettings::getPrefix(), mapdlSrc().folder);
     FsFile f = SDFs.open(p, O_WRONLY | O_CREAT | O_TRUNC);
     if (f) {
-        f.print(kUsgsUrlTemplate);
+        f.print(mapdlSrc().urlTemplate);
         f.print("\n");
         f.close();
     }
-    snprintf(p, sizeof(p), "%s/%s/.format", MapTileSettings::getPrefix(), kUsgsStyle);
+    snprintf(p, sizeof(p), "%s/%s/.format", MapTileSettings::getPrefix(), mapdlSrc().folder);
     f = SDFs.open(p, O_WRONLY | O_CREAT | O_TRUNC);
     if (f) {
-        f.print("jpg\n");
+        f.print(mapdlSrc().ext);
+        f.print("\n");
         f.close();
     }
 }
@@ -2635,8 +2700,25 @@ void TFTView_320x240::openMapsMenu(void)
             char withSlash[26];
             snprintf(withSlash, sizeof(withSlash), "%s/", styleNames[i]);
             bool current = (strcmp(withSlash, MapTileSettings::getTileStyle()) == 0);
-            char lbl[36];
-            snprintf(lbl, sizeof(lbl), "%s%s", current ? LV_SYMBOL_OK " " : "", styleNames[i]);
+            // known downloadable sources get a region prefix so people know coverage
+            const char *region = "";
+            for (auto &s : kMapDlSources) {
+                if (strcmp(styleNames[i], s.folder) == 0) {
+                    region = s.label; // starts with "(US) " / "(EU) " — use just that bit
+                    break;
+                }
+            }
+            char pre[8] = "";
+            if (region[0] == '(') {
+                const char *close = strchr(region, ')');
+                if (close && (size_t)(close - region) + 2 < sizeof(pre)) {
+                    memcpy(pre, region, close - region + 1);
+                    pre[close - region + 1] = ' ';
+                    pre[close - region + 2] = 0;
+                }
+            }
+            char lbl[44];
+            snprintf(lbl, sizeof(lbl), "%s%s%s", current ? LV_SYMBOL_OK " " : "", pre, styleNames[i]);
             row(lbl, 0xffffff,
                 [](lv_event_t *e) {
                     const char *style = (const char *)lv_event_get_user_data(e);
@@ -2656,7 +2738,7 @@ void TFTView_320x240::openMapsMenu(void)
         lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     }
 
-    row(mapdl_running ? "Download progress..." : "Download this area (USGS)", 0x30d158,
+    row(mapdl_running ? "Download progress..." : "Download this area...", 0x30d158,
         [](lv_event_t *) {
             THIS->closeMapsMenu();
             THIS->openMapDownload();
@@ -2687,8 +2769,8 @@ void TFTView_320x240::mapdlUpdateEstimate(void)
         lv_dropdown_set_selected(mapdl_zmax_dd, mapdl_zmax - 1);
     }
     uint32_t tiles = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
-    uint32_t mb10 = tiles * 20 / 102; // ~20KB/tile, shown in tenths of MB
-    uint32_t mins = tiles / 180 + 1;  // ~3 tiles/s
+    uint32_t mb10 = tiles * mapdlSrc().estKB / 102; // per-source typical KB/tile, shown in tenths of MB
+    uint32_t mins = tiles / 180 + 1;                // ~3 tiles/s
     char buf[96];
     snprintf(buf, sizeof(buf), "%lu tiles  ~%lu.%lu MB  ~%lu min", (unsigned long)tiles, (unsigned long)(mb10 / 10),
              (unsigned long)(mb10 % 10), (unsigned long)mins);
@@ -2720,7 +2802,7 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_t *title = lv_label_create(mapdl_screen);
         lv_label_set_text(title, "Download map area");
         lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
 
         mapdl_status = lv_label_create(mapdl_screen);
         // wrap + center so a long progress line stays on screen instead of running
@@ -2729,51 +2811,78 @@ void TFTView_320x240::openMapDownload(void)
         lv_label_set_long_mode(mapdl_status, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(mapdl_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
         lv_obj_set_style_text_color(mapdl_status, lv_color_hex(0x30d158), LV_PART_MAIN);
-        lv_obj_align(mapdl_status, LV_ALIGN_TOP_MID, 0, 30);
+        lv_obj_align(mapdl_status, LV_ALIGN_TOP_MID, 0, 26);
         lv_label_set_text(mapdl_status, "");
 
+        // NOTE this screen is a fixed 320x240 budget: title 4-25, status 26-72 (2 lines
+        // max), info 76-116 (two SHORT lines — this font fits ~26 chars in 300px and a
+        // wrapped third line slides under the rows below; keep every info string short),
+        // Source row 120-155, Detail row 158-193, buttons 196-234.
         mapdl_info = lv_label_create(mapdl_screen);
         lv_obj_set_width(mapdl_info, 300);
         lv_label_set_long_mode(mapdl_info, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(mapdl_info, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_align(mapdl_info, LV_ALIGN_TOP_LEFT, 12, 64);
-        // short on purpose: the old 3-line text wrapped to 4+ lines and slid under
-        // the Detail dropdowns on the 240px-tall screen
-        lv_label_set_text(mapdl_info, "Area: what the map showed. USGS Topo (free).\n"
-                                      "Keeps downloading while the screen sleeps.");
+        lv_obj_align(mapdl_info, LV_ALIGN_TOP_LEFT, 12, 76);
+        lv_label_set_text(mapdl_info, "Area: what the map shows.\nOK to let the screen sleep.");
+
+        lv_obj_t *ls = lv_label_create(mapdl_screen);
+        lv_label_set_text(ls, "Source:");
+        lv_obj_set_style_text_color(ls, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(ls, LV_ALIGN_TOP_LEFT, 12, 128);
+
+        mapdl_src_dd = lv_dropdown_create(mapdl_screen);
+        {
+            std::string opts;
+            for (size_t i = 0; i < sizeof(kMapDlSources) / sizeof(kMapDlSources[0]); i++) {
+                if (i)
+                    opts += "\n";
+                opts += kMapDlSources[i].label;
+            }
+            lv_dropdown_set_options(mapdl_src_dd, opts.c_str());
+        }
+        lv_dropdown_set_selected(mapdl_src_dd, (uint32_t)s_mapdlSrcIdx);
+        lv_obj_set_width(mapdl_src_dd, 210);
+        lv_obj_align(mapdl_src_dd, LV_ALIGN_TOP_LEFT, 98, 120);
+        lv_obj_add_event_cb(
+            mapdl_src_dd,
+            [](lv_event_t *e) {
+                s_mapdlSrcIdx = (int)lv_dropdown_get_selected((lv_obj_t *)lv_event_get_target(e));
+                THIS->mapdlUpdateEstimate();
+            },
+            LV_EVENT_VALUE_CHANGED, NULL);
 
         lv_obj_t *l1 = lv_label_create(mapdl_screen);
         lv_label_set_text(l1, "Detail:");
         lv_obj_set_style_text_color(l1, lv_color_hex(0xffffff), LV_PART_MAIN);
-        lv_obj_align(l1, LV_ALIGN_LEFT_MID, 12, 28);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 12, 166);
 
         mapdl_zmin_dd = lv_dropdown_create(mapdl_screen);
         // 1-15: low zooms are nearly free (a handful of tiles) and give the zoomed-out
         // view, so the default range includes them all
         lv_dropdown_set_options(mapdl_zmin_dd, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15");
         lv_dropdown_set_selected(mapdl_zmin_dd, 0);
-        lv_obj_set_width(mapdl_zmin_dd, 70);
-        lv_obj_align(mapdl_zmin_dd, LV_ALIGN_LEFT_MID, 70, 28);
+        lv_obj_set_width(mapdl_zmin_dd, 66);
+        lv_obj_align(mapdl_zmin_dd, LV_ALIGN_TOP_LEFT, 98, 158);
         lv_obj_add_event_cb(
             mapdl_zmin_dd, [](lv_event_t *) { THIS->mapdlUpdateEstimate(); }, LV_EVENT_VALUE_CHANGED, NULL);
 
         lv_obj_t *l2 = lv_label_create(mapdl_screen);
         lv_label_set_text(l2, "to");
         lv_obj_set_style_text_color(l2, lv_color_hex(0xffffff), LV_PART_MAIN);
-        lv_obj_align(l2, LV_ALIGN_LEFT_MID, 148, 28);
+        lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 172, 166);
 
         mapdl_zmax_dd = lv_dropdown_create(mapdl_screen);
         lv_dropdown_set_options(mapdl_zmax_dd, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15");
         lv_dropdown_set_selected(mapdl_zmax_dd, 14);
-        lv_obj_set_width(mapdl_zmax_dd, 70);
-        lv_obj_align(mapdl_zmax_dd, LV_ALIGN_LEFT_MID, 172, 28);
+        lv_obj_set_width(mapdl_zmax_dd, 66);
+        lv_obj_align(mapdl_zmax_dd, LV_ALIGN_TOP_LEFT, 198, 158);
         lv_obj_add_event_cb(
             mapdl_zmax_dd, [](lv_event_t *) { THIS->mapdlUpdateEstimate(); }, LV_EVENT_VALUE_CHANGED, NULL);
 
         mapdl_btn = lv_btn_create(mapdl_screen);
-        lv_obj_set_size(mapdl_btn, 130, 40);
+        lv_obj_set_size(mapdl_btn, 90, 38);
         lv_obj_set_style_bg_color(mapdl_btn, lv_color_hex(0x30d158), LV_PART_MAIN);
-        lv_obj_align(mapdl_btn, LV_ALIGN_BOTTOM_LEFT, 12, -10);
+        lv_obj_align(mapdl_btn, LV_ALIGN_BOTTOM_LEFT, 12, -6);
         mapdl_btn_lbl = lv_label_create(mapdl_btn);
         lv_label_set_text(mapdl_btn_lbl, "Start");
         lv_obj_set_style_text_color(mapdl_btn_lbl, lv_color_hex(0x000000), LV_PART_MAIN);
@@ -2789,9 +2898,10 @@ void TFTView_320x240::openMapDownload(void)
             LV_EVENT_CLICKED, NULL);
 
         mapdl_use_btn = lv_btn_create(mapdl_screen);
-        lv_obj_set_size(mapdl_use_btn, 150, 40);
+        // 90+120+70 wide + margins: all three bottom buttons coexist without overlap
+        lv_obj_set_size(mapdl_use_btn, 120, 38);
         lv_obj_set_style_bg_color(mapdl_use_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
-        lv_obj_align(mapdl_use_btn, LV_ALIGN_BOTTOM_MID, 30, -10);
+        lv_obj_align(mapdl_use_btn, LV_ALIGN_BOTTOM_LEFT, 110, -6);
         lv_obj_t *ubl = lv_label_create(mapdl_use_btn);
         lv_label_set_text(ubl, "Use this map");
         lv_obj_set_style_text_color(ubl, lv_color_hex(0xffffff), LV_PART_MAIN);
@@ -2800,15 +2910,15 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_add_event_cb(
             mapdl_use_btn,
             [](lv_event_t *) {
-                THIS->mapsApplyStyle(kUsgsStyle, true);
+                THIS->mapsApplyStyle(mapdlSrc().folder, true);
                 THIS->openMaps();
             },
             LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *back = lv_btn_create(mapdl_screen);
-        lv_obj_set_size(back, 70, 40);
+        lv_obj_set_size(back, 70, 38);
         lv_obj_set_style_bg_color(back, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
-        lv_obj_align(back, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+        lv_obj_align(back, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
         lv_obj_t *bl = lv_label_create(back);
         lv_label_set_text(bl, "Back");
         lv_obj_set_style_text_color(bl, lv_color_hex(0xffffff), LV_PART_MAIN);
@@ -2834,8 +2944,8 @@ void TFTView_320x240::mapdlStart(void)
 #ifdef ARDUINO_ARCH_ESP32
     if (mapdl_running)
         return;
-    mapdl_zmin = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
-    mapdl_zmax = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
+    mapdl_zmin = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
+    mapdl_zmax = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
     if (mapdl_zmax < mapdl_zmin)
         mapdl_zmax = mapdl_zmin;
     mapdl_total = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
@@ -2852,13 +2962,20 @@ void TFTView_320x240::mapdlStart(void)
     mapdl_wifi_up = already;
     if (!already && !tdeck_wifi_connect_now(db.config.network.wifi_ssid, db.config.network.wifi_psk)) {
         lv_label_set_text(mapdl_status, "No Wi-Fi network saved");
-        lv_label_set_text(mapdl_info, "Set one first: Settings -> Wi-Fi -> Network + Password, then come back here.");
+        lv_label_set_text(mapdl_info, "Set one in Settings -> Wi-Fi,\nthen come back here.");
         return;
     }
     mapdl_deadline = lv_tick_get() + 25000;
     mapdl_running = true;
     lv_label_set_text(mapdl_btn_lbl, "Stop");
     lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+    // lock the knobs while running — the cursor math depends on them
+    if (mapdl_src_dd)
+        lv_obj_add_state(mapdl_src_dd, LV_STATE_DISABLED);
+    if (mapdl_zmin_dd)
+        lv_obj_add_state(mapdl_zmin_dd, LV_STATE_DISABLED);
+    if (mapdl_zmax_dd)
+        lv_obj_add_state(mapdl_zmax_dd, LV_STATE_DISABLED);
     if (!already)
         lv_label_set_text(mapdl_status, "Turning Wi-Fi on...");
 
@@ -2888,6 +3005,12 @@ void TFTView_320x240::mapdlStop(bool finished)
     mapdl_wifi_up = false;
     if (mapdl_screen) {
         lv_label_set_text(mapdl_btn_lbl, "Start");
+        if (mapdl_src_dd)
+            lv_obj_remove_state(mapdl_src_dd, LV_STATE_DISABLED);
+        if (mapdl_zmin_dd)
+            lv_obj_remove_state(mapdl_zmin_dd, LV_STATE_DISABLED);
+        if (mapdl_zmax_dd)
+            lv_obj_remove_state(mapdl_zmax_dd, LV_STATE_DISABLED);
         char buf[96];
         if (finished)
             snprintf(buf, sizeof(buf), "Done! %lu new, %lu had, %lu failed", (unsigned long)mapdl_done,
@@ -2896,8 +3019,8 @@ void TFTView_320x240::mapdlStop(bool finished)
             snprintf(buf, sizeof(buf), "Stopped at %lu of %lu tiles", (unsigned long)(mapdl_done + mapdl_skipped),
                      (unsigned long)mapdl_total);
         lv_label_set_text(mapdl_status, buf);
-        lv_label_set_text(mapdl_info, finished ? "Tiles are saved on the SD card.\nTap \"Use this map\" to switch to it."
-                                               : "Everything fetched so far is saved.\nStart again to continue where it left off.");
+        // short lines only — see the layout note in openMapDownload
+        lv_label_set_text(mapdl_info, finished ? "Saved to the card.\nTap \"Use this map\"." : "Progress is saved.\nStart continues it.");
         lv_obj_clear_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
     }
     if (finished)
@@ -2922,7 +3045,7 @@ void TFTView_320x240::mapdlPump(void)
         } else if (lv_tick_get() > mapdl_deadline) {
             if (mapdl_screen) {
                 lv_label_set_text(mapdl_status, "Couldn't connect to Wi-Fi");
-                lv_label_set_text(mapdl_info, "Check the network + password in Settings -> Wi-Fi, then try again.");
+                lv_label_set_text(mapdl_info, "Check name + password in\nSettings -> Wi-Fi, then retry.");
             }
             mapdlStop(false);
         }

@@ -19,6 +19,101 @@ bool decodeImgGrey(const void *data, size_t size, lv_img_dsc_t **img);
 bool decodeImgColor(const void *data, size_t size, lv_img_dsc_t **img);
 }
 
+#ifdef ARDUINO_ARCH_ESP32
+#include <esp_heap_caps.h>
+#endif
+
+namespace {
+// Decoded-tile cache for the STBI path. A JPEG decode costs ~100ms of UI time and
+// panning reloads tiles constantly (MAP_FULL_REDRAW), which made JPEG maps crawl.
+// Keep the last few tiles' decoded pixels in PSRAM; a repeat load hands out a fresh
+// COPY (a few ms of memcpy) so ownership stays exactly like a fresh decode: MapTile
+// frees its copy, the cache owns its own buffers outright, lifetimes never tangle.
+struct TileCacheEntry {
+    char key[112];
+    uint8_t *px = nullptr;
+    uint32_t size = 0;
+    lv_image_header_t header;
+    uint32_t stamp = 0;
+};
+constexpr int kTileCacheSlots = 10; // > the ~6 tiles ever visible at once
+TileCacheEntry s_tileCache[kTileCacheSlots];
+uint32_t s_tileStamp = 0;
+
+uint8_t *tileCacheAlloc(size_t sz)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    return (uint8_t *)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+#else
+    return (uint8_t *)lv_malloc(sz);
+#endif
+}
+
+void tileCacheFree(uint8_t *p)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    heap_caps_free(p);
+#else
+    lv_free(p);
+#endif
+}
+
+// Build a MapTile-ownable dsc (USER1 flag, lv_malloc'd) from cached pixels.
+lv_img_dsc_t *tileCacheMakeDsc(const TileCacheEntry &e)
+{
+    uint8_t *data = (uint8_t *)lv_malloc(e.size);
+    if (!data)
+        return nullptr;
+    memcpy(data, e.px, e.size);
+    lv_img_dsc_t *dsc = (lv_img_dsc_t *)lv_malloc_zeroed(sizeof(lv_img_dsc_t));
+    if (!dsc) {
+        lv_free(data);
+        return nullptr;
+    }
+    dsc->header = e.header;
+    dsc->data = data;
+    dsc->data_size = e.size;
+    return dsc;
+}
+
+lv_img_dsc_t *tileCacheGet(const char *key)
+{
+    for (auto &e : s_tileCache) {
+        if (e.px && strcmp(e.key, key) == 0) {
+            e.stamp = ++s_tileStamp;
+            return tileCacheMakeDsc(e);
+        }
+    }
+    return nullptr;
+}
+
+void tileCachePut(const char *key, const lv_img_dsc_t *dsc)
+{
+    if (strlen(key) >= sizeof(s_tileCache[0].key))
+        return;
+    TileCacheEntry *slot = &s_tileCache[0];
+    for (auto &e : s_tileCache) { // free slot first, else the least recently used
+        if (!e.px) {
+            slot = &e;
+            break;
+        }
+        if (e.stamp < slot->stamp)
+            slot = &e;
+    }
+    uint8_t *px = tileCacheAlloc(dsc->data_size);
+    if (!px)
+        return; // PSRAM tight — just skip caching this one
+    if (slot->px)
+        tileCacheFree(slot->px);
+    memcpy(px, dsc->data, dsc->data_size);
+    strcpy(slot->key, key);
+    slot->px = px;
+    slot->size = dsc->data_size;
+    slot->header = dsc->header;
+    slot->stamp = ++s_tileStamp;
+}
+} // namespace
+
 SdFatService::SdFatService() : ITileService(DRIVE_LETTER ":")
 {
     static lv_fs_drv_t drv;
@@ -52,6 +147,11 @@ bool SdFatService::load(const char *name, void *img)
     // like any fetched tile. PNG stays on LVGL's LODEPNG path, which works.
     const char *ext = strrchr(name, '.');
     if (ext && strcmp(ext, ".jpg") == 0) {
+        lv_img_dsc_t *cached = tileCacheGet(name);
+        if (cached) {
+            lv_image_set_src((lv_obj_t *)img, cached);
+            return true;
+        }
         FsFile f = SDFs.open(name, O_RDONLY);
         if (!f)
             return false;
@@ -71,6 +171,7 @@ bool SdFatService::load(const char *name, void *img)
             ILOG_DEBUG("STBI decode failed for SD tile %s", name);
             return false;
         }
+        tileCachePut(name, dsc);
         lv_image_set_src((lv_obj_t *)img, dsc);
         return true;
     }

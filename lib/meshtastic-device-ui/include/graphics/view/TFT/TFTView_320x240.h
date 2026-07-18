@@ -317,6 +317,8 @@ class TFTView_320x240 : public MeshtasticView
     void mapsShowNotice(const char *msg);   // transient on-map message (auto-hides)
     lv_obj_t *maps_sats_label = nullptr;    // top-bar "N sats" readout (green = locked)
     lv_timer_t *maps_sats_timer = nullptr;  // drives updateMapsSats while Maps is on screen
+    lv_obj_t *maps_zoom_label = nullptr;    // bottom-left "z13" readout
+    void updateMapsZoom(void);              // refresh it (zoom buttons + the 1s timer)
     lv_obj_t *maps_notice = nullptr;        // the transient message label
     uint32_t maps_notice_until = 0;         // lv_tick deadline to hide it (0 = hidden)
     // Maps: style picker (gear cog) + USGS region downloader
@@ -339,6 +341,7 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *mapdl_use_btn = nullptr;  // "Use this map now" (shown when done)
     lv_obj_t *mapdl_zmin_dd = nullptr;  // detail range dropdowns
     lv_obj_t *mapdl_zmax_dd = nullptr;
+    lv_obj_t *mapdl_src_dd = nullptr;   // tile source ((US) USGS / (EU) TopPlusOpen)
     lv_timer_t *mapdl_timer = nullptr;  // the pump; independent of which screen is showing
     bool mapdl_running = false;
     bool mapdl_own_wifi = false;        // we brought WiFi up -> we take it down
