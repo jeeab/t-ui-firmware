@@ -339,6 +339,7 @@ class TFTView_320x240 : public MeshtasticView
         bool installed;
     };
     void openGetApps(void);
+    void closeGetApps(void); // hand back Wi-Fi + the TLS client on leaving, by any route
     void getappsPump(void); // connect Wi-Fi, then fetch the catalog once
     void getappsBuildList(void);
     int getappsParseCatalog(const char *json, int len);

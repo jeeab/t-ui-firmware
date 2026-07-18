@@ -213,7 +213,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.18.3"
+#define TUI_VERSION "2026.07.18.4"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -3495,6 +3495,26 @@ void TFTView_320x240::getappsPump(void)
 #endif
 }
 
+// Give back everything the screen was holding: the pump timer, the TLS client's ~45KB, and
+// Wi-Fi itself if we were the ones who switched it on. Safe to call more than once.
+void TFTView_320x240::closeGetApps(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (getapps_timer) {
+        lv_timer_delete(getapps_timer);
+        getapps_timer = nullptr;
+    }
+    if (getappsClient) {
+        delete getappsClient;
+        getappsClient = nullptr;
+    }
+    if (getapps_own_wifi) { // leave the Settings toggle alone if the user had it on already
+        tdeck_wifi_disconnect_now();
+        getapps_own_wifi = false;
+    }
+#endif
+}
+
 void TFTView_320x240::openGetApps(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
@@ -3536,23 +3556,17 @@ void TFTView_320x240::openGetApps(void)
         lv_obj_add_event_cb(
             back,
             [](lv_event_t *) {
-                // Drop Wi-Fi on the way out if we were the ones who brought it up.
-                if (THIS->getapps_timer) {
-                    lv_timer_delete(THIS->getapps_timer);
-                    THIS->getapps_timer = nullptr;
-                }
-                if (THIS->getapps_own_wifi) {
-                    tdeck_wifi_disconnect_now();
-                    THIS->getapps_own_wifi = false;
-                }
-                if (getappsClient) { // free the TLS heap (~45KB) until next time
-                    delete getappsClient;
-                    getappsClient = nullptr;
-                }
                 if (THIS->launcher_screen)
                     lv_screen_load_anim(THIS->launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
             },
             LV_EVENT_CLICKED, NULL);
+
+        // Safety net, same as the File Share screen: leaving by ANY route - Back, the
+        // trackball double-click to Home, the screen locking - tears Wi-Fi back down.
+        // Hanging it off the Back button alone left Wi-Fi running (and the battery
+        // draining) whenever the user double-clicked out instead.
+        lv_obj_add_event_cb(
+            getapps_screen, [](lv_event_t *) { THIS->closeGetApps(); }, LV_EVENT_SCREEN_UNLOADED, NULL);
     }
 
     lv_screen_load_anim(getapps_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
