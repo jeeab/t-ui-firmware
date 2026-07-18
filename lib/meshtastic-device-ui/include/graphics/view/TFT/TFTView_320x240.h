@@ -25,7 +25,8 @@ class TFTView_320x240 : public MeshtasticView
     static void openSettingsAction(void);
     static void openFilesAction(void);
     static void openFlashlightAction(void);
-    static void openMapsAction(void); // Maps tile -> our own standalone Maps app screen
+    static void openMapsAction(void);    // Maps tile -> our own standalone Maps app screen
+    static void openGetAppsAction(void); // Get Apps tile -> browse + install add-on apps
 
     // methods to update view
     void setMyInfo(uint32_t nodeNum) override;
@@ -328,6 +329,31 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *maps_gear_btn = nullptr;
     lv_obj_t *maps_style_ovl = nullptr;
     void openMapDownload(void);   // capture the current viewport as the download box + show the screen
+    // --- Get Apps: install add-on apps from jeeab.github.io/t-ui over Wi-Fi -----------
+    static const int kMaxStoreApps = 24;
+    struct StoreApp {
+        char id[20];   // folder name under /apps
+        char name[16]; // tile label
+        char desc[92]; // one line, as published in catalog.json
+        uint32_t bytes;
+        bool installed;
+    };
+    void openGetApps(void);
+    void getappsPump(void); // connect Wi-Fi, then fetch the catalog once
+    void getappsBuildList(void);
+    int getappsParseCatalog(const char *json, int len);
+    bool getappsInstall(int idx);
+    bool getappsIsInstalled(const char *id) const;
+    StoreApp storeApps[kMaxStoreApps];
+    int storeAppCount = 0;
+    lv_obj_t *getapps_screen = nullptr;
+    lv_obj_t *getapps_status = nullptr;
+    lv_obj_t *getapps_list = nullptr;
+    lv_timer_t *getapps_timer = nullptr;
+    uint32_t getapps_deadline = 0;
+    bool getapps_own_wifi = false; // we brought Wi-Fi up -> we take it down
+    bool getapps_loaded = false;   // catalog fetched (or failed) this visit
+
     void mapdlUpdateEstimate(void);
     void mapdlStart(void);
     void mapdlStop(bool finished);

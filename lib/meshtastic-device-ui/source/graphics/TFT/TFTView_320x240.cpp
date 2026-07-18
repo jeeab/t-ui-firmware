@@ -213,7 +213,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.18.1"
+#define TUI_VERSION "2026.07.18.3"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -506,6 +506,8 @@ static const LauncherApp kApps[] = {
     {"Maps", &img_map_button_image, 0x5ac8fa, nullptr, nullptr, nullptr, &TFTView_320x240::openMapsAction},
     // Settings = our own screen (mesh kill switch lives here), opened via a custom action.
     {"Settings", &img_settings_button_image, 0x8e8e93, nullptr, nullptr, nullptr, &TFTView_320x240::openSettingsAction},
+    // Get Apps = browse the published catalog over Wi-Fi and install straight to the SD card.
+    {"Get Apps", &img_nodes_button_image, 0xbf5af2, nullptr, nullptr, nullptr, &TFTView_320x240::openGetAppsAction},
     // Snake = self-contained game module (SnakeGame.cpp), WASD/swipe controls.
     {"Snake", &img_nodes_button_image, 0x30d158, nullptr, nullptr, nullptr, &snake_open},
     // Flashlight = full-white screen at max backlight (its own action).
@@ -2113,22 +2115,44 @@ ITileService *TFTView_320x240::sharedTileService(void)
 
 // Same style/prefix detection the mesh map does in loadMap(), minus its dropdown UI,
 // so the Maps app finds the tiles even if the mesh map was never opened this boot.
+// Restore the map style the user last chose. Two traps this has to avoid:
+//
+//  1. The saved style arrives with the radio's UI config, which syncs several seconds AFTER
+//     boot. Opening Maps before that lands used to read an EMPTY style, fail the lookup, fall
+//     back to whichever folder sorts first alphabetically (e.g. "osm" beating "usgs"), and
+//     then latch mapsStyleInited so it never corrected itself. Now: if the config hasn't
+//     arrived yet we apply a provisional style but DON'T latch, so the next open gets it right.
+//  2. A style is three things - the folder, its image format (.format) and its tile server
+//     (.url). This used to restore only the folder, leaving format/server at defaults, so the
+//     "right" map could still draw wrong. Routing through mapsApplyStyle restores all three.
 void TFTView_320x240::mapsInitTileStyle(void)
 {
     if (mapsStyleInited || !sdCard)
         return;
-    mapsStyleInited = true;
     std::set<std::string> mapStyles = sdCard->loadMapStyles(MapTileSettings::getPrefix());
     if (mapStyles.find("/map") != mapStyles.end()) {
         MapTileSettings::setPrefix("/map");
         MapTileSettings::setTileStyle("");
-    } else if (!mapStyles.empty()) {
-        if (mapStyles.find(db.uiConfig.map_data.style) != mapStyles.end())
-            MapTileSettings::setTileStyle(db.uiConfig.map_data.style);
-        else
-            MapTileSettings::setTileStyle(mapStyles.begin()->c_str());
-        MapTileSettings::setPrefix("/maps");
+        mapsStyleInited = true;
+        return;
     }
+    if (mapStyles.empty())
+        return; // no card / no styles yet - try again next time Maps opens
+
+    // The prefix has to be right BEFORE mapsApplyStyle reads .format and .url from the card.
+    MapTileSettings::setPrefix("/maps");
+
+    const char *saved = db.uiConfig.map_data.style;
+    bool haveSaved = (saved[0] != 0);
+    bool savedOnCard = haveSaved && (mapStyles.find(saved) != mapStyles.end());
+
+    // persist=false throughout: restoring a preference must never overwrite it. Otherwise a
+    // fallback pick would quietly become the new saved choice.
+    mapsApplyStyle(savedOnCard ? saved : mapStyles.begin()->c_str(), false);
+
+    // Only consider this settled once we've actually honoured a saved choice. If the config
+    // hasn't synced yet (no saved style at all), leave the door open to correct ourselves.
+    mapsStyleInited = savedOnCard || haveSaved;
 }
 
 void TFTView_320x240::openMaps(void)
@@ -2478,6 +2502,10 @@ const MapDlSource kMapDlSources[] = {
     {"(EU) TopPlusOpen", "TopPlusOpen",
      "https://sgx.geodatenzentrum.de/wmts_topplus_open/tile/1.0.0/web/default/WEBMERCATOR/{z}/{y}/{x}.png", "png", 35},
 };
+// Detail levels offered on the download screen. Both dropdowns share this list; the value is
+// the index + 1, so the last entry here is the deepest zoom the downloader will fetch.
+const char *kMapDlDetailOpts = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18";
+
 int s_mapdlSrcIdx = 0; // which source the download screen has selected
 inline const MapDlSource &mapdlSrc(void)
 {
@@ -2870,7 +2898,7 @@ void TFTView_320x240::openMapDownload(void)
         mapdl_zmin_dd = lv_dropdown_create(mapdl_screen);
         // 1-15: low zooms are nearly free (a handful of tiles) and give the zoomed-out
         // view, so the default range includes them all
-        lv_dropdown_set_options(mapdl_zmin_dd, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15");
+        lv_dropdown_set_options(mapdl_zmin_dd, kMapDlDetailOpts);
         lv_dropdown_set_selected(mapdl_zmin_dd, 0);
         lv_obj_set_width(mapdl_zmin_dd, 66);
         lv_obj_align(mapdl_zmin_dd, LV_ALIGN_TOP_LEFT, 98, 158);
@@ -2883,7 +2911,9 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 172, 166);
 
         mapdl_zmax_dd = lv_dropdown_create(mapdl_screen);
-        lv_dropdown_set_options(mapdl_zmax_dd, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15");
+        lv_dropdown_set_options(mapdl_zmax_dd, kMapDlDetailOpts);
+        // Default stays at 15. Each extra level is ~4x the tiles, so 18 is ~64x a 15 -
+        // it's there when you want a small area in close detail, not as a default.
         lv_dropdown_set_selected(mapdl_zmax_dd, 14);
         lv_obj_set_width(mapdl_zmax_dd, 66);
         lv_obj_align(mapdl_zmax_dd, LV_ALIGN_TOP_LEFT, 198, 158);
@@ -3117,6 +3147,434 @@ void TFTView_320x240::mapdlPump(void)
                  (unsigned long)(left / 180 + 1));
         lv_label_set_text(mapdl_status, buf);
     }
+#endif
+}
+
+// ===== Get Apps: install add-on apps from the web, over Wi-Fi ============================
+//
+// The catalog published at jeeab.github.io/t-ui/apps/catalog.json is the single source of
+// truth (the web page renders from the same file). An app is one small main.lua, so
+// installing is: fetch the catalog -> fetch one text file -> write /apps/<id>/main.lua ->
+// rescan. No reboot: scanUserApps() + rebuildAppGrid() make the new tile appear live.
+#ifdef ARDUINO_ARCH_ESP32
+namespace {
+const char *kGetAppsCatalogUrl = "https://jeeab.github.io/t-ui/apps/catalog.json";
+const char *kGetAppsBaseUrl = "https://jeeab.github.io/t-ui/";
+WiFiClientSecure *getappsClient = nullptr;
+
+// Download a whole (small) file into PSRAM. Returns nullptr on any failure; the caller
+// frees with heap_caps_free. Timeouts are short on purpose: this runs on the UI task, so
+// a stalled server must fail fast rather than freeze the screen the way map tiles used to.
+uint8_t *getappsGet(const char *url, int *outLen)
+{
+    if (!getappsClient) {
+        getappsClient = new WiFiClientSecure();
+        getappsClient->setInsecure(); // public, read-only content; no room for a CA bundle
+    }
+    HTTPClient http;
+    http.setReuse(true);
+    http.setConnectTimeout(4000);
+    http.setTimeout(4000);
+    if (!http.begin(*getappsClient, url))
+        return nullptr;
+    if (http.GET() != HTTP_CODE_OK) {
+        http.end();
+        return nullptr;
+    }
+    int len = http.getSize();
+    if (len <= 0 || len > 65536) { // a catalog or an app; anything bigger is wrong
+        http.end();
+        return nullptr;
+    }
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        http.end();
+        return nullptr;
+    }
+    WiFiClient *stream = http.getStreamPtr();
+    int got = 0;
+    uint16_t idle = 0;
+    while (got < len) {
+        size_t avail = stream->available();
+        if (!avail) {
+            if (++idle > 200) // ~2s of silence mid-body = give up
+                break;
+            delay(10);
+            continue;
+        }
+        idle = 0;
+        size_t want = (size_t)(len - got);
+        if (want > avail)
+            want = avail;
+        int r = stream->read(buf + got, want);
+        if (r <= 0)
+            break;
+        got += r;
+    }
+    http.end();
+    if (got != len) {
+        heap_caps_free(buf);
+        return nullptr;
+    }
+    buf[len] = 0; // the parser below is string-based
+    *outLen = len;
+    return buf;
+}
+
+// Minimal readers for the catalog. We publish that file ourselves and the PR check
+// validates its shape, so this only has to handle the JSON we generate - not arbitrary
+// JSON. Everything is bounds-checked against `end` so a malformed file can't run away.
+bool jsonStrField(const char *obj, const char *end, const char *key, char *out, size_t cap)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(obj, pat);
+    if (!p || p >= end)
+        return false;
+    p = strchr(p + strlen(pat), ':');
+    if (!p || p >= end)
+        return false;
+    while (p < end && *p != '"') { // skip to the opening quote of the value
+        if (*p == ',' || *p == '}')
+            return false;
+        p++;
+    }
+    if (p >= end)
+        return false;
+    p++;
+    size_t n = 0;
+    while (p < end && *p != '"' && n + 1 < cap) {
+        if (*p == '\\' && p + 1 < end)
+            p++; // take the escaped character literally; our text has no fancy escapes
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+    return n > 0;
+}
+
+uint32_t jsonIntField(const char *obj, const char *end, const char *key)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(obj, pat);
+    if (!p || p >= end)
+        return 0;
+    p = strchr(p + strlen(pat), ':');
+    if (!p || p >= end)
+        return 0;
+    p++;
+    while (p < end && *p == ' ')
+        p++;
+    return (uint32_t)strtoul(p, nullptr, 10);
+}
+} // namespace
+#endif // ARDUINO_ARCH_ESP32
+
+void TFTView_320x240::openGetAppsAction(void)
+{
+    instance()->openGetApps();
+}
+
+bool TFTView_320x240::getappsIsInstalled(const char *id) const
+{
+#if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+    char path[64];
+    snprintf(path, sizeof(path), "/apps/%s/main.lua", id);
+    return sdCard && SDFs.exists(path);
+#else
+    (void)id;
+    return false;
+#endif
+}
+
+// Parse catalog.json into storeApps[]. Returns the number of apps found.
+int TFTView_320x240::getappsParseCatalog(const char *json, int len)
+{
+    storeAppCount = 0;
+#ifdef ARDUINO_ARCH_ESP32
+    const char *end = json + len;
+    const char *arr = strstr(json, "\"apps\"");
+    if (!arr)
+        return 0;
+    const char *p = strchr(arr, '[');
+    if (!p)
+        return 0;
+    while (p < end && storeAppCount < kMaxStoreApps) {
+        const char *ob = strchr(p, '{');
+        if (!ob || ob >= end)
+            break;
+        const char *oe = strchr(ob, '}');
+        if (!oe || oe >= end)
+            break;
+        StoreApp &a = storeApps[storeAppCount];
+        // id + name are the two we can't do without; skip anything malformed rather than
+        // showing the user a half-built row.
+        if (jsonStrField(ob, oe, "id", a.id, sizeof(a.id)) && jsonStrField(ob, oe, "name", a.name, sizeof(a.name))) {
+            if (!jsonStrField(ob, oe, "desc", a.desc, sizeof(a.desc)))
+                a.desc[0] = 0;
+            a.bytes = jsonIntField(ob, oe, "bytes");
+            a.installed = getappsIsInstalled(a.id);
+            storeAppCount++;
+        }
+        p = oe + 1;
+    }
+#else
+    (void)json;
+    (void)len;
+#endif
+    return storeAppCount;
+}
+
+// Download one app's main.lua and write it to /apps/<id>/main.lua.
+bool TFTView_320x240::getappsInstall(int idx)
+{
+#if defined(ARDUINO_ARCH_ESP32) && HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+    if (idx < 0 || idx >= storeAppCount || !sdCard)
+        return false;
+    StoreApp &a = storeApps[idx];
+    char url[160];
+    snprintf(url, sizeof(url), "%sapps/%s/main.lua", kGetAppsBaseUrl, a.id);
+    int len = 0;
+    uint8_t *buf = getappsGet(url, &len);
+    if (!buf)
+        return false;
+
+    char dir[64], path[80];
+    snprintf(dir, sizeof(dir), "/apps/%s", a.id);
+    snprintf(path, sizeof(path), "/apps/%s/main.lua", a.id);
+    SDFs.mkdir("/apps"); // no-op if it's already there
+    SDFs.mkdir(dir);
+    bool ok = false;
+    FsFile f = SDFs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (f) {
+        ok = (f.write(buf, (size_t)len) == (size_t)len);
+        f.close();
+    }
+    heap_caps_free(buf);
+    if (ok) {
+        a.installed = true;
+        // Make the tile appear right now - no reboot. Both of these already run together
+        // from the SD-mount timer at boot, so this is the same path the launcher uses.
+        scanUserApps();
+        rebuildAppGrid();
+    }
+    return ok;
+#else
+    (void)idx;
+    return false;
+#endif
+}
+
+// Build (or rebuild) the list of app rows on the screen.
+void TFTView_320x240::getappsBuildList(void)
+{
+    if (!getapps_list)
+        return;
+    lv_obj_clean(getapps_list);
+
+    for (int i = 0; i < storeAppCount; i++) {
+        StoreApp &a = storeApps[i];
+
+        lv_obj_t *row = lv_obj_create(getapps_list);
+        lv_obj_set_size(row, 286, 62);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c20), LV_PART_MAIN);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x2a2a30), LV_PART_MAIN);
+        lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(row, 10, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(row, 8, LV_PART_MAIN);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *nm = lv_label_create(row);
+        lv_label_set_text(nm, a.name);
+        lv_obj_set_style_text_color(nm, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(nm, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        // Size, in the units a person thinks in.
+        char meta[32];
+        if (a.bytes >= 1024)
+            snprintf(meta, sizeof(meta), "%lu KB", (unsigned long)((a.bytes + 512) / 1024));
+        else
+            snprintf(meta, sizeof(meta), "%lu bytes", (unsigned long)a.bytes);
+        lv_obj_t *mt = lv_label_create(row);
+        lv_obj_set_style_text_font(mt, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(mt, meta);
+        lv_obj_set_style_text_color(mt, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_align(mt, LV_ALIGN_TOP_LEFT, 0, 20);
+
+        // One line of description, clipped to the row rather than wrapping into the button.
+        lv_obj_t *ds = lv_label_create(row);
+        lv_obj_set_style_text_font(ds, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_width(ds, 262);
+        lv_label_set_long_mode(ds, LV_LABEL_LONG_DOT);
+        lv_label_set_text(ds, a.desc);
+        lv_obj_set_style_text_color(ds, lv_color_hex(0xdcdce2), LV_PART_MAIN);
+        lv_obj_align(ds, LV_ALIGN_TOP_LEFT, 0, 36);
+
+        lv_obj_t *btn = lv_btn_create(row);
+        lv_obj_set_size(btn, 84, 30);
+        lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, 0, -2);
+        lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(a.installed ? 0x2c2c2e : 0x30d158), LV_PART_MAIN);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_obj_set_style_text_font(bl, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(bl, a.installed ? "On device" : "Install");
+        lv_obj_set_style_text_color(bl, lv_color_hex(a.installed ? 0x8e8e93 : 0x000000), LV_PART_MAIN);
+        lv_obj_center(bl);
+        if (!a.installed) {
+            lv_obj_set_user_data(btn, (void *)(intptr_t)i);
+            lv_obj_add_event_cb(
+                btn,
+                [](lv_event_t *e) {
+                    lv_obj_t *b = (lv_obj_t *)lv_event_get_target(e);
+                    int idx = (int)(intptr_t)lv_obj_get_user_data(b);
+                    lv_obj_t *lbl = lv_obj_get_child(b, 0);
+                    // Downloading blocks this task for a moment; say so before it starts.
+                    if (lbl)
+                        lv_label_set_text(lbl, "...");
+                    lv_refr_now(NULL);
+                    bool ok = THIS->getappsInstall(idx);
+                    if (lbl)
+                        lv_label_set_text(lbl, ok ? "On device" : "Failed");
+                    lv_obj_set_style_bg_color(b, lv_color_hex(ok ? 0x2c2c2e : 0xff453a), LV_PART_MAIN);
+                    if (ok) {
+                        lv_obj_set_style_text_color(lbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+                        // Left tappable on purpose: installing again just rewrites the same
+                        // file, which is also how you'd pull down an updated version.
+                        lv_label_set_text(THIS->getapps_status, "Added to your home screen");
+                    } else {
+                        lv_label_set_text(THIS->getapps_status, "Download failed - try again");
+                    }
+                },
+                LV_EVENT_CLICKED, NULL);
+        }
+    }
+}
+
+// The pump: bring Wi-Fi up if we have to, then fetch the catalog once.
+void TFTView_320x240::getappsPump(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (getapps_loaded)
+        return;
+
+    if (!tdeck_wifi_connected()) {
+        if (lv_tick_get() > getapps_deadline) {
+            lv_label_set_text(getapps_status, "Couldn't connect to Wi-Fi");
+            if (getapps_timer) {
+                lv_timer_delete(getapps_timer);
+                getapps_timer = nullptr;
+            }
+        }
+        return;
+    }
+
+    lv_label_set_text(getapps_status, "Getting the list...");
+    lv_refr_now(NULL);
+
+    int len = 0;
+    uint8_t *buf = getappsGet(kGetAppsCatalogUrl, &len);
+    getapps_loaded = true; // one attempt per screen visit either way
+    if (getapps_timer) {
+        lv_timer_delete(getapps_timer);
+        getapps_timer = nullptr;
+    }
+    if (!buf) {
+        lv_label_set_text(getapps_status, "Couldn't reach the app list");
+        return;
+    }
+    int n = getappsParseCatalog((const char *)buf, len);
+    heap_caps_free(buf);
+    if (n <= 0) {
+        lv_label_set_text(getapps_status, "No apps available right now");
+        return;
+    }
+    char msg[48];
+    snprintf(msg, sizeof(msg), "%d app%s available", n, n == 1 ? "" : "s");
+    lv_label_set_text(getapps_status, msg);
+    getappsBuildList();
+#endif
+}
+
+void TFTView_320x240::openGetApps(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (!getapps_screen) {
+        getapps_screen = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(getapps_screen, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_clear_flag(getapps_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(getapps_screen);
+        lv_label_set_text(title, "Get Apps");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+        getapps_status = lv_label_create(getapps_screen);
+        lv_obj_set_style_text_font(getapps_status, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(getapps_status, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_align(getapps_status, LV_ALIGN_TOP_MID, 0, 30);
+        lv_label_set_text(getapps_status, "");
+
+        // Scrolling list of apps, sitting above the Back button.
+        getapps_list = lv_obj_create(getapps_screen);
+        lv_obj_set_size(getapps_list, 310, 150);
+        lv_obj_align(getapps_list, LV_ALIGN_TOP_MID, 0, 48);
+        lv_obj_set_style_bg_opa(getapps_list, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(getapps_list, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(getapps_list, 4, LV_PART_MAIN);
+        lv_obj_set_flex_flow(getapps_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_scroll_dir(getapps_list, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(getapps_list, LV_SCROLLBAR_MODE_AUTO);
+
+        lv_obj_t *back = lv_btn_create(getapps_screen);
+        lv_obj_set_size(back, 80, 34);
+        lv_obj_set_style_bg_color(back, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
+        lv_obj_t *bl = lv_label_create(back);
+        lv_label_set_text(bl, "Back");
+        lv_obj_set_style_text_color(bl, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_center(bl);
+        lv_obj_add_event_cb(
+            back,
+            [](lv_event_t *) {
+                // Drop Wi-Fi on the way out if we were the ones who brought it up.
+                if (THIS->getapps_timer) {
+                    lv_timer_delete(THIS->getapps_timer);
+                    THIS->getapps_timer = nullptr;
+                }
+                if (THIS->getapps_own_wifi) {
+                    tdeck_wifi_disconnect_now();
+                    THIS->getapps_own_wifi = false;
+                }
+                if (getappsClient) { // free the TLS heap (~45KB) until next time
+                    delete getappsClient;
+                    getappsClient = nullptr;
+                }
+                if (THIS->launcher_screen)
+                    lv_screen_load_anim(THIS->launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+            },
+            LV_EVENT_CLICKED, NULL);
+    }
+
+    lv_screen_load_anim(getapps_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+
+    // Fetch fresh every visit, so a newly published app shows up without a reboot.
+    getapps_loaded = false;
+    lv_obj_clean(getapps_list);
+
+    bool already = tdeck_wifi_connected();
+    getapps_own_wifi = !already;
+    if (!already) {
+        if (!tdeck_wifi_connect_now(db.config.network.wifi_ssid, db.config.network.wifi_psk)) {
+            lv_label_set_text(getapps_status, "Set up Wi-Fi in Settings first");
+            return;
+        }
+        lv_label_set_text(getapps_status, "Turning Wi-Fi on...");
+    } else {
+        lv_label_set_text(getapps_status, "Getting the list...");
+    }
+    getapps_deadline = lv_tick_get() + 25000;
+    if (!getapps_timer)
+        getapps_timer = lv_timer_create([](lv_timer_t *) { THIS->getappsPump(); }, 200, NULL);
 #endif
 }
 
