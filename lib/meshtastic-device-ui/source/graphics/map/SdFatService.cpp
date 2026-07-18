@@ -11,6 +11,14 @@
 
 #define DRIVE_LETTER "S"
 
+#include <cstring>
+
+// from ConvertPNG.c — the same STBI decoders the online tile fetcher uses
+extern "C" {
+bool decodeImgGrey(const void *data, size_t size, lv_img_dsc_t **img);
+bool decodeImgColor(const void *data, size_t size, lv_img_dsc_t **img);
+}
+
 SdFatService::SdFatService() : ITileService(DRIVE_LETTER ":")
 {
     static lv_fs_drv_t drv;
@@ -37,6 +45,36 @@ SdFatService::~SdFatService()
 
 bool SdFatService::load(const char *name, void *img)
 {
+    // JPEG tiles (the on-device USGS download writes these): LVGL's built-in TJPGD
+    // decoder draws them black on this device, so read the file ourselves and decode
+    // through STBI — the exact path the online fetcher uses for the same tiles.
+    // decodeImg* tags the dsc LV_IMAGE_FLAGS_USER1, so MapTile::removeImage frees it
+    // like any fetched tile. PNG stays on LVGL's LODEPNG path, which works.
+    const char *ext = strrchr(name, '.');
+    if (ext && strcmp(ext, ".jpg") == 0) {
+        FsFile f = SDFs.open(name, O_RDONLY);
+        if (!f)
+            return false;
+        size_t len = f.size();
+        uint8_t *raw = (len && len < 512u * 1024u) ? (uint8_t *)lv_malloc(len) : nullptr;
+        if (!raw) {
+            f.close();
+            return false;
+        }
+        bool ok = (size_t)f.read(raw, len) == len;
+        f.close();
+        lv_img_dsc_t *dsc = nullptr;
+        if (ok)
+            ok = MapTileSettings::color() ? decodeImgColor(raw, len, &dsc) : decodeImgGrey(raw, len, &dsc);
+        lv_free(raw);
+        if (!ok || !dsc) {
+            ILOG_DEBUG("STBI decode failed for SD tile %s", name);
+            return false;
+        }
+        lv_image_set_src((lv_obj_t *)img, dsc);
+        return true;
+    }
+
     char buf[128] = DRIVE_LETTER ":";
     strcat(&buf[2], name);
     // ILOG_DEBUG("SdFatService::load(): %s", buf);

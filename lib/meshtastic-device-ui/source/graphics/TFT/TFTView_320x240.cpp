@@ -2241,10 +2241,14 @@ void TFTView_320x240::openMaps(void)
         lv_obj_set_style_bg_opa(maps_gear_btn, LV_OPA_80, LV_PART_MAIN);
         lv_obj_align(maps_gear_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
         {
-            lv_obj_t *gl = lv_label_create(maps_gear_btn);
-            lv_label_set_text(gl, LV_SYMBOL_SETTINGS);
-            lv_obj_set_style_text_color(gl, lv_color_hex(0xffffff), LV_PART_MAIN);
-            lv_obj_center(gl);
+            // draw a mini gear (ring + 4 nubs) like the Settings tile icon — this
+            // build's font has no symbol glyphs, so LV_SYMBOL_SETTINGS renders blank
+            lv_obj_set_style_pad_all(maps_gear_btn, 0, LV_PART_MAIN);
+            icRing(maps_gear_btn, 10, 10, 16, 0xffffff, 3);
+            icBox(maps_gear_btn, 16, 5, 4, 6, 0xffffff, 1);
+            icBox(maps_gear_btn, 16, 25, 4, 6, 0xffffff, 1);
+            icBox(maps_gear_btn, 5, 16, 6, 4, 0xffffff, 1);
+            icBox(maps_gear_btn, 25, 16, 6, 4, 0xffffff, 1);
         }
         lv_obj_add_event_cb(
             maps_gear_btn, [](lv_event_t *) { THIS->openMapsMenu(); }, LV_EVENT_CLICKED, NULL);
@@ -2676,11 +2680,11 @@ void TFTView_320x240::mapdlUpdateEstimate(void)
 {
     if (!mapdl_screen || mapdl_running)
         return;
-    mapdl_zmin = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
-    mapdl_zmax = 10 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
+    mapdl_zmin = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
+    mapdl_zmax = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
     if (mapdl_zmax < mapdl_zmin) { // keep the range sane instead of erroring
         mapdl_zmax = mapdl_zmin;
-        lv_dropdown_set_selected(mapdl_zmax_dd, mapdl_zmax - 10);
+        lv_dropdown_set_selected(mapdl_zmax_dd, mapdl_zmax - 1);
     }
     uint32_t tiles = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
     uint32_t mb10 = tiles * 20 / 102; // ~20KB/tile, shown in tenths of MB
@@ -2719,17 +2723,24 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
         mapdl_status = lv_label_create(mapdl_screen);
+        // wrap + center so a long progress line stays on screen instead of running
+        // off both edges
+        lv_obj_set_width(mapdl_status, 296);
+        lv_label_set_long_mode(mapdl_status, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(mapdl_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
         lv_obj_set_style_text_color(mapdl_status, lv_color_hex(0x30d158), LV_PART_MAIN);
-        lv_obj_align(mapdl_status, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_align(mapdl_status, LV_ALIGN_TOP_MID, 0, 30);
         lv_label_set_text(mapdl_status, "");
 
         mapdl_info = lv_label_create(mapdl_screen);
         lv_obj_set_width(mapdl_info, 300);
         lv_label_set_long_mode(mapdl_info, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(mapdl_info, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_align(mapdl_info, LV_ALIGN_TOP_LEFT, 12, 62);
-        lv_label_set_text(mapdl_info, "Area: what the map was showing.\nSource: USGS Topo (free, public domain).\n"
-                                      "Screen can turn off - the download keeps going.");
+        lv_obj_align(mapdl_info, LV_ALIGN_TOP_LEFT, 12, 64);
+        // short on purpose: the old 3-line text wrapped to 4+ lines and slid under
+        // the Detail dropdowns on the 240px-tall screen
+        lv_label_set_text(mapdl_info, "Area: what the map showed. USGS Topo (free).\n"
+                                      "Keeps downloading while the screen sleeps.");
 
         lv_obj_t *l1 = lv_label_create(mapdl_screen);
         lv_label_set_text(l1, "Detail:");
@@ -2737,7 +2748,9 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_align(l1, LV_ALIGN_LEFT_MID, 12, 28);
 
         mapdl_zmin_dd = lv_dropdown_create(mapdl_screen);
-        lv_dropdown_set_options(mapdl_zmin_dd, "10\n11\n12\n13\n14\n15");
+        // 1-15: low zooms are nearly free (a handful of tiles) and give the zoomed-out
+        // view, so the default range includes them all
+        lv_dropdown_set_options(mapdl_zmin_dd, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15");
         lv_dropdown_set_selected(mapdl_zmin_dd, 0);
         lv_obj_set_width(mapdl_zmin_dd, 70);
         lv_obj_align(mapdl_zmin_dd, LV_ALIGN_LEFT_MID, 70, 28);
@@ -2750,8 +2763,8 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_align(l2, LV_ALIGN_LEFT_MID, 148, 28);
 
         mapdl_zmax_dd = lv_dropdown_create(mapdl_screen);
-        lv_dropdown_set_options(mapdl_zmax_dd, "10\n11\n12\n13\n14\n15");
-        lv_dropdown_set_selected(mapdl_zmax_dd, 5);
+        lv_dropdown_set_options(mapdl_zmax_dd, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15");
+        lv_dropdown_set_selected(mapdl_zmax_dd, 14);
         lv_obj_set_width(mapdl_zmax_dd, 70);
         lv_obj_align(mapdl_zmax_dd, LV_ALIGN_LEFT_MID, 172, 28);
         lv_obj_add_event_cb(
