@@ -211,6 +211,10 @@ enum ScrollDirection {
 
 extern const char *firmware_version;
 
+// Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
+// keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
+#define TUI_VERSION "2026.07.18.1"
+
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
 lv_obj_t *TFTView_320x240::spinnerButton = nullptr;
@@ -1563,6 +1567,13 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *backLbl = lv_label_create(backBtn);
     lv_label_set_text(backLbl, "Back");
     lv_obj_center(backLbl);
+
+    // Version, last line on the screen — the only place the launcher's own version is visible.
+    lv_obj_t *verLbl = lv_label_create(settings_screen);
+    lv_obj_set_style_text_font(verLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(verLbl, "Version " TUI_VERSION);
+    lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 652);
 }
 
 /**
@@ -2823,7 +2834,7 @@ void TFTView_320x240::openMapDownload(void)
         lv_label_set_long_mode(mapdl_info, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(mapdl_info, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_align(mapdl_info, LV_ALIGN_TOP_LEFT, 12, 76);
-        lv_label_set_text(mapdl_info, "Area: what the map shows.\nOK to let the screen sleep.");
+        lv_label_set_text(mapdl_info, "Area = what the map shows.\nSleep is OK once started.");
 
         lv_obj_t *ls = lv_label_create(mapdl_screen);
         lv_label_set_text(ls, "Source:");
@@ -2967,6 +2978,9 @@ void TFTView_320x240::mapdlStart(void)
     }
     mapdl_deadline = lv_tick_get() + 25000;
     mapdl_running = true;
+    // Two SHORT lines only — see the layout note in openMapDownload. Leaving this screen
+    // currently stops the download (Jake hit this on 16.7); sleeping is safe, so say both.
+    lv_label_set_text(mapdl_info, "Stay on this screen while\ndownloading. Sleep is OK.");
     lv_label_set_text(mapdl_btn_lbl, "Stop");
     lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
     // lock the knobs while running — the cursor math depends on them
