@@ -43,6 +43,7 @@ class MapPanel
     void setScrolledPosition(float lat, float lon);
     void setGpsPosition(float lat, float lon);
     bool scroll(int16_t deltaX, int16_t deltaY, uint16_t fraction = 3); // -1, 0, +1, 1/3
+    bool scrollBy(int16_t scrollX, int16_t scrollY);                    // exact pixels, for drag-to-pan
     void moveHome(bool zoomDefault = true);
     void moveCurrent(void);
     // convert a panel pixel (x,y) to a geographic lat/lon (inverse of the object placement)

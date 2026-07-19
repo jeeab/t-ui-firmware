@@ -17,6 +17,10 @@ extern volatile bool tdeck_wake_request;
 // Alt+C on the T-Deck keyboard emits a dedicated byte (0x0C, see the C3 keyboard firmware):
 // a touch-independent request to (re)run screen calibration, handled by the launcher's poll.
 extern volatile bool tdeck_calib_request;
+// While a Lua app is the screen in front of the user, its keys belong to that app rather
+// than to LVGL. Defined in graphics/TFT/LuaApp.cpp.
+extern "C" bool tdeck_lua_app_focused(void);
+extern "C" void tdeck_lua_queue_key(uint32_t key);
 
 I2CKeyboardInputDriver::KeyboardList I2CKeyboardInputDriver::i2cKeyboardList;
 
@@ -68,6 +72,17 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // so we record the request and swallow the key below.
             if (tdeck_input_gated) {
                 tdeck_wake_request = true;
+                break;
+            }
+            // A Lua app is on screen: the key is the app's, not LVGL's. Queue it for the
+            // app's next tick and swallow it here, so it can't also land in whatever widget
+            // the keyboard group happens to have focused underneath. Deliberately AFTER the
+            // gated/prog-mode/Alt+C checks above, so waking, escaping and calibrating all
+            // still work exactly as before while an app is open.
+            if (tdeck_lua_app_focused()) {
+                tdeck_lua_queue_key(data->key);
+                data->state = LV_INDEV_STATE_RELEASED;
+                data->key = 0;
                 break;
             }
             // Keys belong to the screen the user is looking at. The keyboard group's focused

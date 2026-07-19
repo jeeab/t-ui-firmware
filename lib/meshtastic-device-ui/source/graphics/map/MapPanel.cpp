@@ -320,6 +320,8 @@ void MapPanel::setLocked(bool lock)
 /**
  * move map in direction x/y -1, 0, 1 by fraction of panel width but not more than tile size
  */
+// Step the map by a fraction of the screen (the old swipe-gesture behaviour). Works out
+// how far that is in pixels, then hands over to scrollBy.
 bool MapPanel::scroll(int16_t deltaX, int16_t deltaY, uint16_t fraction)
 {
     int16_t size = MapTileSettings::getTileSize();
@@ -335,6 +337,21 @@ bool MapPanel::scroll(int16_t deltaX, int16_t deltaY, uint16_t fraction)
         scrollY = deltaY * size;
     else
         scrollY = deltaY * heightPixel / fraction;
+
+    return scrollBy(scrollX, scrollY);
+}
+
+// Move the map by an exact number of pixels. This is the body that scroll() always had;
+// splitting it out lets the Maps app follow a finger directly instead of jumping a third
+// of a screen per swipe. Every tile is just an LVGL image being repositioned, so this is
+// cheap - the only expensive moments are when a new tile scrolls into view and has to be
+// decoded, which is why the caller keeps each step small.
+//
+// NOTE the existing constraint still applies: a single step must be smaller than one tile
+// (256px). Finger deltas are a few pixels per frame, so that's comfortably satisfied.
+bool MapPanel::scrollBy(int16_t scrollX, int16_t scrollY)
+{
+    int16_t size = MapTileSettings::getTileSize();
 
     // first check if we are already at the edge of the world tile map
     // TODO: allow sub-tile movement to the exact border (adapt scrollX/scrollY)

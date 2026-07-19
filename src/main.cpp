@@ -1284,6 +1284,9 @@ extern "C" void tdeck_sound_service(void);
 // T-Deck launcher Time zone: apply + persist a pending zone change from this (main) thread.
 // Writing settings to flash from the UI task froze the device. Defined in TDeckTimeZone.cpp.
 extern "C" void tdeck_tz_service(void);
+// T-Deck launcher: apply a channel link the UI read off the SD card. Decoding and the
+// channel/flash writes belong on this thread. Defined in src/TDeckChannelImport.cpp.
+extern "C" void tdeck_channel_import_service(void);
 // Main-loop heartbeat for the freeze detector (TDeckMemInfo.cpp): if this loop stops
 // iterating, the UI task records how long + which OSThread it's stuck in, so the 90s
 // app-watchdog "FROZE (task)" reboots finally say WHERE the loop froze.
@@ -1298,6 +1301,7 @@ void loop()
     tdeck_gps_control_service();
     tdeck_sound_service();
     tdeck_tz_service();
+    tdeck_channel_import_service();
 
 #if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
     if (lockdownDisablePending) {

@@ -29,6 +29,7 @@ extern "C" void tdeck_lua_app_touch(int x, int y);
 extern "C" void tdeck_lua_app_drag(int x, int y);
 extern "C" void tdeck_lua_app_stop(void);
 extern "C" void tdeck_ui_canvas_free(void); // defined below; frees the game frame buffer
+extern "C" void tdeck_lua_app_key(uint32_t key); // TDeckLua.cpp: hands a key to the app's on_key
 
 // Multi-touch reader, installed by LGFXDriver<LGFX>::init (it owns the touch
 // hardware handle). Null until the display driver comes up.
@@ -97,7 +98,23 @@ UObj *findOrCreateSlot(int id, int type)
     return &uobjs[uobjCount++];
 }
 
-void tickCb(lv_timer_t *) { tdeck_lua_app_tick(33); }
+// Keys arrive on the LVGL input-read callback, which is NOT where we want to run Lua —
+// so the driver drops them in this little ring and the app's tick drains it. Sixteen is
+// far more than a human can type in one frame; if it ever overflowed we'd rather drop the
+// oldest key than block the input driver.
+constexpr int kKeyQueueLen = 16;
+volatile uint32_t keyQueue[kKeyQueueLen];
+volatile uint8_t keyHead = 0, keyTail = 0;
+
+void tickCb(lv_timer_t *)
+{
+    while (keyTail != keyHead) {
+        uint32_t k = keyQueue[keyTail];
+        keyTail = (uint8_t)((keyTail + 1) % kKeyQueueLen);
+        tdeck_lua_app_key(k);
+    }
+    tdeck_lua_app_tick(33);
+}
 
 // Write the bundled script to the SD card (overwrite so a firmware update always
 // wins for OUR demos; user-added apps live in other folders and are never touched).
@@ -536,6 +553,27 @@ end
 } // namespace
 
 // ---- drawing bridges the Lua toolbox calls (from src/TDeckLua.cpp) -----------
+// ===== Physical keyboard for apps ===============================================
+//
+// Is a Lua app the thing on screen right now? The keyboard driver asks before handing
+// a key to an app, so keys only ever divert while an app is genuinely in front of the
+// user — typing in Notes, the PIN pad and the wake-on-keypress path are untouched.
+extern "C" bool tdeck_lua_app_focused(void)
+{
+    return luaScreen != nullptr && lv_screen_active() == luaScreen;
+}
+
+// Called from the keyboard driver's read callback. Queues the key for the app's next
+// tick; running Lua straight from an input callback would be asking for trouble.
+extern "C" void tdeck_lua_queue_key(uint32_t key)
+{
+    uint8_t next = (uint8_t)((keyHead + 1) % kKeyQueueLen);
+    if (next == keyTail)
+        return; // full: drop it rather than stall the input driver
+    keyQueue[keyHead] = key;
+    keyHead = next;
+}
+
 // ===== Canvas: a real pixel surface for games ===================================
 //
 // The label/box/line API above is a UI toolkit — every element is a full LVGL object,
@@ -698,6 +736,56 @@ extern "C" void tdeck_ui_canvas_circle(int cx, int cy, int r, uint32_t color, in
         } else {
             x--;
             err += 2 * (y - x) + 1;
+        }
+    }
+}
+
+// Blit a sprite. The art arrives as one character per pixel plus a lookup table the Lua
+// side has already flattened from the app's palette, so this loop never calls back into
+// Lua — it just reads bytes and writes pixels.
+//
+// `lut` is indexed by (character - 32), 95 entries. `opaque` says whether that character
+// draws at all, which is how transparency works: any character with no palette entry
+// (space, by convention) leaves the background alone.
+//
+// `scale` draws each sprite pixel as a scale x scale block, so 8x8 pixel art is actually
+// visible on a 320x240 screen.
+extern "C" void tdeck_ui_canvas_sprite(int x, int y, int w, int h, const char *pix, const uint32_t *lut,
+                                       const uint8_t *opaque, int scale)
+{
+    if (!canvasBuf || !pix || w <= 0 || h <= 0)
+        return;
+    if (scale < 1)
+        scale = 1;
+    if (scale > 16)
+        scale = 16;
+
+    for (int sy = 0; sy < h; sy++) {
+        int py0 = y + sy * scale;
+        if (py0 + scale <= 0 || py0 >= canvasH)
+            continue; // whole row is off-screen
+        for (int sx = 0; sx < w; sx++) {
+            unsigned char c = (unsigned char)pix[sy * w + sx];
+            if (c < 32 || c > 126)
+                continue;
+            int idx = c - 32;
+            if (!opaque[idx])
+                continue; // transparent
+            uint16_t col = rgb565(lut[idx]);
+
+            int px0 = x + sx * scale;
+            for (int dy = 0; dy < scale; dy++) {
+                int py = py0 + dy;
+                if (py < 0 || py >= canvasH)
+                    continue;
+                uint16_t *row = canvasBuf + (size_t)py * canvasStridePx;
+                for (int dx = 0; dx < scale; dx++) {
+                    int px = px0 + dx;
+                    if (px < 0 || px >= canvasW)
+                        continue;
+                    row[px] = col;
+                }
+            }
         }
     }
 }

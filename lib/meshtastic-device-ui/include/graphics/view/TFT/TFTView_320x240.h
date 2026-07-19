@@ -306,6 +306,22 @@ class TFTView_320x240 : public MeshtasticView
     uint32_t flashlight_saved_brightness = 153;
     // ---- Maps app: our own standalone map screen (same SD tiles, own MapPanel instance) ----
     void openMaps(void);
+    // Pins are placed by arming "Add pin" in the Pins list and then tapping the map.
+    // Holding was tried first and couldn't be told apart from starting a pan.
+    lv_obj_t *maps_hold_label = nullptr; // "tap the map to place a pin" prompt
+    bool mapsAwaitPinTap = false;        // armed by "Add pin" in the Pins list
+    // Drag-to-pan state. mapsPanMoved also tells a pan apart from a tap, so panning
+    // while "Add pin" is armed doesn't drop a pin wherever the finger happened to lift.
+    int mapsPanX = 0, mapsPanY = 0;
+    int mapsPanMoved = 0;
+    bool mapsPanActive = false; // a press actually started on the map
+    uint32_t mapsPanLast = 0;
+
+    // Add a Meshtastic channel from a link saved in /channel.txt on the SD card.
+    void importChannelFromCard(void);
+    lv_obj_t *channel_import_label = nullptr;
+    lv_timer_t *channel_import_timer = nullptr;
+
     void mapsInitTileStyle(void);                 // detect tile style/prefix on SD (mirror of loadMap's logic)
     static ITileService *sharedTileService(void); // ONE tile service ever — its ctor registers an LVGL fs driver
     lv_obj_t *maps_screen = nullptr;

@@ -89,6 +89,11 @@ extern "C" void tdeck_gps_kick(void); // re-arm the GPS search after a sleep
 // which must stay in the same order as the dropdown built in createSettingsScreen().
 extern "C" void tdeck_tz_set(int idx);
 extern "C" int tdeck_tz_get(void);
+// Channel import: the UI reads the file (SD belongs to this task), the main loop applies it.
+extern "C" void tdeck_channel_import_submit(const char *text, int len);
+extern "C" int tdeck_channel_import_status(void);
+extern "C" int tdeck_channel_import_count(void);
+extern "C" void tdeck_channel_import_clear(void);
 
 // WiFi status bridge (src/TDeckWifi.cpp): 0=off/unconfigured, 1=connecting, 2=connected
 extern "C" int tdeck_wifi_state(void);
@@ -218,7 +223,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.3"
+#define TUI_VERSION "2026.07.19.10"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -1615,13 +1620,41 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_color(sndHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 570);
 
+    // "Add channel" row — reads a Meshtastic channel link from /channel.txt on the card.
+    // Typing a 150-character link on the thumb keyboard isn't realistic, and there's no
+    // camera for the usual QR code, so a file on the card is the practical route.
+    lv_obj_t *chLbl = lv_label_create(settings_screen);
+    lv_label_set_text(chLbl, "Add channel");
+    lv_obj_set_style_text_color(chLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 602);
+
+    lv_obj_t *chBtn = lv_btn_create(settings_screen);
+    lv_obj_set_size(chBtn, 110, 30);
+    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 598);
+    lv_obj_set_style_radius(chBtn, 8, LV_PART_MAIN);
+    lv_obj_t *chBtnLbl = lv_label_create(chBtn);
+    lv_obj_set_style_text_font(chBtnLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(chBtnLbl, "Read card");
+    lv_obj_center(chBtnLbl);
+
+    channel_import_label = lv_label_create(settings_screen);
+    lv_obj_set_width(channel_import_label, 288);
+    lv_label_set_long_mode(channel_import_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(channel_import_label, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(channel_import_label, "Put the channel link in channel.txt on the card, then tap.");
+    lv_obj_set_style_text_color(channel_import_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 632);
+
+    lv_obj_add_event_cb(
+        chBtn, [](lv_event_t *) { THIS->importChannelFromCard(); }, LV_EVENT_CLICKED, NULL);
+
     // "Time zone" row — makes the clock on the home screen read local time. The device gets
     // UTC from the GPS satellites; without a zone the firmware falls back to GMT, which is
     // why the clock would otherwise be hours out. Order must match kTdeckZones[].
     lv_obj_t *tzLbl = lv_label_create(settings_screen);
     lv_label_set_text(tzLbl, "Time zone");
     lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 602);
+    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 668);
 
     // When no zone is set the device silently runs on GMT. Showing the list's first entry in
     // that case made it look like Pacific was already chosen while the clock was really on
@@ -1635,7 +1668,7 @@ void TFTView_320x240::createSettingsScreen(void)
                                           : "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
                                             "UTC\nUK\nCentral Europe");
     lv_obj_set_width(tzDd, 150);
-    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 596);
+    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 662);
     lv_dropdown_set_selected(tzDd, tzUnset ? 0 : (uint32_t)tzCur);
     // Keep the open list on-screen: this row sits at the bottom of a tall scrolling screen,
     // so let it drop upward rather than off the end.
@@ -1657,7 +1690,7 @@ void TFTView_320x240::createSettingsScreen(void)
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 648);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 714);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -1675,12 +1708,87 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(verLbl, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(verLbl, "Version " TUI_VERSION);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 692);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 758);
 }
 
 /**
  * @brief Open the settings screen (lazily built on first use).
  */
+// Read /channel.txt off the card and hand it to the main loop to apply. The SD read has
+// to happen here (this task owns SdFat); decoding and the channel/flash writes happen in
+// TDeckChannelImport.cpp, on the thread that's allowed to do them.
+void TFTView_320x240::importChannelFromCard(void)
+{
+#if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+    if (!channel_import_label)
+        return;
+    auto say = [&](const char *msg, uint32_t colour) {
+        lv_label_set_text(channel_import_label, msg);
+        lv_obj_set_style_text_color(channel_import_label, lv_color_hex(colour), LV_PART_MAIN);
+    };
+
+    if (!sdCard) {
+        say("No SD card.", 0xff453a);
+        return;
+    }
+    FsFile f = SDFs.open("/channel.txt", O_RDONLY);
+    if (!f) {
+        say("No channel.txt on the card. Put the link in that file.", 0xff453a);
+        return;
+    }
+    char buf[512];
+    int n = (int)f.read((uint8_t *)buf, sizeof(buf) - 1);
+    f.close();
+    if (n <= 0) {
+        say("channel.txt is empty.", 0xff453a);
+        return;
+    }
+    buf[n] = 0;
+
+    tdeck_channel_import_clear();
+    tdeck_channel_import_submit(buf, n);
+    say("Reading...", 0xffd60a);
+
+    // The main loop picks it up within a tick or two; poll briefly for the outcome.
+    if (channel_import_timer)
+        lv_timer_delete(channel_import_timer);
+    channel_import_timer = lv_timer_create(
+        [](lv_timer_t *t) {
+            static int tries = 0;
+            int st = tdeck_channel_import_status();
+            const char *msg = nullptr;
+            uint32_t colour = 0xff453a;
+            if (st == 2) {
+                static char okMsg[72];
+                snprintf(okMsg, sizeof(okMsg), "Added %d channel(s). Restart to finish.", tdeck_channel_import_count());
+                msg = okMsg;
+                colour = 0x30d158;
+            } else if (st == -1) {
+                msg = "That file doesn't look like a channel link.";
+            } else if (st == -2) {
+                msg = "The link looks damaged - copy it again.";
+            } else if (st == -3) {
+                msg = "Couldn't read that as a channel.";
+            } else if (st == -4) {
+                msg = "The link contained no channels.";
+            } else if (++tries > 40) { // ~4s
+                msg = "Timed out applying the channel.";
+            } else {
+                return; // still pending
+            }
+            tries = 0;
+            if (THIS->channel_import_label) {
+                lv_label_set_text(THIS->channel_import_label, msg);
+                lv_obj_set_style_text_color(THIS->channel_import_label, lv_color_hex(colour), LV_PART_MAIN);
+            }
+            tdeck_channel_import_clear();
+            lv_timer_delete(t);
+            THIS->channel_import_timer = nullptr;
+        },
+        100, NULL);
+#endif
+}
+
 void TFTView_320x240::openSettings(void)
 {
     if (!settings_screen)
@@ -1923,8 +2031,27 @@ void TFTView_320x240::wifiApplyEnabled(bool enable)
         return;
     }
     net.wifi_enabled = enable;
-    controller->sendConfig(meshtastic_Config_NetworkConfig{net}); // persist + apply (device reboots)
-    updateWifiStatus();
+
+    // Applying network config restarts the device. That's normal Meshtastic behaviour, but
+    // with no warning it looks exactly like a crash — Jake's brother thought the firmware
+    // had died. Say what's about to happen, leave it on screen long enough to read, THEN
+    // apply. The delay is the point: without it the reboot eats the message.
+    if (wifi_status_label) {
+        lv_label_set_text(wifi_status_label, enable ? "Restarting to turn Wi-Fi on. This is normal."
+                                                    : "Restarting to turn Wi-Fi off. This is normal.");
+        lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xffd60a), LV_PART_MAIN);
+    }
+    messageAlert(enable ? _("Turning Wi-Fi on...\nThe device restarts - this is normal.")
+                        : _("Turning Wi-Fi off...\nThe device restarts - this is normal."),
+                 true);
+    lv_refr_now(NULL); // make sure it's actually on screen before we hand over
+
+    lv_timer_t *t = lv_timer_create(
+        [](lv_timer_t *) {
+            THIS->controller->sendConfig(meshtastic_Config_NetworkConfig{THIS->db.config.network});
+        },
+        1800, NULL);
+    lv_timer_set_repeat_count(t, 1);
 }
 
 void TFTView_320x240::closeWifiEntry(void)
@@ -2271,13 +2398,39 @@ void TFTView_320x240::openMaps(void)
         lv_obj_set_style_bg_opa(maps_map_container, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_clear_flag(maps_map_container, LV_OBJ_FLAG_SCROLLABLE);
 
-        // long-press anywhere on the map drops a pin at that geographic spot
+        // hold anywhere on the map to drop a pin at that geographic spot
         lv_obj_add_flag(maps_map_container, LV_OBJ_FLAG_CLICKABLE);
+
+        // Shown while a pin-drop hold is in progress, so three seconds of nothing doesn't
+        // read as the device ignoring you.
+        maps_hold_label = lv_label_create(maps_screen);
+        lv_obj_set_style_text_font(maps_hold_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_hold_label, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_hold_label, LV_OPA_70, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(maps_hold_label, 5, LV_PART_MAIN);
+        lv_obj_set_style_radius(maps_hold_label, 6, LV_PART_MAIN);
+        lv_label_set_text(maps_hold_label, "keep holding to drop a pin");
+        lv_obj_set_style_text_color(maps_hold_label, lv_color_hex(0xffd60a), LV_PART_MAIN);
+        lv_obj_align(maps_hold_label, LV_ALIGN_BOTTOM_MID, 0, -12);
+        lv_obj_add_flag(maps_hold_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(maps_hold_label, LV_OBJ_FLAG_CLICKABLE);
+
+        // Placing a pin: tap the map after choosing "Add pin" in the Pins list.
+        // The previous version needed a 3-second hold, which is genuinely hard to tell
+        // apart from starting a pan - so it fired when you were panning, or never fired
+        // at all. Note this hangs off the map CONTAINER, not the screen: presses land on
+        // the object under the finger and LVGL doesn't pass them up to the parent.
         lv_obj_add_event_cb(
             maps_map_container,
             [](lv_event_t *) {
+                if (!THIS->mapsAwaitPinTap || !THIS->userMap)
+                    return;
+                // A pan ends in a click too, so ignore one that travelled - otherwise
+                // dragging the map while armed would drop a pin wherever you let go.
+                if (THIS->mapsPanMoved > 12)
+                    return;
                 lv_indev_t *indev = lv_indev_active();
-                if (!indev || !THIS->userMap)
+                if (!indev)
                     return;
                 lv_point_t pt;
                 lv_indev_get_point(indev, &pt);
@@ -2285,37 +2438,93 @@ void TFTView_320x240::openMaps(void)
                 lv_obj_get_coords(THIS->maps_map_container, &a);
                 float lat, lon;
                 THIS->userMap->screenToGeo((int16_t)(pt.x - a.x1), (int16_t)(pt.y - a.y1), lat, lon);
+                THIS->mapsAwaitPinTap = false;
+                if (THIS->maps_hold_label)
+                    lv_obj_add_flag(THIS->maps_hold_label, LV_OBJ_FLAG_HIDDEN);
                 THIS->dropPinAt(lat, lon);
             },
-            LV_EVENT_LONG_PRESSED, NULL);
+            LV_EVENT_CLICKED, NULL);
 
-        // swipe scrolls the map (same direction mapping as the mesh map's gestures)
+        // Drag to pan, following the finger. This replaced swipe-gestures, where one swipe
+        // jumped a third of a screen and the map arrived somewhere you hadn't aimed at.
+        //
+        // Panning is cheap - every tile is an LVGL image being repositioned - so the only
+        // costly moments are when a new tile scrolls in and has to be decoded. Deltas are
+        // applied at most every 30ms so a fast drag can't queue up more work than the
+        // screen can draw, and a drag never fetches over the network (touch is sacred).
         lv_obj_add_event_cb(
-            maps_screen,
-            [](lv_event_t *) {
-                if (!THIS->userMap || !THIS->userMap->redrawComplete())
+            maps_map_container,
+            [](lv_event_t *e) {
+                lv_event_code_t code = lv_event_get_code(e);
+
+                // Handle EXACTLY three events and ignore the rest. Registering for
+                // LV_EVENT_ALL and treating "not a press or release" as a drag was the
+                // jump-on-tap: LVGL also sends CLICKED, SHORT_CLICKED, LONG_PRESSED_REPEAT
+                // and a pile of draw events, and each one fell through to the pan path and
+                // applied whatever leftover movement the anchor was holding.
+                if (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING && code != LV_EVENT_RELEASED &&
+                    code != LV_EVENT_PRESS_LOST)
                     return;
-                int16_t dx = 0, dy = 0;
-                switch (lv_indev_get_gesture_dir(lv_indev_active())) {
-                case LV_DIR_LEFT:
-                    dx = -1;
-                    break;
-                case LV_DIR_RIGHT:
-                    dx = 1;
-                    break;
-                case LV_DIR_TOP:
-                    dy = -1;
-                    break;
-                case LV_DIR_BOTTOM:
-                    dy = 1;
-                    break;
-                default:
+
+                lv_indev_t *indev = lv_indev_active();
+                if (!indev || !THIS->userMap)
+                    return;
+                lv_point_t pt;
+                lv_indev_get_point(indev, &pt);
+
+                if (code == LV_EVENT_PRESSED) {
+                    THIS->mapsPanX = pt.x;
+                    THIS->mapsPanY = pt.y;
+                    THIS->mapsPanMoved = 0;
+                    THIS->mapsPanLast = lv_tick_get();
+                    THIS->mapsPanActive = true;
                     return;
                 }
-                if (!THIS->userMap->scroll(dx, dy))
+                if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+                    // Settle: pick up any tiles the throttle skipped over.
+                    if (THIS->mapsPanMoved > 6)
+                        THIS->userMap->forceRedraw(true);
+                    THIS->mapsPanActive = false;
+                    return;
+                }
+                // A drag that began somewhere else (the top bar, say) never gave us a
+                // PRESSED here, so the anchor would be stale - don't pan from it.
+                if (!THIS->mapsPanActive)
+                    return;
+
+                // PRESSING
+                int dx = (int)pt.x - THIS->mapsPanX;
+                int dy = (int)pt.y - THIS->mapsPanY;
+                if (dx == 0 && dy == 0)
+                    return;
+                THIS->mapsPanMoved += abs(dx) + abs(dy);
+
+                // Skip a step by RETURNING WITHOUT MOVING THE ANCHOR, so the movement is
+                // still owed and gets applied next time. The first version consumed the
+                // anchor before deciding to skip, which threw the movement away - the map
+                // fell behind the finger and then resynced, which reads as snapping back.
+                uint32_t now = lv_tick_get();
+                if (now - THIS->mapsPanLast < 30)
+                    return; // let the screen keep up
+                if (!THIS->userMap->redrawComplete())
+                    return; // still drawing the last step - don't pile on
+
+                THIS->mapsPanLast = now;
+                THIS->mapsPanX = pt.x; // consume the delta only now that we're applying it
+                THIS->mapsPanY = pt.y;
+
+                // A single step must stay under a tile (see scrollBy); clamp hard drags.
+                if (dx > 120) dx = 120;
+                if (dx < -120) dx = -120;
+                if (dy > 120) dy = 120;
+                if (dy < -120) dy = -120;
+                // A refused scroll (edge of the world, or a tile not loaded yet) leaves the
+                // panel and the stored centre disagreeing. The gesture version always
+                // resynced here; dropping that is the other half of the snap-back.
+                if (!THIS->userMap->scrollBy((int16_t)dx, (int16_t)dy))
                     THIS->userMap->forceRedraw();
             },
-            LV_EVENT_GESTURE, NULL);
+            LV_EVENT_ALL, NULL);
 
         // ---- top bar: Back · − · + · Me · Pins ----
         auto barBtn = [this](const char *txt, int32_t w, lv_align_t align, int32_t xofs, uint32_t color,
@@ -4105,6 +4314,31 @@ void TFTView_320x240::openPinsList(void)
     lv_label_set_text(cl, "Close");
     lv_obj_center(cl);
 
+    // "Add pin" — closes this list, then the next tap on the map places the pin.
+    // This replaced holding the map: a hold has to be distinguished from a pan, so it
+    // either fires while you're dragging or doesn't fire at all. Aiming a tap is
+    // unambiguous, and you can see exactly where it's going.
+    lv_obj_t *addBtn = lv_btn_create(pins_overlay);
+    lv_obj_set_size(addBtn, 78, 28);
+    lv_obj_align(addBtn, LV_ALIGN_TOP_RIGHT, -76, 6);
+    lv_obj_set_style_bg_color(addBtn, lv_color_hex(0x30d158), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        addBtn,
+        [](lv_event_t *) {
+            THIS->closePinsList();
+            THIS->mapsAwaitPinTap = true;
+            if (THIS->maps_hold_label) {
+                lv_label_set_text(THIS->maps_hold_label, "tap the map to place a pin  (Pins to cancel)");
+                lv_obj_clear_flag(THIS->maps_hold_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        },
+        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *al = lv_label_create(addBtn);
+    lv_obj_set_style_text_font(al, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(al, "Add pin");
+    lv_obj_set_style_text_color(al, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_center(al);
+
     lv_obj_t *list = lv_obj_create(pins_overlay);
     lv_obj_remove_style_all(list);
     lv_obj_set_size(list, 314, 194);
@@ -4115,7 +4349,7 @@ void TFTView_320x240::openPinsList(void)
 
     if (mapPins.empty()) {
         lv_obj_t *empty = lv_label_create(list);
-        lv_label_set_text(empty, "No pins yet.\nLong-press the map to drop one.");
+        lv_label_set_text(empty, "No pins yet.\nTap Add pin, then tap the map.");
         lv_obj_set_style_text_color(empty, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         return;
     }
