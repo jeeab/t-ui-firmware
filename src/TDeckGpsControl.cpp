@@ -23,9 +23,29 @@
 #include "gps/GPS.h"
 #include "mesh/NodeDB.h"
 
+// How often the GPS looks for a fix when it's "on". At or below the driver's always-on
+// threshold the chip never powers down between fixes, so it is continuously searching.
+#define TDECK_GPS_CONTINUOUS_SECS 10
+
 static volatile bool s_tdeckGpsPending = false;          // an on/off change is waiting
 static volatile bool s_tdeckGpsWantOn = true;            // desired state (written by the UI task)
 static volatile uint32_t s_tdeckGpsPendingInterval = 0;  // desired check interval, seconds (0 = no change)
+static volatile bool s_tdeckGpsKick = false;             // re-arm the search (wake); no config write
+static bool s_tdeckGpsBootKicked = false;                // boot re-arm done once the driver is up
+
+// Re-arm the GPS search. Called on wake, because nothing else does.
+//
+// Observed on-device (2026-07-18): from a cold boot the GPS could sit for 25+ minutes,
+// including driving, without a lock - then flipping the Settings switch off and on gave
+// satellites almost immediately. After the device slept it died again and only the toggle
+// revived it. Both gaps are the same root cause: the ONLY thing that ever called
+// gps->enable() with the continuous interval was that switch. At boot the stored (possibly
+// long) interval left the chip napping between searches, and after a sleep nothing re-armed
+// it at all. This does automatically what Jake was doing by hand.
+extern "C" void tdeck_gps_kick(void)
+{
+    s_tdeckGpsKick = true;
+}
 
 // Called from the UI (LVGL) task. Only records intent — never touches the GPS here.
 extern "C" void tdeck_gps_set_enabled(bool on)
@@ -52,11 +72,35 @@ extern "C" bool tdeck_gps_get_enabled(void)
 // requests; retries next loop if the GPS driver isn't up yet. Cheap when idle.
 extern "C" void tdeck_gps_control_service(void)
 {
-    if (!s_tdeckGpsPending && !s_tdeckGpsPendingInterval)
+    if (!s_tdeckGpsPending && !s_tdeckGpsPendingInterval && !s_tdeckGpsKick && s_tdeckGpsBootKicked)
         return;
 
     if (!gps)
         return; // GPS driver not ready yet — keep the request pending, retry next loop
+
+    // Once, as soon as the driver exists: if the GPS is meant to be on, put it into
+    // continuous search. Without this a stored long interval means the chip naps between
+    // fixes from boot, which reads as "the GPS just never locks".
+    if (!s_tdeckGpsBootKicked) {
+        s_tdeckGpsBootKicked = true;
+        if (config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
+            config.position.gps_update_interval = TDECK_GPS_CONTINUOUS_SECS;
+            gps->enable();
+        }
+    }
+
+    // Wake re-arm. Deliberately does NOT write config to flash — this can happen often, and
+    // the stored settings aren't changing, only the driver's scheduling.
+    if (s_tdeckGpsKick) {
+        s_tdeckGpsKick = false;
+        if (config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
+            config.position.gps_update_interval = TDECK_GPS_CONTINUOUS_SECS;
+            gps->enable();
+        }
+    }
+
+    if (!s_tdeckGpsPending && !s_tdeckGpsPendingInterval)
+        return;
 
     // Apply a new check interval first so an accompanying "on" enables with it.
     uint32_t interval = s_tdeckGpsPendingInterval;
@@ -89,6 +133,7 @@ extern "C" void tdeck_gps_control_service(void)
 #else // GPS excluded from this build — provide no-op stubs so callers still link.
 extern "C" void tdeck_gps_set_enabled(bool) {}
 extern "C" void tdeck_gps_set_interval(uint32_t) {}
+extern "C" void tdeck_gps_kick(void) {}
 extern "C" bool tdeck_gps_get_enabled(void)
 {
     return false;

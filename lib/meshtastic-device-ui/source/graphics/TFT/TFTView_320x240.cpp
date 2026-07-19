@@ -84,6 +84,7 @@ extern "C" uint32_t tdeck_gps_dop(void); // PDOP x100, 0 = unknown
 extern "C" void tdeck_gps_set_enabled(bool on);
 extern "C" void tdeck_gps_set_interval(uint32_t secs);
 extern "C" bool tdeck_gps_get_enabled(void);
+extern "C" void tdeck_gps_kick(void); // re-arm the GPS search after a sleep
 
 // WiFi status bridge (src/TDeckWifi.cpp): 0=off/unconfigured, 1=connecting, 2=connected
 extern "C" int tdeck_wifi_state(void);
@@ -213,7 +214,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.18.4"
+#define TUI_VERSION "2026.07.18.5"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -5237,6 +5238,9 @@ void TFTView_320x240::handleHomeGesture(void)
         tdeck_input_gated = false;
         tdeck_hold_dark = false;           // stop forcing the backlight black
         lv_display_trigger_activity(NULL); // relight the backlight
+        // Waking is also where the GPS gets re-armed: after the device sleeps, nothing else
+        // restarts its search, so it would stay dark until the Settings switch was toggled.
+        tdeck_gps_kick();
         // A code is always in effect (built-in default 1234 until the user sets their own), so
         // any wake — a deliberate lock OR an idle timeout, in any app — brings up the pad. This
         // is the single, deterministic wake path.
