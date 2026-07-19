@@ -223,7 +223,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.12"
+#define TUI_VERSION "2026.07.19.13"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -2401,6 +2401,19 @@ void TFTView_320x240::openMaps(void)
         // hold anywhere on the map to drop a pin at that geographic spot
         lv_obj_add_flag(maps_map_container, LV_OBJ_FLAG_CLICKABLE);
 
+        // Map attribution. TopPlusOpen is BKG open data under dl-de/by-2-0, which requires
+        // credit wherever the tiles are displayed - so it belongs here on the device, not
+        // only on the website. Kept small and out of the way, but always visible.
+        maps_credit_label = lv_label_create(maps_screen);
+        lv_obj_set_style_text_font(maps_credit_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(maps_credit_label, lv_color_hex(0x6a6a72), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_credit_label, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_credit_label, LV_OPA_50, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(maps_credit_label, 2, LV_PART_MAIN);
+        lv_label_set_text(maps_credit_label, "");
+        lv_obj_align(maps_credit_label, LV_ALIGN_BOTTOM_LEFT, 2, -1);
+        lv_obj_clear_flag(maps_credit_label, LV_OBJ_FLAG_CLICKABLE);
+
         // Shown while a pin-drop hold is in progress, so three seconds of nothing doesn't
         // read as the device ignoring you.
         maps_hold_label = lv_label_create(maps_screen);
@@ -2802,14 +2815,20 @@ struct MapDlSource {
     const char *label;  // shown in the Source dropdown, region-prefixed
     const char *folder; // style folder under /maps
     const char *urlTemplate;
-    const char *ext; // tile format written to .format ("jpg"/"png")
-    uint8_t estKB;   // typical tile size for the estimate
+    const char *ext;    // tile format written to .format ("jpg"/"png")
+    uint8_t estKB;      // typical tile size for the estimate
+    const char *credit; // attribution the source's licence asks for
 };
+// Each source carries the credit its licence asks for. USGS is US-government work and
+// public domain, so its line is courtesy; TopPlusOpen is BKG open data published under
+// dl-de/by-2-0, which REQUIRES attribution wherever the tiles are shown - so it has to
+// appear on the device, not just on the website.
 const MapDlSource kMapDlSources[] = {
     {"(US) USGS Topo", "USGS-Topo", "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
-     "jpg", 20},
+     "jpg", 20, "Map: USGS The National Map (public domain)"},
     {"(EU) TopPlusOpen", "TopPlusOpen",
-     "https://sgx.geodatenzentrum.de/wmts_topplus_open/tile/1.0.0/web/default/WEBMERCATOR/{z}/{y}/{x}.png", "png", 35},
+     "https://sgx.geodatenzentrum.de/wmts_topplus_open/tile/1.0.0/web/default/WEBMERCATOR/{z}/{y}/{x}.png", "png", 35,
+     "Map: (c) BKG TopPlusOpen, dl-de/by-2-0"},
 };
 // Detail levels offered on the download screen. Both dropdowns share this list; the value is
 // the index + 1, so the last entry here is the deepest zoom the downloader will fetch.
@@ -2981,6 +3000,18 @@ void TFTView_320x240::mapsApplyStyle(const char *style, bool persist)
         TileProvider::selectTemplate(entry);
     }
     MapTileSettings::setSaveOK(!url.empty());
+
+    // Show the credit for whichever source these tiles came from.
+    if (maps_credit_label) {
+        const char *credit = "";
+        for (size_t i = 0; i < sizeof(kMapDlSources) / sizeof(kMapDlSources[0]); i++) {
+            if (!strcmp(kMapDlSources[i].folder, style)) {
+                credit = kMapDlSources[i].credit;
+                break;
+            }
+        }
+        lv_label_set_text(maps_credit_label, credit);
+    }
 
     if (persist) {
         strncpy(db.uiConfig.map_data.style, style, sizeof(db.uiConfig.map_data.style) - 1);

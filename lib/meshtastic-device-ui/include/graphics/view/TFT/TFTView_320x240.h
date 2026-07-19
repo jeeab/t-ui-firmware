@@ -308,7 +308,8 @@ class TFTView_320x240 : public MeshtasticView
     void openMaps(void);
     // Pins are placed by arming "Add pin" in the Pins list and then tapping the map.
     // Holding was tried first and couldn't be told apart from starting a pan.
-    lv_obj_t *maps_hold_label = nullptr; // "tap the map to place a pin" prompt
+    lv_obj_t *maps_hold_label = nullptr;   // "tap the map to place a pin" prompt
+    lv_obj_t *maps_credit_label = nullptr; // tile-source attribution (a licence condition)
     bool mapsAwaitPinTap = false;        // armed by "Add pin" in the Pins list
     // Drag-to-pan state. mapsPanMoved also tells a pan apart from a tap, so panning
     // while "Add pin" is armed doesn't drop a pin wherever the finger happened to lift.
