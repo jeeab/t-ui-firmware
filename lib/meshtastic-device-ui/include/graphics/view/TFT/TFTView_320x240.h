@@ -343,8 +343,11 @@ class TFTView_320x240 : public MeshtasticView
     void closeGetApps(void); // hand back Wi-Fi + the TLS client on leaving, by any route
     void getappsPump(void); // connect Wi-Fi, then fetch the catalog once
     void getappsBuildList(void);
+    void getappsScheduleRebuild(void); // rebuild rows after the current event, not during it
     int getappsParseCatalog(const char *json, int len);
     bool getappsInstall(int idx);
+    bool getappsRemove(int idx); // delete an installed app + anything it saved
+    int getapps_confirm = -1;    // row waiting for a second tap to confirm removal
     bool getappsIsInstalled(const char *id) const;
     StoreApp storeApps[kMaxStoreApps];
     int storeAppCount = 0;

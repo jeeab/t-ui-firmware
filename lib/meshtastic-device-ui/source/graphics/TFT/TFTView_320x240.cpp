@@ -218,7 +218,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.2"
+#define TUI_VERSION "2026.07.19.3"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -3467,6 +3467,65 @@ bool TFTView_320x240::getappsInstall(int idx)
 #endif
 }
 
+// Delete an installed app: its script, anything it saved, then the folder itself.
+//
+// Installing was one tap while removing meant taking the SD card out to a computer —
+// a door that only opened one way. An app's folder can't contain sub-folders (store
+// names reject slashes), so a flat sweep is enough.
+bool TFTView_320x240::getappsRemove(int idx)
+{
+#if defined(ARDUINO_ARCH_ESP32) && HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+    if (idx < 0 || idx >= storeAppCount || !sdCard)
+        return false;
+    StoreApp &a = storeApps[idx];
+
+    char dir[64];
+    snprintf(dir, sizeof(dir), "/apps/%s", a.id);
+
+    FsFile d = SDFs.open(dir, O_RDONLY);
+    if (d && d.isDirectory()) {
+        FsFile entry;
+        while ((entry = d.openNextFile())) {
+            char nm[40];
+            entry.getName(nm, sizeof(nm));
+            bool isDir = entry.isDirectory();
+            entry.close();
+            if (isDir || nm[0] == 0)
+                continue; // nothing here should be a folder; leave it rather than recurse
+            char f[110];
+            snprintf(f, sizeof(f), "%s/%s", dir, nm);
+            SDFs.remove(f);
+        }
+        d.close();
+    }
+    SDFs.rmdir(dir);
+
+    // Gone only if the script is actually gone — an rmdir that quietly failed would
+    // otherwise leave the row claiming success while the tile stayed on the grid.
+    char main[80];
+    snprintf(main, sizeof(main), "/apps/%s/main.lua", a.id);
+    bool gone = !SDFs.exists(main);
+    if (gone) {
+        a.installed = false;
+        scanUserApps();
+        rebuildAppGrid(); // the tile disappears straight away, no reboot
+    }
+    return gone;
+#else
+    (void)idx;
+    return false;
+#endif
+}
+
+// Rebuild the rows AFTER the current event finishes. Calling getappsBuildList() directly
+// from a button's own callback deletes the button that is still handling the event, which
+// is a use-after-free waiting to happen; a one-shot timer runs once we're safely out.
+void TFTView_320x240::getappsScheduleRebuild(void)
+{
+    lv_timer_t *t = lv_timer_create([](lv_timer_t *) { THIS->getappsBuildList(); }, 30, NULL);
+    lv_timer_set_repeat_count(t, 1); // LVGL deletes it after the single run
+}
+
 // Build (or rebuild) the list of app rows on the screen.
 void TFTView_320x240::getappsBuildList(void)
 {
@@ -3526,9 +3585,40 @@ void TFTView_320x240::getappsBuildList(void)
         lv_obj_set_style_bg_color(btn, lv_color_hex(a.installed ? 0x2c2c2e : 0x30d158), LV_PART_MAIN);
         lv_obj_t *bl = lv_label_create(btn);
         lv_obj_set_style_text_font(bl, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_label_set_text(bl, a.installed ? "On device" : "Install");
-        lv_obj_set_style_text_color(bl, lv_color_hex(a.installed ? 0x8e8e93 : 0x000000), LV_PART_MAIN);
+        lv_label_set_text(bl, a.installed ? "Remove" : "Install");
+        lv_obj_set_style_text_color(bl, lv_color_hex(a.installed ? 0xff453a : 0x000000), LV_PART_MAIN);
         lv_obj_center(bl);
+
+        if (a.installed) {
+            // Removing deletes saved data too (high scores, settings), so it asks first.
+            // The confirmation lives on the button itself — there's no room for a dialog.
+            lv_obj_set_user_data(btn, (void *)(intptr_t)i);
+            lv_obj_add_event_cb(
+                btn,
+                [](lv_event_t *e) {
+                    lv_obj_t *b = (lv_obj_t *)lv_event_get_target(e);
+                    int idx = (int)(intptr_t)lv_obj_get_user_data(b);
+                    lv_obj_t *lbl = lv_obj_get_child(b, 0);
+                    if (!lbl)
+                        return;
+                    if (strcmp(lv_label_get_text(lbl), "Remove") == 0) {
+                        lv_label_set_text(lbl, "Sure?");
+                        lv_obj_set_style_bg_color(b, lv_color_hex(0x4a2326), LV_PART_MAIN);
+                        THIS->getapps_confirm = idx; // only one row can be armed at a time
+                        return;
+                    }
+                    bool okGone = THIS->getappsRemove(idx);
+                    THIS->getapps_confirm = -1;
+                    lv_label_set_text(THIS->getapps_status, okGone ? "Removed from your device"
+                                                                  : "Couldn't remove it - card busy?");
+                    if (okGone)
+                        THIS->getappsScheduleRebuild(); // row flips back to Install
+                    else
+                        lv_label_set_text(lbl, "Remove");
+                },
+                LV_EVENT_CLICKED, NULL);
+        }
+
         if (!a.installed) {
             lv_obj_set_user_data(btn, (void *)(intptr_t)i);
             lv_obj_add_event_cb(
@@ -3547,9 +3637,8 @@ void TFTView_320x240::getappsBuildList(void)
                     lv_obj_set_style_bg_color(b, lv_color_hex(ok ? 0x2c2c2e : 0xff453a), LV_PART_MAIN);
                     if (ok) {
                         lv_obj_set_style_text_color(lbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-                        // Left tappable on purpose: installing again just rewrites the same
-                        // file, which is also how you'd pull down an updated version.
                         lv_label_set_text(THIS->getapps_status, "Added to your home screen");
+                        THIS->getappsScheduleRebuild(); // the row becomes a Remove button
                     } else {
                         lv_label_set_text(THIS->getapps_status, "Download failed - try again");
                     }
