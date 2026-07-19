@@ -107,6 +107,65 @@ static int api_store_write(lua_State *L)
 }
 
 // screen.line(id, x1, y1, x2, y2, thickness, color) — an angled thick bar.
+// ---- canvas: pixel drawing for games ----------------------------------------
+// The screen.* API above is capped at 80 UI objects. The canvas is one object holding
+// a whole frame buffer, so an app can draw as much as it likes. Every call here lands
+// in C, which is what keeps it fast enough to be worth having.
+extern "C" int tdeck_ui_canvas_begin(void);
+extern "C" void tdeck_ui_canvas_clear(uint32_t color);
+extern "C" void tdeck_ui_canvas_rect(int x, int y, int w, int h, uint32_t color);
+extern "C" void tdeck_ui_canvas_pixel(int x, int y, uint32_t color);
+extern "C" void tdeck_ui_canvas_line(int x1, int y1, int x2, int y2, uint32_t color);
+extern "C" void tdeck_ui_canvas_circle(int cx, int cy, int r, uint32_t color, int filled);
+extern "C" void tdeck_ui_canvas_flip(void);
+
+static int api_canvas_begin(lua_State *L)
+{
+    lua_pushboolean(L, tdeck_ui_canvas_begin());
+    return 1;
+}
+
+static int api_canvas_clear(lua_State *L)
+{
+    tdeck_ui_canvas_clear((uint32_t)luaL_optinteger(L, 1, 0x000000));
+    return 0;
+}
+
+static int api_canvas_rect(lua_State *L)
+{
+    tdeck_ui_canvas_rect((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+                         (int)luaL_checkinteger(L, 4), (uint32_t)luaL_optinteger(L, 5, 0xFFFFFF));
+    return 0;
+}
+
+static int api_canvas_pixel(lua_State *L)
+{
+    tdeck_ui_canvas_pixel((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
+                          (uint32_t)luaL_optinteger(L, 3, 0xFFFFFF));
+    return 0;
+}
+
+static int api_canvas_line(lua_State *L)
+{
+    tdeck_ui_canvas_line((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+                         (int)luaL_checkinteger(L, 4), (uint32_t)luaL_optinteger(L, 5, 0xFFFFFF));
+    return 0;
+}
+
+static int api_canvas_circle(lua_State *L)
+{
+    tdeck_ui_canvas_circle((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2), (int)luaL_checkinteger(L, 3),
+                           (uint32_t)luaL_optinteger(L, 4, 0xFFFFFF), lua_toboolean(L, 5));
+    return 0;
+}
+
+static int api_canvas_flip(lua_State *L)
+{
+    (void)L;
+    tdeck_ui_canvas_flip();
+    return 0;
+}
+
 static int api_screen_line(lua_State *L)
 {
     int id = (int)luaL_checkinteger(L, 1);
@@ -207,12 +266,18 @@ extern "C" int tdeck_lua_app_start(const char *script)
     static const luaL_Reg deviceLib[] = {
         {"beep", api_device_beep}, {"time", api_device_time}, {"touches", api_device_touches}, {nullptr, nullptr}};
     static const luaL_Reg storeLib[] = {{"read", api_store_read}, {"write", api_store_write}, {nullptr, nullptr}};
+    static const luaL_Reg canvasLib[] = {{"begin", api_canvas_begin}, {"clear", api_canvas_clear},
+                                         {"rect", api_canvas_rect},   {"pixel", api_canvas_pixel},
+                                         {"line", api_canvas_line},   {"circle", api_canvas_circle},
+                                         {"flip", api_canvas_flip},   {nullptr, nullptr}};
     luaL_newlib(AppL, screenLib);
     lua_setglobal(AppL, "screen");
     luaL_newlib(AppL, deviceLib);
     lua_setglobal(AppL, "device");
     luaL_newlib(AppL, storeLib);
     lua_setglobal(AppL, "store");
+    luaL_newlib(AppL, canvasLib);
+    lua_setglobal(AppL, "canvas");
 
     if (luaL_dostring(AppL, script) != LUA_OK) {
         lua_close(AppL);

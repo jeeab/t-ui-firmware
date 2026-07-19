@@ -218,7 +218,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.1"
+#define TUI_VERSION "2026.07.19.2"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -681,6 +681,16 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icRing(ic, 5, 3, 34, 0x0a84ff, 2);
         icRing(ic, 12, 10, 20, 0x30d158, 2);
         icBox(ic, 20, 18, 5, 5, 0xffffff, LV_RADIUS_CIRCLE);
+    } else if (!strcmp(name, "Stars")) { // scattered stars with a warp streak
+        icBox(ic, 8, 6, 3, 3, 0xffffff, LV_RADIUS_CIRCLE);
+        icBox(ic, 30, 9, 4, 4, 0x9ad0ff, LV_RADIUS_CIRCLE);
+        icBox(ic, 16, 26, 3, 3, 0xffe9a8, LV_RADIUS_CIRCLE);
+        icBox(ic, 35, 29, 3, 3, 0xffffff, LV_RADIUS_CIRCLE);
+        icBox(ic, 6, 20, 4, 4, 0xffffff, LV_RADIUS_CIRCLE);
+        lv_obj_t *st = icBox(ic, 18, 17, 16, 3, 0xffffff, 2); // the streak
+        lv_obj_set_style_transform_pivot_x(st, 0, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(st, 1, LV_PART_MAIN);
+        lv_obj_set_style_transform_rotation(st, 250, LV_PART_MAIN);
     } else { // fallback: a colored rounded square
         icBox(ic, 11, 8, 24, 24, color, 6);
     }

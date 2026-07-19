@@ -28,6 +28,7 @@ extern "C" void tdeck_lua_app_tick(uint32_t dt);
 extern "C" void tdeck_lua_app_touch(int x, int y);
 extern "C" void tdeck_lua_app_drag(int x, int y);
 extern "C" void tdeck_lua_app_stop(void);
+extern "C" void tdeck_ui_canvas_free(void); // defined below; frees the game frame buffer
 
 // Multi-touch reader, installed by LGFXDriver<LGFX>::init (it owns the touch
 // hardware handle). Null until the display driver comes up.
@@ -159,6 +160,7 @@ bool storeNameOk(const char *name)
 void runFromSd(const char *dir, const char *path, const char *bundled)
 {
     if (luaScreen) {
+        tdeck_ui_canvas_free(); // release the 150KB frame buffer with the old screen
         lv_obj_delete(luaScreen);
         luaScreen = nullptr;
     }
@@ -218,6 +220,9 @@ void runFromSd(const char *dir, const char *path, const char *bundled)
             if (luaTick)
                 lv_timer_pause(luaTick);
             tdeck_lua_app_stop();
+            // Hand back the 150KB frame buffer as soon as the app is left, rather than
+            // holding it until some other app happens to open.
+            tdeck_ui_canvas_free();
         },
         LV_EVENT_SCREEN_UNLOADED, NULL);
 
@@ -531,6 +536,196 @@ end
 } // namespace
 
 // ---- drawing bridges the Lua toolbox calls (from src/TDeckLua.cpp) -----------
+// ===== Canvas: a real pixel surface for games ===================================
+//
+// The label/box/line API above is a UI toolkit — every element is a full LVGL object,
+// and there's a hard ceiling of 80 of them. That's fine for tools and just about
+// stretches to Pinball, but a tile map or a particle effect needs hundreds of things
+// on screen, which that model can't reach at any speed.
+//
+// The canvas is ONE LVGL object holding a 320x240 RGB565 buffer in PSRAM (150KB of the
+// spare 8MB). Apps draw into it as pixels, so the element ceiling stops applying.
+// Crucially every primitive below runs in C: Lua decides *what* to draw, this decides
+// *how*, which is what makes hundreds of moving sprites affordable on this chip.
+//
+// It sits behind the label/box elements, so an app can draw a game world on the canvas
+// and still put a crisp text score on top using the old API.
+namespace
+{
+lv_obj_t *luaCanvas = nullptr;
+uint16_t *canvasBuf = nullptr;
+int32_t canvasW = 0, canvasH = 0;
+uint32_t canvasStridePx = 0; // row length in PIXELS (LVGL may pad it beyond the width)
+
+inline uint16_t rgb565(uint32_t c)
+{
+    return (uint16_t)((((c >> 16) & 0xFF) >> 3) << 11 | (((c >> 8) & 0xFF) >> 2) << 5 | ((c & 0xFF) >> 3));
+}
+
+// Clip a rectangle to the canvas; returns false if nothing is left to draw. Every
+// primitive goes through this, so an app can pass wild coordinates (an off-screen
+// sprite, a negative position) without ever writing outside the buffer.
+inline bool clipRect(int &x, int &y, int &w, int &h)
+{
+    if (!canvasBuf || w <= 0 || h <= 0)
+        return false;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x >= canvasW || y >= canvasH)
+        return false;
+    if (x + w > canvasW) w = canvasW - x;
+    if (y + h > canvasH) h = canvasH - y;
+    return w > 0 && h > 0;
+}
+} // namespace
+
+extern "C" int tdeck_ui_canvas_begin(void)
+{
+    if (luaCanvas)
+        return 1;
+    if (!luaScreen)
+        return 0;
+
+    canvasW = 320;
+    canvasH = 240;
+    canvasStridePx = lv_draw_buf_width_to_stride(canvasW, LV_COLOR_FORMAT_RGB565) / 2;
+    size_t bytes = (size_t)canvasStridePx * canvasH * 2;
+
+    canvasBuf = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!canvasBuf) {
+        // Out of PSRAM: canvas.begin() returns false and the app can fall back to the
+        // ordinary screen.* API rather than dying.
+        LV_LOG_ERROR("Lua canvas: no PSRAM for the frame buffer");
+        return 0;
+    }
+    memset(canvasBuf, 0, bytes);
+
+    luaCanvas = lv_canvas_create(luaScreen);
+    lv_canvas_set_buffer(luaCanvas, canvasBuf, canvasW, canvasH, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(luaCanvas, 0, 0);
+    lv_obj_clear_flag(luaCanvas, LV_OBJ_FLAG_CLICKABLE); // taps belong to the screen
+    lv_obj_move_background(luaCanvas);                   // labels/boxes stay on top
+    return 1;
+}
+
+extern "C" void tdeck_ui_canvas_clear(uint32_t color)
+{
+    if (!canvasBuf)
+        return;
+    uint16_t c = rgb565(color);
+    // Fill one row then copy it down — memcpy beats a per-pixel loop by a wide margin.
+    uint16_t *row = canvasBuf;
+    for (int32_t x = 0; x < canvasW; x++)
+        row[x] = c;
+    for (int32_t y = 1; y < canvasH; y++)
+        memcpy(canvasBuf + (size_t)y * canvasStridePx, row, (size_t)canvasW * 2);
+}
+
+extern "C" void tdeck_ui_canvas_rect(int x, int y, int w, int h, uint32_t color)
+{
+    if (!clipRect(x, y, w, h))
+        return;
+    uint16_t c = rgb565(color);
+    for (int row = 0; row < h; row++) {
+        uint16_t *p = canvasBuf + (size_t)(y + row) * canvasStridePx + x;
+        for (int col = 0; col < w; col++)
+            p[col] = c;
+    }
+}
+
+extern "C" void tdeck_ui_canvas_pixel(int x, int y, uint32_t color)
+{
+    if (!canvasBuf || x < 0 || y < 0 || x >= canvasW || y >= canvasH)
+        return;
+    canvasBuf[(size_t)y * canvasStridePx + x] = rgb565(color);
+}
+
+// Bresenham — no floating point, and it clips per-pixel so any coordinates are safe.
+extern "C" void tdeck_ui_canvas_line(int x1, int y1, int x2, int y2, uint32_t color)
+{
+    if (!canvasBuf)
+        return;
+    uint16_t c = rgb565(color);
+    int dx = abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
+    int dy = -abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if (x1 >= 0 && y1 >= 0 && x1 < canvasW && y1 < canvasH)
+            canvasBuf[(size_t)y1 * canvasStridePx + x1] = c;
+        if (x1 == x2 && y1 == y2)
+            break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x1 += sx; }
+        if (e2 <= dx) { err += dx; y1 += sy; }
+    }
+}
+
+// Midpoint circle. `filled` draws spans instead of an outline.
+extern "C" void tdeck_ui_canvas_circle(int cx, int cy, int r, uint32_t color, int filled)
+{
+    if (!canvasBuf || r <= 0)
+        return;
+    uint16_t c = rgb565(color);
+    int x = r, y = 0, err = 1 - r;
+    auto plot = [&](int px, int py) {
+        if (px >= 0 && py >= 0 && px < canvasW && py < canvasH)
+            canvasBuf[(size_t)py * canvasStridePx + px] = c;
+    };
+    auto span = [&](int x0, int x1, int py) {
+        if (py < 0 || py >= canvasH)
+            return;
+        if (x0 < 0) x0 = 0;
+        if (x1 >= canvasW) x1 = canvasW - 1;
+        uint16_t *p = canvasBuf + (size_t)py * canvasStridePx;
+        for (int i = x0; i <= x1; i++)
+            p[i] = c;
+    };
+    while (x >= y) {
+        if (filled) {
+            span(cx - x, cx + x, cy + y);
+            span(cx - x, cx + x, cy - y);
+            span(cx - y, cx + y, cy + x);
+            span(cx - y, cx + y, cy - x);
+        } else {
+            plot(cx + x, cy + y); plot(cx - x, cy + y);
+            plot(cx + x, cy - y); plot(cx - x, cy - y);
+            plot(cx + y, cy + x); plot(cx - y, cy + x);
+            plot(cx + y, cy - x); plot(cx - y, cy - x);
+        }
+        y++;
+        if (err < 0) {
+            err += 2 * y + 1;
+        } else {
+            x--;
+            err += 2 * (y - x) + 1;
+        }
+    }
+}
+
+// Show the frame. Nothing reaches the screen until this is called, so a half-drawn
+// frame never appears — the app builds the whole picture, then flips it up.
+extern "C" void tdeck_ui_canvas_flip(void)
+{
+    if (luaCanvas)
+        lv_obj_invalidate(luaCanvas);
+}
+
+// Delete the canvas object BEFORE releasing its buffer — LVGL holds a pointer to it,
+// and freeing first would leave the widget referencing dead memory.
+extern "C" void tdeck_ui_canvas_free(void)
+{
+    if (luaCanvas) {
+        lv_obj_delete(luaCanvas);
+        luaCanvas = nullptr;
+    }
+    if (canvasBuf) {
+        heap_caps_free(canvasBuf);
+        canvasBuf = nullptr;
+    }
+    canvasW = canvasH = 0;
+    canvasStridePx = 0;
+}
+
 extern "C" void tdeck_ui_label(int id, int x, int y, const char *text, uint32_t color)
 {
     UObj *s = findOrCreateSlot(id, 0);
