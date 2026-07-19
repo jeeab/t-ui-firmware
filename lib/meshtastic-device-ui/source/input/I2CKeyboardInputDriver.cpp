@@ -81,6 +81,11 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // still work exactly as before while an app is open.
             if (tdeck_lua_app_focused()) {
                 tdeck_lua_queue_key(data->key);
+                // Count it as activity BEFORE swallowing it. The screen timeout only sees
+                // input LVGL itself handles, so playing a game with the keyboard alone
+                // used to let the screen dim and sleep mid-play - the app was getting the
+                // keys but nothing else knew the user was there.
+                lv_display_trigger_activity(NULL);
                 data->state = LV_INDEV_STATE_RELEASED;
                 data->key = 0;
                 break;
