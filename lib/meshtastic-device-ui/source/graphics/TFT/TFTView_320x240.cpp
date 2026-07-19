@@ -223,7 +223,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.11"
+#define TUI_VERSION "2026.07.19.12"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -3584,6 +3584,36 @@ void TFTView_320x240::openGetAppsAction(void)
     instance()->openGetApps();
 }
 
+// Which version is actually on the card? Written by getappsInstall as a tiny marker
+// beside the script. Empty when unknown - either installed before this existed, or
+// copied on by hand - which we deliberately treat as "probably old, offer the update".
+void TFTView_320x240::getappsInstalledVer(const char *id, char *out, size_t cap) const
+{
+    out[0] = 0;
+#if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+    if (!sdCard)
+        return;
+    char path[72];
+    snprintf(path, sizeof(path), "/apps/%s/.ver", id);
+    FsFile f = SDFs.open(path, O_RDONLY);
+    if (!f)
+        return;
+    int n = (int)f.read((uint8_t *)out, cap - 1);
+    f.close();
+    if (n < 0)
+        n = 0;
+    out[n] = 0;
+    for (char *c = out; *c; c++) {
+        if (*c == 0x0D || *c == 0x0A) { // trim a newline the file may carry
+            *c = 0;
+            break;
+        }
+    }
+#else
+    (void)id; (void)cap;
+#endif
+}
+
 bool TFTView_320x240::getappsIsInstalled(const char *id) const
 {
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
@@ -3623,8 +3653,16 @@ int TFTView_320x240::getappsParseCatalog(const char *json, int len)
                 a.desc[0] = 0;
             if (!jsonStrField(ob, oe, "kind", a.kind, sizeof(a.kind)))
                 strcpy(a.kind, "tool"); // anything unlabelled lands under Tools
+            if (!jsonStrField(ob, oe, "ver", a.ver, sizeof(a.ver)))
+                strcpy(a.ver, "1");
             a.bytes = jsonIntField(ob, oe, "bytes");
             a.installed = getappsIsInstalled(a.id);
+            a.have[0] = 0;
+            a.outdated = false;
+            if (a.installed) {
+                getappsInstalledVer(a.id, a.have, sizeof(a.have));
+                a.outdated = (strcmp(a.have, a.ver) != 0); // unknown counts as outdated
+            }
             storeAppCount++;
         }
         p = oe + 1;
@@ -3663,7 +3701,18 @@ bool TFTView_320x240::getappsInstall(int idx)
     }
     heap_caps_free(buf);
     if (ok) {
+        // Record what we just installed, so the list can offer an update later.
+        char vp[72];
+        snprintf(vp, sizeof(vp), "/apps/%s/.ver", a.id);
+        FsFile vf = SDFs.open(vp, O_WRONLY | O_CREAT | O_TRUNC);
+        if (vf) {
+            vf.write((const uint8_t *)a.ver, strlen(a.ver));
+            vf.close();
+        }
         a.installed = true;
+        a.outdated = false;
+        strncpy(a.have, a.ver, sizeof(a.have) - 1);
+        a.have[sizeof(a.have) - 1] = 0;
         // Make the tile appear right now - no reboot. Both of these already run together
         // from the SD-mount timer at boot, so this is the same path the launcher uses.
         scanUserApps();
@@ -3791,14 +3840,20 @@ void TFTView_320x240::getappsBuildList(void)
         lv_obj_set_size(btn, 84, 30);
         lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, 0, -2);
         lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(a.installed ? 0x2c2c2e : 0x30d158), LV_PART_MAIN);
+        // Three states: not installed, installed-and-current, installed-but-outdated.
+        // An update is the one people would otherwise never notice, so it gets the
+        // loud colour and the install action rather than the remove one.
+        bool updatable = a.installed && a.outdated;
+        lv_obj_set_style_bg_color(btn, lv_color_hex(updatable ? 0xff9f0a : (a.installed ? 0x2c2c2e : 0x30d158)),
+                                  LV_PART_MAIN);
         lv_obj_t *bl = lv_label_create(btn);
         lv_obj_set_style_text_font(bl, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_label_set_text(bl, a.installed ? "Remove" : "Install");
-        lv_obj_set_style_text_color(bl, lv_color_hex(a.installed ? 0xff453a : 0x000000), LV_PART_MAIN);
+        lv_label_set_text(bl, updatable ? "Update" : (a.installed ? "Remove" : "Install"));
+        lv_obj_set_style_text_color(bl, lv_color_hex(updatable ? 0x000000 : (a.installed ? 0xff453a : 0x000000)),
+                                    LV_PART_MAIN);
         lv_obj_center(bl);
 
-        if (a.installed) {
+        if (a.installed && !updatable) {
             // Removing deletes saved data too (high scores, settings), so it asks first.
             // The confirmation lives on the button itself — there's no room for a dialog.
             lv_obj_set_user_data(btn, (void *)(intptr_t)i);
@@ -3828,7 +3883,7 @@ void TFTView_320x240::getappsBuildList(void)
                 LV_EVENT_CLICKED, NULL);
         }
 
-        if (!a.installed) {
+        if (!a.installed || updatable) {
             lv_obj_set_user_data(btn, (void *)(intptr_t)i);
             lv_obj_add_event_cb(
                 btn,
@@ -3919,9 +3974,17 @@ void TFTView_320x240::getappsPump(void)
         lv_label_set_text(getapps_status, "No apps available right now");
         return;
     }
-    char msg[48];
-    snprintf(msg, sizeof(msg), "%d app%s available", n, n == 1 ? "" : "s");
+    int updates = 0;
+    for (int i = 0; i < storeAppCount; i++)
+        if (storeApps[i].installed && storeApps[i].outdated)
+            updates++;
+    char msg[64];
+    if (updates > 0)
+        snprintf(msg, sizeof(msg), "%d update%s available", updates, updates == 1 ? "" : "s");
+    else
+        snprintf(msg, sizeof(msg), "%d app%s available", n, n == 1 ? "" : "s");
     lv_label_set_text(getapps_status, msg);
+    lv_obj_set_style_text_color(getapps_status, lv_color_hex(updates > 0 ? 0xff9f0a : 0x30d158), LV_PART_MAIN);
     getappsBuildList();
 #endif
 }

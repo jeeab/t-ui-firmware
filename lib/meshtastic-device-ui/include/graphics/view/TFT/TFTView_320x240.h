@@ -352,8 +352,11 @@ class TFTView_320x240 : public MeshtasticView
         char name[16]; // tile label
         char desc[92]; // one line, as published in catalog.json
         char kind[8];  // "game" / "tool" / "toy" - drives the filter tabs
+        char ver[8];   // version in the catalog
+        char have[8];  // version actually on the card ("" = unknown/older)
         uint32_t bytes;
         bool installed;
+        bool outdated; // installed, but the catalog has a newer version
     };
     void openGetApps(void);
     void closeGetApps(void); // hand back Wi-Fi + the TLS client on leaving, by any route
@@ -365,6 +368,7 @@ class TFTView_320x240 : public MeshtasticView
     bool getappsRemove(int idx); // delete an installed app + anything it saved
     int getapps_confirm = -1;    // row waiting for a second tap to confirm removal
     bool getappsIsInstalled(const char *id) const;
+    void getappsInstalledVer(const char *id, char *out, size_t cap) const;
     StoreApp storeApps[kMaxStoreApps];
     int storeAppCount = 0;
     lv_obj_t *getapps_screen = nullptr;
