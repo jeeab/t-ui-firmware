@@ -214,7 +214,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.18.5"
+#define TUI_VERSION "2026.07.18.6"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;

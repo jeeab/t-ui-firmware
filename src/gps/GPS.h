@@ -132,6 +132,10 @@ class GPS : private concurrency::OSThread
     // Let the GPS hardware save power between updates
     void down();
 
+    // Read-only view of the power state, so the T-Deck launcher can notice the receiver
+    // sleeping when it is supposed to be searching and re-arm it (see TDeckGpsControl.cpp).
+    GPSPowerState getPowerState() const { return powerState; }
+
   private:
     GPS() : concurrency::OSThread("GPS") {}
 

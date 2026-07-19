@@ -20,6 +20,7 @@
 // Longer intervals nap the chip between checks and save battery.
 // -----------------------------------------------------------------------------
 #if !MESHTASTIC_EXCLUDE_GPS
+#include "DebugConfiguration.h" // LOG_INFO
 #include "gps/GPS.h"
 #include "mesh/NodeDB.h"
 
@@ -96,6 +97,28 @@ extern "C" void tdeck_gps_control_service(void)
         if (config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
             config.position.gps_update_interval = TDECK_GPS_CONTINUOUS_SECS;
             gps->enable();
+        }
+    }
+
+    // Watchdog. The wake re-arm above only fires on the trackball double-click / keyboard
+    // wake path, so waking any other way (or the power state machine dropping the device to
+    // DARK on battery and coming back) could still leave the receiver asleep with no way
+    // back except toggling the Settings switch by hand.
+    //
+    // ACTIVE and IDLE are both fine — IDLE is the normal resting state between fixes when
+    // continuous search is on. Only the genuinely powered-down states are wrong here, so
+    // this can't disturb a search that's legitimately in progress.
+    static uint32_t lastWatchdogMs = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - lastWatchdogMs > 20000) {
+        lastWatchdogMs = nowMs;
+        if (config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
+            GPSPowerState ps = gps->getPowerState();
+            if (ps == GPS_SOFTSLEEP || ps == GPS_HARDSLEEP || ps == GPS_OFF) {
+                LOG_INFO("T-Deck GPS watchdog: receiver asleep (state %d) but GPS is on — re-arming", (int)ps);
+                config.position.gps_update_interval = TDECK_GPS_CONTINUOUS_SECS;
+                gps->enable();
+            }
         }
     }
 
