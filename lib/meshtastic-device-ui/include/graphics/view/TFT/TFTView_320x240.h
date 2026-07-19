@@ -335,6 +335,7 @@ class TFTView_320x240 : public MeshtasticView
         char id[20];   // folder name under /apps
         char name[16]; // tile label
         char desc[92]; // one line, as published in catalog.json
+        char kind[8];  // "game" / "tool" / "toy" - drives the filter tabs
         uint32_t bytes;
         bool installed;
     };
@@ -350,6 +351,9 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *getapps_screen = nullptr;
     lv_obj_t *getapps_status = nullptr;
     lv_obj_t *getapps_list = nullptr;
+    lv_obj_t *getapps_tabs[3] = {nullptr, nullptr, nullptr}; // All / Games / Tools
+    int getapps_filter = 0;                                  // 0 all, 1 games, 2 tools
+    void getappsSetFilter(int which);
     lv_timer_t *getapps_timer = nullptr;
     uint32_t getapps_deadline = 0;
     bool getapps_own_wifi = false; // we brought Wi-Fi up -> we take it down

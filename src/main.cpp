@@ -1281,6 +1281,9 @@ extern "C" void tdeck_gps_control_service(void);
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
+// T-Deck launcher Time zone: apply + persist a pending zone change from this (main) thread.
+// Writing settings to flash from the UI task froze the device. Defined in TDeckTimeZone.cpp.
+extern "C" void tdeck_tz_service(void);
 // Main-loop heartbeat for the freeze detector (TDeckMemInfo.cpp): if this loop stops
 // iterating, the UI task records how long + which OSThread it's stuck in, so the 90s
 // app-watchdog "FROZE (task)" reboots finally say WHERE the loop froze.
@@ -1294,6 +1297,7 @@ void loop()
     tdeck_mesh_switch_service();
     tdeck_gps_control_service();
     tdeck_sound_service();
+    tdeck_tz_service();
 
 #if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
     if (lockdownDisablePending) {

@@ -218,7 +218,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.18.7"
+#define TUI_VERSION "2026.07.19.1"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -648,6 +648,39 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         lv_obj_set_style_transform_pivot_x(b2, 4, LV_PART_MAIN);
         lv_obj_set_style_transform_pivot_y(b2, 9, LV_PART_MAIN);
         lv_obj_set_style_transform_rotation(b2, 250, LV_PART_MAIN);
+    } else if (!strcmp(name, "Score")) { // scoreboard: two columns of tally marks
+        icBox(ic, 5, 5, 16, 30, 0x1c1c20, 3);
+        icBox(ic, 25, 5, 16, 30, 0x1c1c20, 3);
+        icBox(ic, 8, 10, 3, 9, 0x30d158, 1);
+        icBox(ic, 13, 10, 3, 9, 0x30d158, 1);
+        icBox(ic, 8, 23, 3, 9, 0x30d158, 1);
+        icBox(ic, 28, 10, 3, 9, 0x0a84ff, 1);
+        icBox(ic, 33, 10, 3, 9, 0x0a84ff, 1);
+    } else if (!strcmp(name, "Tally")) { // four gate marks, the fifth struck through
+        icBox(ic, 8, 8, 3, 22, 0xffffff, 1);
+        icBox(ic, 14, 8, 3, 22, 0xffffff, 1);
+        icBox(ic, 20, 8, 3, 22, 0xffffff, 1);
+        icBox(ic, 26, 8, 3, 22, 0xffffff, 1);
+        lv_obj_t *sl = icBox(ic, 5, 18, 30, 3, 0xff453a, 1); // the diagonal fifth
+        lv_obj_set_style_transform_pivot_x(sl, 15, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(sl, 1, LV_PART_MAIN);
+        lv_obj_set_style_transform_rotation(sl, -200, LV_PART_MAIN);
+    } else if (!strcmp(name, "Convert")) { // two arrows pointing opposite ways
+        icBox(ic, 7, 11, 26, 4, 0x30d158, 2);
+        icBox(ic, 27, 7, 8, 4, 0x30d158, 2); // upper arrow head
+        icBox(ic, 31, 11, 4, 4, 0x30d158, 2);
+        icBox(ic, 13, 25, 26, 4, 0x0a84ff, 2);
+        icBox(ic, 11, 25, 8, 4, 0x0a84ff, 2); // lower arrow head
+        icBox(ic, 11, 21, 4, 4, 0x0a84ff, 2);
+    } else if (!strcmp(name, "Intervals")) { // timer ring split into work/rest halves
+        icRing(ic, 9, 6, 28, 0x30d158, 3);
+        icBox(ic, 23, 12, 3, 9, 0xffffff, 1); // hand
+        icBox(ic, 20, 1, 6, 5, 0x30d158, 1);  // crown
+        icBox(ic, 9, 18, 12, 3, 0x0a84ff, 1); // the rest half
+    } else if (!strcmp(name, "Breathe")) { // nested squares = the box expanding
+        icRing(ic, 5, 3, 34, 0x0a84ff, 2);
+        icRing(ic, 12, 10, 20, 0x30d158, 2);
+        icBox(ic, 20, 18, 5, 5, 0xffffff, LV_RADIUS_CIRCLE);
     } else { // fallback: a colored rounded square
         icBox(ic, 11, 8, 24, 24, color, 6);
     }
@@ -1580,19 +1613,35 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 602);
 
+    // When no zone is set the device silently runs on GMT. Showing the list's first entry in
+    // that case made it look like Pacific was already chosen while the clock was really on
+    // UTC — so an unset device gets an explicit "Not set" entry at the top instead, and the
+    // zone indices shift by one while it's there.
     lv_obj_t *tzDd = lv_dropdown_create(settings_screen);
-    lv_dropdown_set_options(tzDd, "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
-                                  "UTC\nUK\nCentral Europe");
+    int tzCur = tdeck_tz_get();
+    bool tzUnset = (tzCur < 0);
+    lv_dropdown_set_options(tzDd, tzUnset ? "Not set\nPacific\nMountain\nArizona\nCentral\nEastern\nAlaska\n"
+                                            "Hawaii\nUTC\nUK\nCentral Europe"
+                                          : "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
+                                            "UTC\nUK\nCentral Europe");
     lv_obj_set_width(tzDd, 150);
     lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 596);
-    {
-        int cur = tdeck_tz_get();
-        if (cur >= 0)
-            lv_dropdown_set_selected(tzDd, (uint32_t)cur);
-    }
+    lv_dropdown_set_selected(tzDd, tzUnset ? 0 : (uint32_t)tzCur);
+    // Keep the open list on-screen: this row sits at the bottom of a tall scrolling screen,
+    // so let it drop upward rather than off the end.
+    lv_dropdown_set_dir(tzDd, LV_DIR_TOP);
+    lv_obj_set_user_data(tzDd, (void *)(intptr_t)(tzUnset ? 1 : 0));
     lv_obj_add_event_cb(
         tzDd,
-        [](lv_event_t *e) { tdeck_tz_set((int)lv_dropdown_get_selected((lv_obj_t *)lv_event_get_target(e))); },
+        [](lv_event_t *e) {
+            lv_obj_t *dd = (lv_obj_t *)lv_event_get_target(e);
+            int sel = (int)lv_dropdown_get_selected(dd);
+            int offset = (int)(intptr_t)lv_obj_get_user_data(dd); // 1 while "Not set" is present
+            if (offset && sel == 0)
+                return; // "Not set" isn't a choice you can apply
+            // Records intent only — the main loop applies and persists it (see TDeckTimeZone.cpp).
+            tdeck_tz_set(sel - offset);
+        },
         LV_EVENT_VALUE_CHANGED, NULL);
 
     // Back to the grid
@@ -3353,6 +3402,8 @@ int TFTView_320x240::getappsParseCatalog(const char *json, int len)
         if (jsonStrField(ob, oe, "id", a.id, sizeof(a.id)) && jsonStrField(ob, oe, "name", a.name, sizeof(a.name))) {
             if (!jsonStrField(ob, oe, "desc", a.desc, sizeof(a.desc)))
                 a.desc[0] = 0;
+            if (!jsonStrField(ob, oe, "kind", a.kind, sizeof(a.kind)))
+                strcpy(a.kind, "tool"); // anything unlabelled lands under Tools
             a.bytes = jsonIntField(ob, oe, "bytes");
             a.installed = getappsIsInstalled(a.id);
             storeAppCount++;
@@ -3413,8 +3464,15 @@ void TFTView_320x240::getappsBuildList(void)
         return;
     lv_obj_clean(getapps_list);
 
+    int shown = 0;
     for (int i = 0; i < storeAppCount; i++) {
         StoreApp &a = storeApps[i];
+        // Filter tabs: 1 = games only, 2 = everything that isn't a game (tools + toys).
+        if (getapps_filter == 1 && strcmp(a.kind, "game") != 0)
+            continue;
+        if (getapps_filter == 2 && strcmp(a.kind, "game") == 0)
+            continue;
+        shown++;
 
         lv_obj_t *row = lv_obj_create(getapps_list);
         lv_obj_set_size(row, 286, 62);
@@ -3489,6 +3547,30 @@ void TFTView_320x240::getappsBuildList(void)
                 LV_EVENT_CLICKED, NULL);
         }
     }
+
+    // An empty category should say so rather than looking like a failed download.
+    if (shown == 0 && storeAppCount > 0) {
+        lv_obj_t *none = lv_label_create(getapps_list);
+        lv_obj_set_style_text_font(none, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(none, "Nothing here yet.");
+        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
+}
+
+// Switch category and redraw. Highlights the chosen tab so it's obvious which is active.
+void TFTView_320x240::getappsSetFilter(int which)
+{
+    getapps_filter = which;
+    for (int i = 0; i < 3; i++) {
+        if (!getapps_tabs[i])
+            continue;
+        bool on = (i == which);
+        lv_obj_set_style_bg_color(getapps_tabs[i], lv_color_hex(on ? 0x30d158 : 0x2c2c2e), LV_PART_MAIN);
+        lv_obj_t *lbl = lv_obj_get_child(getapps_tabs[i], 0);
+        if (lbl)
+            lv_obj_set_style_text_color(lbl, lv_color_hex(on ? 0x000000 : 0xffffff), LV_PART_MAIN);
+    }
+    getappsBuildList();
 }
 
 // The pump: bring Wi-Fi up if we have to, then fetch the catalog once.
@@ -3575,10 +3657,37 @@ void TFTView_320x240::openGetApps(void)
         lv_obj_align(getapps_status, LV_ALIGN_TOP_MID, 0, 30);
         lv_label_set_text(getapps_status, "");
 
-        // Scrolling list of apps, sitting above the Back button.
+        // Category tabs. The catalog already labels every app game/tool/toy; this just
+        // surfaces it so a growing list stays browsable.
+        {
+            const char *tabNames[3] = {"All", "Games", "Tools"};
+            for (int i = 0; i < 3; i++) {
+                lv_obj_t *tab = lv_btn_create(getapps_screen);
+                lv_obj_set_size(tab, 96, 24);
+                lv_obj_align(tab, LV_ALIGN_TOP_LEFT, 8 + i * 102, 44);
+                lv_obj_set_style_radius(tab, 6, LV_PART_MAIN);
+                lv_obj_set_style_bg_color(tab, lv_color_hex(i == 0 ? 0x30d158 : 0x2c2c2e), LV_PART_MAIN);
+                lv_obj_t *tl = lv_label_create(tab);
+                lv_obj_set_style_text_font(tl, &ui_font_montserrat_12, LV_PART_MAIN);
+                lv_label_set_text(tl, tabNames[i]);
+                lv_obj_set_style_text_color(tl, lv_color_hex(i == 0 ? 0x000000 : 0xffffff), LV_PART_MAIN);
+                lv_obj_center(tl);
+                lv_obj_set_user_data(tab, (void *)(intptr_t)i);
+                lv_obj_add_event_cb(
+                    tab,
+                    [](lv_event_t *e) {
+                        lv_obj_t *b = (lv_obj_t *)lv_event_get_target(e);
+                        THIS->getappsSetFilter((int)(intptr_t)lv_obj_get_user_data(b));
+                    },
+                    LV_EVENT_CLICKED, NULL);
+                getapps_tabs[i] = tab;
+            }
+        }
+
+        // Scrolling list of apps, sitting between the tabs and the Back button.
         getapps_list = lv_obj_create(getapps_screen);
-        lv_obj_set_size(getapps_list, 310, 150);
-        lv_obj_align(getapps_list, LV_ALIGN_TOP_MID, 0, 48);
+        lv_obj_set_size(getapps_list, 310, 122);
+        lv_obj_align(getapps_list, LV_ALIGN_TOP_MID, 0, 74);
         lv_obj_set_style_bg_opa(getapps_list, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(getapps_list, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(getapps_list, 4, LV_PART_MAIN);

@@ -1,17 +1,18 @@
 // -----------------------------------------------------------------------------
 // T-Deck launcher: time zone bridge (firmware side)
 //
-// Same pattern as TDeckGpsControl.cpp — device-ui can't include firmware headers,
-// so these extern "C" functions let the Settings screen read and set the device's
-// time zone.
+// Same deferred pattern as TDeckGpsControl.cpp, and for the same reason: the LVGL
+// UI runs on its own FreeRTOS task and must NOT write settings to flash from
+// there. The first version of this file called nodeDB->saveToDisk() straight from
+// the dropdown's event callback and froze the device when Jake changed zone —
+// flash writes from the UI task collide with the main loop's own filesystem use.
+// So the UI-facing setter now only records intent, and tdeck_tz_service(), called
+// from loop(), does the real work on the safe thread.
 //
-// Why this exists: the device gets accurate UTC from the GPS satellites, but the
-// stock build has no time zone unless one is configured, so main.cpp falls back to
-// "GMT0". That's why the logs (and any clock we draw) read as UTC. Setting a zone
-// here makes localtime() correct everywhere, including the launcher's clock.
-//
-// The strings are POSIX TZ rules and include the daylight-saving changeover dates,
-// so the clock follows DST on its own with no further input.
+// Why this exists at all: the device gets accurate UTC from the GPS satellites,
+// but with no zone configured main.cpp falls back to "GMT0", so every clock reads
+// UTC. The strings below are POSIX TZ rules including the daylight-saving
+// changeover dates, so the clock follows DST by itself.
 // -----------------------------------------------------------------------------
 #include "configuration.h"
 #include "mesh/NodeDB.h"
@@ -34,11 +35,37 @@ static const char *kTdeckZones[] = {
 };
 static const int kTdeckZoneCount = sizeof(kTdeckZones) / sizeof(kTdeckZones[0]);
 
-// Apply a zone by index. Takes effect immediately (no reboot) and persists.
+static volatile int s_tdeckTzPending = -1; // index the UI asked for; -1 = nothing waiting
+
+// Called from the UI (LVGL) task. Records intent ONLY — no flash, no tzset here.
 extern "C" void tdeck_tz_set(int idx)
 {
-    if (idx < 0 || idx >= kTdeckZoneCount)
+    if (idx >= 0 && idx < kTdeckZoneCount)
+        s_tdeckTzPending = idx;
+}
+
+// Which entry is currently in effect, or -1 if the device has no zone we recognise
+// (including the common case of none set at all, where the firmware silently runs on
+// GMT). The UI must show that honestly rather than displaying the first entry, which
+// looked like "Pacific" was already chosen while the clock was really on UTC.
+extern "C" int tdeck_tz_get(void)
+{
+    if (!config.device.tzdef[0])
+        return -1;
+    for (int i = 0; i < kTdeckZoneCount; i++)
+        if (strcmp(config.device.tzdef, kTdeckZones[i]) == 0)
+            return i;
+    return -1;
+}
+
+// Called from the main Meshtastic loop() — the safe context for touching flash.
+extern "C" void tdeck_tz_service(void)
+{
+    int idx = s_tdeckTzPending;
+    if (idx < 0)
         return;
+    s_tdeckTzPending = -1;
+
     strncpy(config.device.tzdef, kTdeckZones[idx], sizeof(config.device.tzdef) - 1);
     config.device.tzdef[sizeof(config.device.tzdef) - 1] = 0;
     setenv("TZ", config.device.tzdef, 1);
@@ -46,14 +73,4 @@ extern "C" void tdeck_tz_set(int idx)
     if (nodeDB)
         nodeDB->saveToDisk(SEGMENT_CONFIG);
     LOG_INFO("T-Deck time zone set to %s", config.device.tzdef);
-}
-
-// Which entry is currently in effect; -1 if it's something we don't have in the list
-// (e.g. set from the phone app), so the UI can show it as unknown rather than lie.
-extern "C" int tdeck_tz_get(void)
-{
-    for (int i = 0; i < kTdeckZoneCount; i++)
-        if (strcmp(config.device.tzdef, kTdeckZones[i]) == 0)
-            return i;
-    return -1;
 }
