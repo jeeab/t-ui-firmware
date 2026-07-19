@@ -85,6 +85,10 @@ extern "C" void tdeck_gps_set_enabled(bool on);
 extern "C" void tdeck_gps_set_interval(uint32_t secs);
 extern "C" bool tdeck_gps_get_enabled(void);
 extern "C" void tdeck_gps_kick(void); // re-arm the GPS search after a sleep
+// Time zone (so the clock reads local, not UTC). Index into the list in TDeckTimeZone.cpp,
+// which must stay in the same order as the dropdown built in createSettingsScreen().
+extern "C" void tdeck_tz_set(int idx);
+extern "C" int tdeck_tz_get(void);
 
 // WiFi status bridge (src/TDeckWifi.cpp): 0=off/unconfigured, 1=connecting, 2=connected
 extern "C" int tdeck_wifi_state(void);
@@ -214,7 +218,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.18.6"
+#define TUI_VERSION "2026.07.18.7"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -662,9 +666,11 @@ void TFTView_320x240::createLauncher(void)
     lv_obj_set_style_bg_color(launcher_screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(launcher_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    // ---- top status bar (~24px): mesh dot + label left, memory readout center, battery right ----
-    // The center label doubles as a RAM diagnostic while we chase the crashes:
-    // "free NNk  low NNk" = current free heap and the lowest it has hit since boot.
+    // ---- top status bar (~24px): mesh dot + label left, clock center, battery right ----
+    // The centre label shows the time (from the GPS satellites, in the zone set in Settings).
+    // Tap it for the full diagnostics popup — that's where the RAM figures live now; it used
+    // to show "ram NNk/NNk" here permanently, which was crash-hunting scaffolding.
+    // It still flips to a red "last: <reason>" for ~20s after a fault restart.
     tdeck_diag_boot();   // capture last restart reason + last session's memory lows (once)
     lua_seed_bundled();  // install bundled SD apps on first run of this firmware (once, then user-owned)
     launcher_mem_label = lv_label_create(launcher_screen);
@@ -697,10 +703,21 @@ void TFTView_320x240::createLauncher(void)
                              (unsigned long)(tdeck_prev_psram_low() / 1024));
                 lv_obj_set_style_text_color(THIS->launcher_mem_label, lv_color_hex(0xff453a), LV_PART_MAIN);
             } else {
-                // Fast RAM only (free / lowest-since-boot). PSRAM was dropped from the top bar to
-                // make room for the unread-message count; it's still in the tap-to-open diagnostics.
-                snprintf(buf, sizeof(buf), "ram %luk/%luk", (unsigned long)(tdeck_free_heap() / 1024),
-                         (unsigned long)(tdeck_min_free_heap() / 1024));
+                // Normal case: the clock. The device gets accurate time from the GPS satellites,
+                // and the time zone set in Settings makes localtime() local. Before any valid time
+                // arrives (or with no GPS fix yet) fall back to the device name rather than
+                // showing a confidently wrong 00:00. The RAM figures this replaced were a
+                // leftover from the crash hunt and still live in the tap-to-open diagnostics.
+                time_t now;
+                time(&now);
+                if (VALID_TIME(now)) {
+                    tm *lt = localtime(&now);
+                    strftime(buf, sizeof(buf), "%I:%M %p", lt);
+                    if (buf[0] == '0') // "07:05 PM" -> "7:05 PM"
+                        memmove(buf, buf + 1, strlen(buf));
+                } else {
+                    strcpy(buf, "T-Deck");
+                }
                 lv_obj_set_style_text_color(THIS->launcher_mem_label, lv_color_hex(0xffffff), LV_PART_MAIN);
             }
             lv_label_set_text(THIS->launcher_mem_label, buf);
@@ -1555,10 +1572,33 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_color(sndHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 570);
 
+    // "Time zone" row — makes the clock on the home screen read local time. The device gets
+    // UTC from the GPS satellites; without a zone the firmware falls back to GMT, which is
+    // why the clock would otherwise be hours out. Order must match kTdeckZones[].
+    lv_obj_t *tzLbl = lv_label_create(settings_screen);
+    lv_label_set_text(tzLbl, "Time zone");
+    lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 602);
+
+    lv_obj_t *tzDd = lv_dropdown_create(settings_screen);
+    lv_dropdown_set_options(tzDd, "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
+                                  "UTC\nUK\nCentral Europe");
+    lv_obj_set_width(tzDd, 150);
+    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 596);
+    {
+        int cur = tdeck_tz_get();
+        if (cur >= 0)
+            lv_dropdown_set_selected(tzDd, (uint32_t)cur);
+    }
+    lv_obj_add_event_cb(
+        tzDd,
+        [](lv_event_t *e) { tdeck_tz_set((int)lv_dropdown_get_selected((lv_obj_t *)lv_event_get_target(e))); },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 608);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 648);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -1576,7 +1616,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(verLbl, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(verLbl, "Version " TUI_VERSION);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 652);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 692);
 }
 
 /**
