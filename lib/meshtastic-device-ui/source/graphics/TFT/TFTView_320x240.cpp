@@ -223,7 +223,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.14"
+#define TUI_VERSION "2026.07.19.15"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -2406,7 +2406,10 @@ void TFTView_320x240::openMaps(void)
         // only on the website. Kept small and out of the way, but always visible.
         maps_credit_label = lv_label_create(maps_screen);
         lv_obj_set_style_text_font(maps_credit_label, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_set_style_text_color(maps_credit_label, lv_color_hex(0x6a6a72), LV_PART_MAIN);
+        // White, not grey: this sits on top of map tiles that can be any colour at all,
+        // and grey-on-terrain was hard to read. The dark translucent backing behind it is
+        // what keeps it legible, so the text itself should be at full contrast.
+        lv_obj_set_style_text_color(maps_credit_label, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_style_bg_color(maps_credit_label, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(maps_credit_label, LV_OPA_50, LV_PART_MAIN);
         lv_obj_set_style_pad_all(maps_credit_label, 2, LV_PART_MAIN);
@@ -3505,6 +3508,10 @@ WiFiClientSecure *getappsClient = nullptr;
 // Download a whole (small) file into PSRAM. Returns nullptr on any failure; the caller
 // frees with heap_caps_free. Timeouts are short on purpose: this runs on the UI task, so
 // a stalled server must fail fast rather than freeze the screen the way map tiles used to.
+//
+// Use this for the CATALOG only. Apps go through getappsGetToFile below: a growing script
+// needs one unbroken PSRAM block here, and that is what started failing once Deep Space
+// passed ~46 KB - not a size limit anywhere, just no single free run of PSRAM that big.
 uint8_t *getappsGet(const char *url, int *outLen)
 {
     if (!getappsClient) {
@@ -3560,6 +3567,80 @@ uint8_t *getappsGet(const char *url, int *outLen)
     *outLen = len;
     return buf;
 }
+
+// Download straight to a file on the card, a chunk at a time. Nothing bigger than the
+// small stack buffer is ever held in RAM, so an app's size no longer has to be found as
+// one contiguous run of PSRAM - which is the failure this replaces. A partial download
+// deletes itself rather than leaving a half-written script that would fail to parse.
+#if defined(ARDUINO_ARCH_ESP32) && HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+bool getappsGetToFile(const char *url, const char *path, int *outLen)
+{
+    if (!getappsClient) {
+        getappsClient = new WiFiClientSecure();
+        getappsClient->setInsecure(); // public, read-only content; no room for a CA bundle
+    }
+    HTTPClient http;
+    http.setReuse(true);
+    http.setConnectTimeout(4000);
+    http.setTimeout(4000);
+    if (!http.begin(*getappsClient, url))
+        return false;
+    if (http.GET() != HTTP_CODE_OK) {
+        http.end();
+        return false;
+    }
+    int len = http.getSize();
+    if (len <= 0 || len > 262144) { // an app script; anything bigger is wrong
+        http.end();
+        return false;
+    }
+
+    FsFile f = SDFs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!f) {
+        http.end();
+        return false;
+    }
+
+    WiFiClient *stream = http.getStreamPtr();
+    uint8_t chunk[1024];
+    int got = 0;
+    uint16_t idle = 0;
+    while (got < len) {
+        size_t avail = stream->available();
+        if (!avail) {
+            if (++idle > 300) // ~3s of silence mid-body = give up
+                break;
+            delay(10);
+            continue;
+        }
+        idle = 0;
+        size_t want = (size_t)(len - got);
+        if (want > avail)
+            want = avail;
+        if (want > sizeof(chunk))
+            want = sizeof(chunk);
+        int r = stream->read(chunk, want);
+        if (r <= 0)
+            break;
+        if (f.write(chunk, (size_t)r) != (size_t)r) {
+            got = -1; // card write failed; treat as a failed download
+            break;
+        }
+        got += r;
+    }
+    f.close();
+    http.end();
+
+    if (got != len) {
+        SDFs.remove(path); // never leave a truncated script behind
+        ILOG_WARN("getapps: %s stopped at %d of %d bytes", url, got, len);
+        return false;
+    }
+    if (outLen)
+        *outLen = len;
+    return true;
+}
+#endif
 
 // Minimal readers for the catalog. We publish that file ourselves and the PR check
 // validates its shape, so this only has to handle the JSON we generate - not arbitrary
@@ -3714,23 +3795,18 @@ bool TFTView_320x240::getappsInstall(int idx)
     StoreApp &a = storeApps[idx];
     char url[160];
     snprintf(url, sizeof(url), "%sapps/%s/main.lua", kGetAppsBaseUrl, a.id);
-    int len = 0;
-    uint8_t *buf = getappsGet(url, &len);
-    if (!buf)
-        return false;
 
     char dir[64], path[80];
     snprintf(dir, sizeof(dir), "/apps/%s", a.id);
     snprintf(path, sizeof(path), "/apps/%s/main.lua", a.id);
     SDFs.mkdir("/apps"); // no-op if it's already there
     SDFs.mkdir(dir);
-    bool ok = false;
-    FsFile f = SDFs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
-    if (f) {
-        ok = (f.write(buf, (size_t)len) == (size_t)len);
-        f.close();
-    }
-    heap_caps_free(buf);
+
+    // Straight from the socket to the card. The old path pulled the whole script into one
+    // contiguous PSRAM block first, which quietly stopped being findable once apps got
+    // past roughly 46 KB and PSRAM had been fragmented by the map cache and LVGL.
+    int len = 0;
+    bool ok = getappsGetToFile(url, path, &len);
     if (ok) {
         // Record what we just installed, so the list can offer an update later.
         char vp[72];

@@ -58,9 +58,12 @@ struct UObj {
 UObj uobjs[80];
 constexpr int kMaxObj = 80;
 int uobjCount = 0;
-// Script buffer lives in PSRAM (48K - room for a real game; Deep Space alone is ~18K)
-// so it doesn't eat the scarce internal heap. Allocated once on first use, kept for the session.
-constexpr int kScriptCap = 49152;
+// Script buffer lives in PSRAM so it doesn't eat the scarce internal heap. Allocated once
+// on first use and kept for the session, which also means the big contiguous block is
+// claimed early rather than fought for later once PSRAM is fragmented.
+// 96K: was 48K, and Deep Space reached 46K - close enough to the ceiling that ordinary
+// additions were about to stop fitting.
+constexpr int kScriptCap = 98304;
 char *scriptBuf = nullptr;
 // The running app's own folder on the SD card ("" = none/SD unavailable). Set per
 // launch; store.read/write are jailed inside it.
