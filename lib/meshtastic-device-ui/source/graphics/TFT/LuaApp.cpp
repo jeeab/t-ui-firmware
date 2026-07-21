@@ -14,6 +14,7 @@
 // -----------------------------------------------------------------------------
 #include "graphics/common/SdCard.h" // SDFs (shared SdFat instance)
 #include "lvgl.h"
+#include "util/ILog.h" // so a failed launch says WHY instead of showing a black screen
 #include <cstdio>
 #include <cstring>
 #include <esp_heap_caps.h>
@@ -58,13 +59,16 @@ struct UObj {
 UObj uobjs[80];
 constexpr int kMaxObj = 80;
 int uobjCount = 0;
-// Script buffer lives in PSRAM so it doesn't eat the scarce internal heap. Allocated once
-// on first use and kept for the session, which also means the big contiguous block is
-// claimed early rather than fought for later once PSRAM is fragmented.
-// 96K: was 48K, and Deep Space reached 46K - close enough to the ceiling that ordinary
-// additions were about to stop fitting.
-constexpr int kScriptCap = 98304;
+// Script buffer lives in PSRAM so it doesn't eat the scarce internal heap. loadScript keeps
+// it across launches and only ever grows it to fit the biggest app actually run this session.
+// 192K: was 96K (and 48K before). Deep Space is ~82K and has room to keep growing, so the
+// ceiling is doubled again. This costs NOTHING until an app really is that big: the cap is a
+// sanity limit, not a reservation — loadScript asks only for the size of the file in front of
+// it. (Stays under the 256K Get Apps download ceiling in TFTView, so anything that installs
+// can also launch.)
+constexpr int kScriptCap = 196608;
 char *scriptBuf = nullptr;
+int scriptBufCap = 0; // how much scriptBuf actually holds; grows to fit the biggest app run
 // The running app's own folder on the SD card ("" = none/SD unavailable). Set per
 // launch; store.read/write are jailed inside it.
 char appDir[64] = "";
@@ -135,17 +139,46 @@ void seedApp(const char *dir, const char *path, const char *content)
 // Load a script off the SD card into scriptBuf; returns nullptr if it can't.
 const char *loadScript(const char *path)
 {
-    if (!scriptBuf)
-        scriptBuf = (char *)heap_caps_malloc(kScriptCap, MALLOC_CAP_SPIRAM);
-    if (!scriptBuf)
-        return nullptr;
     FsFile f = SDFs.open(path, O_RDONLY);
-    if (!f)
+    if (!f) {
+        ILOG_WARN("lua: cannot open %s", path);
         return nullptr;
-    int n = f.read((uint8_t *)scriptBuf, kScriptCap - 1);
+    }
+    int size = (int)f.fileSize();
+    if (size <= 0 || size >= kScriptCap) {
+        ILOG_WARN("lua: %s is %d bytes, cap is %d", path, size, kScriptCap);
+        f.close();
+        return nullptr;
+    }
+
+    // Allocate what THIS script needs, not the maximum a script may ever be. Claiming a
+    // flat kScriptCap was survivable at 48K and broke launching entirely at 96K: it wants
+    // one unbroken run of PSRAM, every app pays the largest app's price, and there often
+    // isn't a free block that big once maps and the node cache have been running. A 46K
+    // game now asks for 46K. The buffer is kept between launches and only ever grows, so
+    // repeated launches don't churn the heap.
+    if (size + 1 > scriptBufCap) {
+        char *nb = (char *)heap_caps_malloc(size + 1, MALLOC_CAP_SPIRAM);
+        if (!nb) {
+            // Never fail silently again. A null here used to mean a black screen and an
+            // empty log, which is the worst possible way for this to go wrong.
+            ILOG_ERROR("lua: no PSRAM for %d bytes (%s) - largest free block %u", size + 1, path,
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+            f.close();
+            return nullptr;
+        }
+        if (scriptBuf)
+            heap_caps_free(scriptBuf);
+        scriptBuf = nb;
+        scriptBufCap = size + 1;
+    }
+
+    int n = f.read((uint8_t *)scriptBuf, size);
     f.close();
-    if (n <= 0)
+    if (n <= 0) {
+        ILOG_WARN("lua: read of %s returned %d", path, n);
         return nullptr;
+    }
     scriptBuf[n] = 0;
     return scriptBuf;
 }

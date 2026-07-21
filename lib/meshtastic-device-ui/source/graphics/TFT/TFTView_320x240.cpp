@@ -85,6 +85,11 @@ extern "C" void tdeck_gps_set_enabled(bool on);
 extern "C" void tdeck_gps_set_interval(uint32_t secs);
 extern "C" bool tdeck_gps_get_enabled(void);
 extern "C" void tdeck_gps_kick(void); // re-arm the GPS search after a sleep
+// Lock screen on/off (src/TDeckLockControl.cpp). Persisted in NVS; default ON. When OFF,
+// effectiveLockPin() reports 0 (which every gate reads as "no lock") and the manual
+// double-click lock is skipped, so the device never shows the PIN pad.
+extern "C" bool tdeck_lock_enabled(void);
+extern "C" void tdeck_lock_set_enabled(bool en);
 // Time zone (so the clock reads local, not UTC). Index into the list in TDeckTimeZone.cpp,
 // which must stay in the same order as the dropdown built in createSettingsScreen().
 extern "C" void tdeck_tz_set(int idx);
@@ -223,7 +228,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.19.15"
+#define TUI_VERSION "2026.07.20.1"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -1022,11 +1027,38 @@ void TFTView_320x240::buildAppGrid(void)
     }
     for (int u = 0; u < userAppCount && launchCount < kMax; u++) {
         LaunchDesc &d = launchList[launchCount++];
-        strncpy(d.name, userAppDirs[u], sizeof(d.name) - 1);
-        d.name[sizeof(d.name) - 1] = 0;
-        if (d.name[0] >= 'a' && d.name[0] <= 'z')
-            d.name[0] = (char)(d.name[0] - 32); // capitalize the folder name for display
-        d.color = 0x5ac8fa;                     // generic tint for user apps
+        d.name[0] = 0;
+        // A proper title if the app shipped one. The FOLDER name has to stay a short,
+        // lowercase, FAT-safe id ("stars") because it's what the catalog and Get Apps
+        // address the app by - but that's a filing detail, not what the tile should say.
+        // Get Apps writes name.txt from the catalog at install time; anything sideloaded
+        // without one just falls back to the folder name as before.
+#if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+        if (sdCard) {
+            char np[64];
+            snprintf(np, sizeof(np), "/apps/%s/name.txt", userAppDirs[u]);
+            FsFile nf = SDFs.open(np, O_RDONLY);
+            if (nf) {
+                int n = nf.read((uint8_t *)d.name, sizeof(d.name) - 1);
+                nf.close();
+                if (n < 0)
+                    n = 0;
+                d.name[n] = 0;
+                for (int c = 0; c < n; c++) // first line only, and no stray CR
+                    if (d.name[c] == '\n' || d.name[c] == '\r') {
+                        d.name[c] = 0;
+                        break;
+                    }
+            }
+        }
+#endif
+        if (!d.name[0]) {
+            strncpy(d.name, userAppDirs[u], sizeof(d.name) - 1);
+            d.name[sizeof(d.name) - 1] = 0;
+            if (d.name[0] >= 'a' && d.name[0] <= 'z')
+                d.name[0] = (char)(d.name[0] - 32); // capitalize the folder name for display
+        }
+        d.color = 0x5ac8fa; // generic tint for user apps
         d.builtinIdx = -1;
         d.userIdx = u;
     }
@@ -1400,25 +1432,48 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(pinBtnLbl, "Change");
     lv_obj_center(pinBtnLbl);
 
+    // "Lock screen" on/off, directly under the PIN row it belongs with. Off = the device
+    // never shows the PIN pad (boots straight to Home; a double-click on Home still sleeps
+    // the screen, it just wakes back to Home). The idle screen-dim is unaffected. Persists
+    // in NVS (src/TDeckLockControl.cpp); default on, so untouched devices don't change.
+    lv_obj_t *lockLbl = lv_label_create(settings_screen);
+    lv_label_set_text(lockLbl, "Lock screen");
+    lv_obj_set_style_text_color(lockLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(lockLbl, LV_ALIGN_TOP_LEFT, 16, 84);
+
+    lv_obj_t *lock_switch = lv_switch_create(settings_screen);
+    lv_obj_set_size(lock_switch, 56, 28);
+    lv_obj_align(lock_switch, LV_ALIGN_TOP_RIGHT, -16, 78);
+    lv_obj_set_style_bg_color(lock_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (tdeck_lock_enabled())
+        lv_obj_add_state(lock_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(
+        lock_switch,
+        [](lv_event_t *e) {
+            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+            tdeck_lock_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
     lv_obj_t *pinHint = lv_label_create(settings_screen);
     lv_obj_set_width(pinHint, 288);
     lv_label_set_long_mode(pinHint, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(pinHint, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_label_set_text(pinHint, "Lock: double-click on Home. Default 1234");
+    lv_label_set_text(pinHint, "Double-click Home to lock/sleep. Lock screen off = no PIN. Default PIN 1234.");
     lv_obj_set_style_text_color(pinHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(pinHint, LV_ALIGN_TOP_LEFT, 16, 82);
+    lv_obj_align(pinHint, LV_ALIGN_TOP_LEFT, 16, 112);
 
     // "Brightness" row — live slider; persisted on release
     lv_obj_t *briLbl = lv_label_create(settings_screen);
     lv_label_set_text(briLbl, "Brightness");
     lv_obj_set_style_text_color(briLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(briLbl, LV_ALIGN_TOP_LEFT, 16, 114);
+    lv_obj_align(briLbl, LV_ALIGN_TOP_LEFT, 16, 162);
 
     lv_obj_t *briSlider = lv_slider_create(settings_screen);
     lv_slider_set_range(briSlider, 10, 255); // never let it slide fully dark
     lv_slider_set_value(briSlider, db.uiConfig.screen_brightness ? db.uiConfig.screen_brightness : 153, LV_ANIM_OFF);
     lv_obj_set_size(briSlider, 150, 14);
-    lv_obj_align(briSlider, LV_ALIGN_TOP_RIGHT, -20, 116);
+    lv_obj_align(briSlider, LV_ALIGN_TOP_RIGHT, -20, 164);
     lv_obj_add_event_cb(
         briSlider,
         [](lv_event_t *e) {
@@ -1439,12 +1494,12 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *gpsLbl = lv_label_create(settings_screen);
     lv_label_set_text(gpsLbl, "GPS");
     lv_obj_set_style_text_color(gpsLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(gpsLbl, LV_ALIGN_TOP_LEFT, 16, 152);
+    lv_obj_align(gpsLbl, LV_ALIGN_TOP_LEFT, 16, 200);
 
     gpsEnabled = tdeck_gps_get_enabled(); // reflect the firmware's current GPS state
     gps_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(gps_switch, 56, 28);
-    lv_obj_align(gps_switch, LV_ALIGN_TOP_RIGHT, -16, 146);
+    lv_obj_align(gps_switch, LV_ALIGN_TOP_RIGHT, -16, 194);
     lv_obj_set_style_bg_color(gps_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (gpsEnabled)
         lv_obj_add_state(gps_switch, LV_STATE_CHECKED);
@@ -1462,11 +1517,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *locLbl = lv_label_create(settings_screen);
     lv_label_set_text(locLbl, "Share location");
     lv_obj_set_style_text_color(locLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 186);
+    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 234);
 
     lv_obj_t *locBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(locBtn, 112, 32);
-    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 180);
+    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 228);
     lv_obj_set_style_radius(locBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         locBtn, [](lv_event_t *) { THIS->cycleLocPrecision(); }, LV_EVENT_CLICKED, NULL);
@@ -1480,23 +1535,23 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(gpsHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(gpsHint, "GPS on = always searching, even while asleep. Share location = how exactly others on the mesh see you.");
     lv_obj_set_style_text_color(gpsHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 222);
+    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 270);
 
     // ---- WiFi section ----
     lv_obj_t *wifiHdr = lv_label_create(settings_screen);
     lv_label_set_text(wifiHdr, "WiFi");
     lv_obj_set_style_text_color(wifiHdr, lv_color_hex(0x0a84ff), LV_PART_MAIN);
-    lv_obj_align(wifiHdr, LV_ALIGN_TOP_LEFT, 16, 266);
+    lv_obj_align(wifiHdr, LV_ALIGN_TOP_LEFT, 16, 314);
 
     // Network name -> keyboard (button shows the saved name)
     lv_obj_t *netLbl = lv_label_create(settings_screen);
     lv_label_set_text(netLbl, "Network");
     lv_obj_set_style_text_color(netLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(netLbl, LV_ALIGN_TOP_LEFT, 16, 298);
+    lv_obj_align(netLbl, LV_ALIGN_TOP_LEFT, 16, 346);
 
     lv_obj_t *netBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(netBtn, 150, 30);
-    lv_obj_align(netBtn, LV_ALIGN_TOP_RIGHT, -16, 292);
+    lv_obj_align(netBtn, LV_ALIGN_TOP_RIGHT, -16, 340);
     lv_obj_set_style_radius(netBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         netBtn, [](lv_event_t *) { THIS->wifiScanOpen(); }, LV_EVENT_CLICKED, NULL);
@@ -1510,11 +1565,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *pwLbl = lv_label_create(settings_screen);
     lv_label_set_text(pwLbl, "Password");
     lv_obj_set_style_text_color(pwLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(pwLbl, LV_ALIGN_TOP_LEFT, 16, 330);
+    lv_obj_align(pwLbl, LV_ALIGN_TOP_LEFT, 16, 378);
 
     lv_obj_t *pwBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(pwBtn, 96, 30);
-    lv_obj_align(pwBtn, LV_ALIGN_TOP_RIGHT, -16, 324);
+    lv_obj_align(pwBtn, LV_ALIGN_TOP_RIGHT, -16, 372);
     lv_obj_set_style_radius(pwBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         pwBtn, [](lv_event_t *) { THIS->wifiEntryPrompt(true); }, LV_EVENT_CLICKED, NULL);
@@ -1526,11 +1581,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *wifiLbl = lv_label_create(settings_screen);
     lv_label_set_text(wifiLbl, "Turn WiFi on");
     lv_obj_set_style_text_color(wifiLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(wifiLbl, LV_ALIGN_TOP_LEFT, 16, 366);
+    lv_obj_align(wifiLbl, LV_ALIGN_TOP_LEFT, 16, 414);
 
     wifi_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(wifi_switch, 56, 28);
-    lv_obj_align(wifi_switch, LV_ALIGN_TOP_RIGHT, -16, 360);
+    lv_obj_align(wifi_switch, LV_ALIGN_TOP_RIGHT, -16, 408);
     lv_obj_set_style_bg_color(wifi_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (db.config.network.wifi_enabled)
         lv_obj_add_state(wifi_switch, LV_STATE_CHECKED);
@@ -1546,7 +1601,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_width(wifi_status_label, 288);
     lv_label_set_long_mode(wifi_status_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 394);
+    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 442);
     updateWifiStatus();
 
     lv_obj_t *wifiHint = lv_label_create(settings_screen);
@@ -1555,7 +1610,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(wifiHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(wifiHint, "Set the name + password, then turn WiFi on.\nIt restarts the device and pauses Bluetooth.");
     lv_obj_set_style_text_color(wifiHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 418);
+    lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 466);
 
     // refresh the status line every couple seconds while this screen is up
     wifi_status_timer = lv_timer_create([](lv_timer_t *) { THIS->updateWifiStatus(); }, 2000, NULL);
@@ -1564,11 +1619,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shareLbl = lv_label_create(settings_screen);
     lv_label_set_text(shareLbl, "Share files (Wi-Fi)");
     lv_obj_set_style_text_color(shareLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shareLbl, LV_ALIGN_TOP_LEFT, 16, 460);
+    lv_obj_align(shareLbl, LV_ALIGN_TOP_LEFT, 16, 508);
 
     lv_obj_t *shareBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(shareBtn, 96, 30);
-    lv_obj_align(shareBtn, LV_ALIGN_TOP_RIGHT, -16, 454);
+    lv_obj_align(shareBtn, LV_ALIGN_TOP_RIGHT, -16, 502);
     lv_obj_set_style_radius(shareBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         shareBtn, [](lv_event_t *) { THIS->openFileShare(); }, LV_EVENT_CLICKED, NULL);
@@ -1581,11 +1636,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *toLbl = lv_label_create(settings_screen);
     lv_label_set_text(toLbl, "Screen timeout");
     lv_obj_set_style_text_color(toLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 500);
+    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 548);
 
     lv_obj_t *toBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(toBtn, 112, 32);
-    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 494);
+    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 542);
     lv_obj_set_style_radius(toBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         toBtn, [](lv_event_t *) { THIS->cycleScreenTimeout(); }, LV_EVENT_CLICKED, NULL);
@@ -1597,10 +1652,10 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *sndLbl = lv_label_create(settings_screen);
     lv_label_set_text(sndLbl, "Sound");
     lv_obj_set_style_text_color(sndLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 542);
+    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 590);
 
     mute_switch = lv_switch_create(settings_screen);
-    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 536);
+    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 584);
     if (tdeck_sound_get_enabled())
         lv_obj_add_state(mute_switch, LV_STATE_CHECKED); // switch ON = sound ON
     lv_obj_add_event_cb(
@@ -1618,7 +1673,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(sndHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(sndHint, "Off = silence everything, including message alerts.");
     lv_obj_set_style_text_color(sndHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 570);
+    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 618);
 
     // "Add channel" row — reads a Meshtastic channel link from /channel.txt on the card.
     // Typing a 150-character link on the thumb keyboard isn't realistic, and there's no
@@ -1626,11 +1681,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *chLbl = lv_label_create(settings_screen);
     lv_label_set_text(chLbl, "Add channel");
     lv_obj_set_style_text_color(chLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 602);
+    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 650);
 
     lv_obj_t *chBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(chBtn, 110, 30);
-    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 598);
+    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 646);
     lv_obj_set_style_radius(chBtn, 8, LV_PART_MAIN);
     lv_obj_t *chBtnLbl = lv_label_create(chBtn);
     lv_obj_set_style_text_font(chBtnLbl, &ui_font_montserrat_12, LV_PART_MAIN);
@@ -1643,7 +1698,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(channel_import_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(channel_import_label, "Put the channel link in channel.txt on the card, then tap.");
     lv_obj_set_style_text_color(channel_import_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 632);
+    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 680);
 
     lv_obj_add_event_cb(
         chBtn, [](lv_event_t *) { THIS->importChannelFromCard(); }, LV_EVENT_CLICKED, NULL);
@@ -1654,7 +1709,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *tzLbl = lv_label_create(settings_screen);
     lv_label_set_text(tzLbl, "Time zone");
     lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 668);
+    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 716);
 
     // When no zone is set the device silently runs on GMT. Showing the list's first entry in
     // that case made it look like Pacific was already chosen while the clock was really on
@@ -1668,7 +1723,7 @@ void TFTView_320x240::createSettingsScreen(void)
                                           : "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
                                             "UTC\nUK\nCentral Europe");
     lv_obj_set_width(tzDd, 150);
-    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 662);
+    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 710);
     lv_dropdown_set_selected(tzDd, tzUnset ? 0 : (uint32_t)tzCur);
     // Keep the open list on-screen: this row sits at the bottom of a tall scrolling screen,
     // so let it drop upward rather than off the end.
@@ -1690,7 +1745,7 @@ void TFTView_320x240::createSettingsScreen(void)
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 714);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 762);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -1708,7 +1763,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(verLbl, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(verLbl, "Version " TUI_VERSION);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 758);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 806);
 }
 
 /**
@@ -3815,6 +3870,15 @@ bool TFTView_320x240::getappsInstall(int idx)
         if (vf) {
             vf.write((const uint8_t *)a.ver, strlen(a.ver));
             vf.close();
+        }
+        // And its proper title, so the tile can read "Deep Space" rather than "Stars".
+        // The folder has to stay the short lowercase id; this is the display name.
+        char np[72];
+        snprintf(np, sizeof(np), "/apps/%s/name.txt", a.id);
+        FsFile nf = SDFs.open(np, O_WRONLY | O_CREAT | O_TRUNC);
+        if (nf) {
+            nf.write((const uint8_t *)a.name, strlen(a.name));
+            nf.close();
         }
         a.installed = true;
         a.outdated = false;
@@ -5928,6 +5992,9 @@ void TFTView_320x240::handleHomeGesture(void)
     // Awake & unlocked. On the Home grid -> lock; anywhere else -> go Home.
     lv_display_trigger_activity(NULL);
     if (launcher_screen && lv_screen_active() == launcher_screen) {
+        // Double-click on Home always sleeps the screen. Whether waking then asks for the PIN
+        // is decided on the wake path by effectiveLockPin() — so with the lock off this still
+        // sleeps, it just wakes straight to Home instead of to the pad.
         lockDevice();
     } else if (launcher_screen) {
         lv_screen_load_anim(launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
@@ -5948,6 +6015,11 @@ void TFTView_320x240::lockDevice(void)
 
 uint32_t TFTView_320x240::effectiveLockPin(void)
 {
+    // Lock switched off in Settings -> report 0. Every gate in this file already treats 0 as
+    // "no lock" (boot and wake both skip the pad on 0), so one flag checked in one place
+    // disables the whole lock cleanly. Default is ON, so untouched devices are unchanged.
+    if (!tdeck_lock_enabled())
+        return 0;
     // The PIN is stored as a NUMBER, and 0 doubles as "no PIN set" — so 0000 can never act as a
     // real lock (indistinguishable from unset, and unset used to mean "open"). We therefore use
     // 1234 as the built-in default: an unset device locks with 1234, which the user can change
