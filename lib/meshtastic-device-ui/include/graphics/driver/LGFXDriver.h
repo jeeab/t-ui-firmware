@@ -20,6 +20,11 @@ extern volatile bool tdeck_input_gated;
 extern volatile bool tdeck_hold_dark;
 extern volatile bool tdeck_prog_mode;
 
+// Optional "keyboard backlight follows the screen" (src/TDeckKeyboardLight.cpp). Off unless
+// the user switches it on in Settings, and edge-triggered inside, so calling it on every
+// pass costs two comparisons.
+extern "C" void tdeck_kbdlight_screen(bool screenOn);
+
 constexpr uint32_t defaultLongPressTime = 700; // ms until long press is detected (lvgl default is 400)
 constexpr uint32_t defaultGestureLimit = 10;   // x/y diff pixel until a swipe gesture is detected (lvgl default is 50)
 
@@ -118,8 +123,10 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
                 }
                 // Once the screen is actually dark, gate input so only a trackball double-click
                 // (which calls lv_display_trigger_activity) can wake it.
-                if (tdeck_hold_dark || lgfx->getBrightness() == 0)
+                if (tdeck_hold_dark || lgfx->getBrightness() == 0) {
                     tdeck_input_gated = true;
+                    tdeck_kbdlight_screen(false); // keys go dark with the screen
+                }
             }
             // no BL pin defined to control brightness, so show blank screen instead
             else {
@@ -138,10 +145,16 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
                 }
             }
         }
-    } else if (lgfx->getBrightness() < lastBrightness) {
-        lgfx->setBrightness(lastBrightness);
-        lastBrightness = lgfx->getBrightness();
-        tdeck_input_gated = false; // screen is lit again — accept touch/keyboard/roll
+    } else {
+        if (lgfx->getBrightness() < lastBrightness) {
+            lgfx->setBrightness(lastBrightness);
+            lastBrightness = lgfx->getBrightness();
+            tdeck_input_gated = false; // screen is lit again — accept touch/keyboard/roll
+        }
+        // Screen is lit. Deliberately outside the if above so this also covers the very
+        // first pass after boot, where nothing has dimmed yet and so there is no
+        // brightness change to hang the "screen came back" moment off.
+        tdeck_kbdlight_screen(true);
     }
 
     if (!calibrating) {

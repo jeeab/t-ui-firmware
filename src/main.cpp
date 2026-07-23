@@ -1281,6 +1281,9 @@ extern "C" void tdeck_gps_control_service(void);
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
+// T-Deck launcher 12/24-hour switch: apply + persist a pending clock-format change from this
+// (main) thread, for the same reason as the others. Defined in src/TDeckClockFormat.cpp.
+extern "C" void tdeck_clock_service(void);
 // T-Deck launcher Time zone: apply + persist a pending zone change from this (main) thread.
 // Writing settings to flash from the UI task froze the device. Defined in TDeckTimeZone.cpp.
 extern "C" void tdeck_tz_service(void);
@@ -1300,6 +1303,7 @@ void loop()
     tdeck_mesh_switch_service();
     tdeck_gps_control_service();
     tdeck_sound_service();
+    tdeck_clock_service();
     tdeck_tz_service();
     tdeck_channel_import_service();
 

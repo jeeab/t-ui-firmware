@@ -17,6 +17,9 @@ extern volatile bool tdeck_wake_request;
 // Alt+C on the T-Deck keyboard emits a dedicated byte (0x0C, see the C3 keyboard firmware):
 // a touch-independent request to (re)run screen calibration, handled by the launcher's poll.
 extern volatile bool tdeck_calib_request;
+// The "erase" key pressed while nothing is being typed into: a request to go back, polled by
+// the launcher (which decides whether Back is allowed from the screen in front of the user).
+extern volatile bool tdeck_back_request;
 // While a Lua app is the screen in front of the user, its keys belong to that app rather
 // than to LVGL. Defined in graphics/TFT/LuaApp.cpp.
 extern "C" bool tdeck_lua_app_focused(void);
@@ -73,6 +76,29 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             if (tdeck_input_gated) {
                 tdeck_wake_request = true;
                 break;
+            }
+            // The "erase" key doubles as Back — an alternative to the stiff trackball
+            // double-click (requested by a web-installer user). Handled HERE, BEFORE the key is
+            // handed to a Lua app or matched against a focused widget, so it works the same in
+            // games, tools and built-in screens alike (an earlier version sat after the Lua
+            // hand-off, so games like Pinball swallowed the key and Back did nothing in them).
+            // The ONE exception is real typing: if an editable text box (or the on-screen
+            // keyboard) on the CURRENT screen has focus, backspace stays a backspace so you can
+            // still correct a Wi-Fi password, a PIN, or a note — you leave those editors with the
+            // trackball double-click. Lua apps have no text boxes, so Back always works in them.
+            // handleBackGesture() decides whether Back is actually allowed (never off the lock pad).
+            if (data->key == LV_KEY_BACKSPACE && !tdeck_prog_mode) {
+                lv_group_t *bgrp = lv_indev_get_group(indev);
+                lv_obj_t *bfocus = bgrp ? lv_group_get_focused(bgrp) : nullptr;
+                bool typingHere = bfocus && lv_obj_get_screen(bfocus) == lv_screen_active() &&
+                                  (lv_obj_check_type(bfocus, &lv_textarea_class) ||
+                                   lv_obj_check_type(bfocus, &lv_keyboard_class));
+                if (!typingHere) {
+                    tdeck_back_request = true;
+                    data->state = LV_INDEV_STATE_RELEASED;
+                    data->key = 0;
+                    break;
+                }
             }
             // A Lua app is on screen: the key is the app's, not LVGL's. Queue it for the
             // app's next tick and swallow it here, so it can't also land in whatever widget

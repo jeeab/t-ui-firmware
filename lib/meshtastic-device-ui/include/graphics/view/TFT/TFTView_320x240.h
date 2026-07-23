@@ -265,6 +265,11 @@ class TFTView_320x240 : public MeshtasticView
     int userAppCount = 0;
     LaunchDesc launchList[40];           // the assembled, ordered grid (stable storage for tiles)
     int launchCount = 0;
+    // The chosen order, held in RAM as well as on the card. buildAppGrid() reassembles
+    // launchList from scratch on every rebuild, so without this a reorder was thrown away the
+    // instant the grid refreshed on any device with no SD card to read the order back from.
+    char appOrder[40][24];
+    int appOrderCount = 0;
     bool suppressTileClick = false;      // a long-press opened Arrange -> don't also launch on release
     lv_obj_t *arrange_overlay = nullptr;
     lv_obj_t *arrange_list = nullptr;    // the scrollable row list inside the overlay
@@ -474,6 +479,7 @@ class TFTView_320x240 : public MeshtasticView
     enum TDeckLockState { LOCK_NONE, LOCK_DARK, LOCK_ENTRY };
     TDeckLockState lockState = LOCK_NONE;
     void handleHomeGesture(void);            // runs on every trackball double-click
+    void handleBackGesture(void);            // runs on the "erase" key when nothing is being typed
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
     void startCalibrationFromLock(void);     // Alt+C from the pad: run touch calibration, then re-lock

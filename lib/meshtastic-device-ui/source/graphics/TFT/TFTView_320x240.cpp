@@ -90,6 +90,14 @@ extern "C" void tdeck_gps_kick(void); // re-arm the GPS search after a sleep
 // double-click lock is skipped, so the device never shows the PIN pad.
 extern "C" bool tdeck_lock_enabled(void);
 extern "C" void tdeck_lock_set_enabled(bool en);
+// Keyboard backlight follows the screen (src/TDeckKeyboardLight.cpp). Persisted in NVS;
+// default OFF, so a device nobody has touched keeps its keys dark exactly as before.
+extern "C" bool tdeck_kbdlight_enabled(void);
+extern "C" void tdeck_kbdlight_set_enabled(bool en);
+// 12/24-hour clock (src/TDeckClockFormat.cpp). Drives Meshtastic's own
+// config.display.use_12h_clock, so the phone app and the device stay in agreement.
+extern "C" bool tdeck_clock_get_12h(void);
+extern "C" void tdeck_clock_set_12h(bool on);
 // Time zone (so the clock reads local, not UTC). Index into the list in TDeckTimeZone.cpp,
 // which must stay in the same order as the dropdown built in createSettingsScreen().
 extern "C" void tdeck_tz_set(int idx);
@@ -178,6 +186,11 @@ volatile bool tdeck_wake_request = false;
 //  touch-screen calibration from the lock pad — a touch-independent fix when the screen is
 //  miscalibrated (set by the keyboard driver, see I2CKeyboardInputDriver.cpp).
 volatile bool tdeck_calib_request = false;
+//  tdeck_back_request -> the "erase" (backspace) key was pressed while nothing was being typed
+//  into. A user asked for a Back key alongside the trackball double-click, which is stiff in a
+//  case. The keyboard driver decides "is the user typing?" (it has the focused widget);
+//  handleBackGesture() below decides whether Back is allowed at all.
+volatile bool tdeck_back_request = false;
 
 #define LV_COLOR_HEX(C)                                                                                                          \
     {                                                                                                                            \
@@ -228,7 +241,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.20.1"
+#define TUI_VERSION "2026.07.22.3"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -568,6 +581,23 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 14, 13, 9, 9, 0x30d158, 2);
         icBox(ic, 23, 13, 9, 9, 0x30d158, 2);
         icBox(ic, 34, 4, 8, 8, 0xff453a, 4);
+    } else if (!strcmp(name, "Deep Space")) {
+        // Black sky, a scatter of stars, and your ship climbing up through it. Drawn in
+        // creation order so the void goes down first and everything else lands on top.
+        icBox(ic, 0, 0, 46, 40, 0x05050a, 6); // the void
+        icBox(ic, 5, 6, 2, 2, 0xffffff, 1);   // stars
+        icBox(ic, 38, 8, 2, 2, 0xffffff, 1);
+        icBox(ic, 12, 31, 2, 2, 0x9ad0ff, 1);
+        icBox(ic, 34, 29, 2, 2, 0xffffff, 1);
+        icBox(ic, 41, 19, 2, 2, 0xffe9a8, 1);
+        icBox(ic, 7, 18, 2, 2, 0xffffff, 1);
+        icBox(ic, 29, 4, 2, 2, 0x9ad0ff, 1);
+        icBox(ic, 18, 35, 2, 2, 0xffffff, 1);
+        icBox(ic, 21, 13, 4, 7, 0xffffff, 1);  // nose
+        icBox(ic, 18, 19, 10, 8, 0xc7c7cc, 2); // hull
+        icBox(ic, 12, 23, 6, 4, 0x0a84ff, 1);  // wings
+        icBox(ic, 28, 23, 6, 4, 0x0a84ff, 1);
+        icBox(ic, 21, 27, 4, 6, 0xff9f0a, 2);  // thruster
     } else if (!strcmp(name, "Flashlight")) { // bulb + rays
         icBox(ic, 17, 17, 12, 15, 0xffd60a, 4);
         icBox(ic, 19, 13, 8, 5, 0xfff3b0, 2);
@@ -765,9 +795,16 @@ void TFTView_320x240::createLauncher(void)
                 time(&now);
                 if (VALID_TIME(now)) {
                     tm *lt = localtime(&now);
-                    strftime(buf, sizeof(buf), "%I:%M %p", lt);
-                    if (buf[0] == '0') // "07:05 PM" -> "7:05 PM"
-                        memmove(buf, buf + 1, strlen(buf));
+                    // 12- or 24-hour, per Settings. This clock used to be hard-wired to 12-hour
+                    // while the Meshtastic screens right next to it already honoured the setting,
+                    // so a 24-hour user got both on one device (reported from Europe).
+                    if (THIS->db.config.display.use_12h_clock) {
+                        strftime(buf, sizeof(buf), "%I:%M %p", lt);
+                        if (buf[0] == '0') // "07:05 PM" -> "7:05 PM"
+                            memmove(buf, buf + 1, strlen(buf));
+                    } else {
+                        strftime(buf, sizeof(buf), "%H:%M", lt);
+                    }
                 } else {
                     strcpy(buf, "T-Deck");
                 }
@@ -838,6 +875,13 @@ void TFTView_320x240::createLauncher(void)
         [](lv_timer_t *) {
             // Either the trackball double-click OR (when the screen is dark) a keyboard key
             // runs the gesture. The keyboard is the reliable wake for the stiff trackball.
+            // The "erase" key asking to go back. Separate from the Home gesture below: Back
+            // steps out of what you're in, it never sleeps the device the way a double-click
+            // on Home does.
+            if (tdeck_back_request) {
+                tdeck_back_request = false;
+                THIS->handleBackGesture();
+            }
             if (!tb_home_request && !tdeck_wake_request)
                 return;
             tb_home_request = false;
@@ -942,48 +986,71 @@ void TFTView_320x240::runUserApp(int userIdx)
     lua_run_path(path);
 }
 
-// Reorder launchList to match the saved order in /apps/order.txt. Apps not listed
-// (newly added) keep their default position at the end. Missing/garbled file => no-op
-// (default order preserved). This is a best-effort convenience, never a hard failure.
+// Reorder launchList to match the chosen order. The order lives in RAM (appOrder) and is
+// backed by /apps/order.txt when a card is present; the file is read once, the first time
+// this runs. Apps not listed (newly added) keep their default position at the end. No order
+// at all => no-op, default order preserved. Best-effort convenience, never a hard failure.
+//
+// The RAM copy is what makes reordering work on a device with NO SD card. buildAppGrid()
+// reassembles launchList from kApps + userAppDirs on every rebuild, and the rebuild happens
+// immediately after every move — so when the order could only be read back from a card,
+// a cardless device threw the move away the moment the grid refreshed. That is the
+// "Organize apps does not work" report.
 void TFTView_320x240::applyAppOrder(void)
 {
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
-    if (!sdCard || !SDFs.exists("/apps/order.txt"))
+    // First run of the session with no order in RAM yet: seed it from the card if there is one.
+    if (appOrderCount == 0 && sdCard && SDFs.exists("/apps/order.txt")) {
+        FsFile f = SDFs.open("/apps/order.txt", O_RDONLY);
+        if (f) {
+            char key[24];
+            while (appOrderCount < (int)(sizeof(appOrder) / sizeof(appOrder[0])) && f.fgets(key, sizeof(key)) > 0) {
+                for (char *c = key; *c; c++)
+                    if (*c == '\n' || *c == '\r') {
+                        *c = 0;
+                        break;
+                    }
+                if (!key[0])
+                    continue;
+                strncpy(appOrder[appOrderCount], key, sizeof(appOrder[0]) - 1);
+                appOrder[appOrderCount][sizeof(appOrder[0]) - 1] = 0;
+                appOrderCount++;
+            }
+            f.close();
+        }
+    }
+#endif
+    if (appOrderCount == 0)
         return;
-    FsFile f = SDFs.open("/apps/order.txt", O_RDONLY);
-    if (!f)
-        return;
+
     LaunchDesc ordered[40];
     bool placed[40] = {false};
     int oc = 0;
-    char key[24];
-    while (oc < launchCount && f.fgets(key, sizeof(key)) > 0) {
-        for (char *c = key; *c; c++)
-            if (*c == '\n' || *c == '\r') {
-                *c = 0;
-                break;
-            }
-        if (!key[0])
-            continue;
+    for (int k = 0; k < appOrderCount && oc < launchCount; k++)
         for (int i = 0; i < launchCount; i++)
-            if (!placed[i] && !strcmp(launchList[i].name, key)) {
+            if (!placed[i] && !strcmp(launchList[i].name, appOrder[k])) {
                 ordered[oc++] = launchList[i];
                 placed[i] = true;
                 break;
             }
-    }
-    f.close();
     for (int i = 0; i < launchCount && oc < launchCount; i++) // append anything not listed
         if (!placed[i])
             ordered[oc++] = launchList[i];
     for (int i = 0; i < oc; i++)
         launchList[i] = ordered[i];
     launchCount = oc;
-#endif
 }
 
+// Snapshot the current order. RAM always (so it survives the grid rebuild even with no card),
+// then the card as a best-effort so it also survives a reboot.
 void TFTView_320x240::saveAppOrder(void)
 {
+    appOrderCount = 0;
+    for (int i = 0; i < launchCount && i < (int)(sizeof(appOrder) / sizeof(appOrder[0])); i++) {
+        strncpy(appOrder[appOrderCount], launchList[i].name, sizeof(appOrder[0]) - 1);
+        appOrder[appOrderCount][sizeof(appOrder[0]) - 1] = 0;
+        appOrderCount++;
+    }
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
     if (!sdCard)
         return;
@@ -1742,10 +1809,56 @@ void TFTView_320x240::createSettingsScreen(void)
         },
         LV_EVENT_VALUE_CHANGED, NULL);
 
+    // "24-hour clock" — sits with Time zone because it's the same subject. This drives
+    // Meshtastic's OWN display setting rather than a private copy, so the phone app and the
+    // device can't disagree about it. Asked for by a European user; the launcher's clock used
+    // to be hard-wired to 12-hour even when the Meshtastic screens beside it showed 24.
+    lv_obj_t *clkLbl = lv_label_create(settings_screen);
+    lv_label_set_text(clkLbl, "24-hour clock");
+    lv_obj_set_style_text_color(clkLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 752);
+
+    lv_obj_t *clk_switch = lv_switch_create(settings_screen);
+    lv_obj_set_size(clk_switch, 56, 28);
+    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 746);
+    lv_obj_set_style_bg_color(clk_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (!tdeck_clock_get_12h()) // the switch reads "24-hour", the setting stores "12-hour"
+        lv_obj_add_state(clk_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(
+        clk_switch,
+        [](lv_event_t *e) {
+            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+            bool want12h = !lv_obj_has_state(sw, LV_STATE_CHECKED);
+            tdeck_clock_set_12h(want12h); // persist via the main-loop service
+            // Also update the copy the home-screen clock actually reads, so it flips within a
+            // second instead of only after a reboot re-synced the two copies (Jake's report).
+            THIS->db.config.display.use_12h_clock = want12h;
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
+    // "Keyboard light" — no software switch. The keyboard's own chip ACCEPTS the I2C brightness
+    // command (it ACKs, i2c_rc=0) but doesn't actually light the backlight from that path on this
+    // hardware — only its built-in Alt+B shortcut drives it (likely a keyboard-firmware quirk:
+    // the PWM write from the I2C callback context doesn't take effect). Rather than ship a switch
+    // that silently does nothing, point people at the shortcut that works. Software control is
+    // parked for a later deep-dive (see src/TDeckKeyboardLight.cpp, left dormant).
+    lv_obj_t *kbdLbl = lv_label_create(settings_screen);
+    lv_label_set_text(kbdLbl, "Keyboard light");
+    lv_obj_set_style_text_color(kbdLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 790);
+
+    lv_obj_t *kbdHint = lv_label_create(settings_screen);
+    lv_obj_set_width(kbdHint, 288);
+    lv_label_set_long_mode(kbdHint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(kbdHint, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(kbdHint, "Press Alt + B to turn the keyboard backlight on or off.");
+    lv_obj_set_style_text_color(kbdHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 814);
+
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 762);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 860);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -1758,12 +1871,18 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(backLbl, "Back");
     lv_obj_center(backLbl);
 
-    // Version, last line on the screen — the only place the launcher's own version is visible.
+    // Versions, last lines on the screen. Two of them, because there are two: this launcher
+    // has its own version, and underneath it sits the Meshtastic firmware that does the radio.
+    // A user asked "how do I know what Meshtastic version this is?" and there was genuinely
+    // nowhere to look — firmware_version is the string Meshtastic itself reports.
     lv_obj_t *verLbl = lv_label_create(settings_screen);
     lv_obj_set_style_text_font(verLbl, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_label_set_text(verLbl, "Version " TUI_VERSION);
+    static char verBuf[72];
+    snprintf(verBuf, sizeof(verBuf), "Version %s\nMeshtastic %s", TUI_VERSION, firmware_version ? firmware_version : "?");
+    lv_label_set_text(verLbl, verBuf);
+    lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 806);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 904);
 }
 
 /**
@@ -5950,9 +6069,14 @@ void TFTView_320x240::handleHomeGesture(void)
     // and if a real PIN is set, always show the pad. Previously the "idle timeout" case was
     // decided separately from the "manual lock" case, which let some apps wake straight to
     // Home without the PIN. Unifying it here fixes that.
-    if (tdeck_input_gated || tdeck_hold_dark) {
+    if (tdeck_input_gated || tdeck_hold_dark || screenLocked) {
         tdeck_input_gated = false;
-        tdeck_hold_dark = false;           // stop forcing the backlight black
+        tdeck_hold_dark = false; // stop forcing the backlight black
+        // Belt and braces: isScreenLocked() also holds the backlight at 0, and its own way out
+        // (the blank-screen button) is unreachable on a backlit device. Clear it here so this
+        // stays the ONE wake path no matter which code raised the flag.
+        screenLocked = false;
+        screenUnlockRequest = false;
         lv_display_trigger_activity(NULL); // relight the backlight
         // Waking is also where the GPS gets re-armed: after the device sleeps, nothing else
         // restarts its search, so it would stay dark until the Settings switch was toggled.
@@ -5998,6 +6122,53 @@ void TFTView_320x240::handleHomeGesture(void)
         lockDevice();
     } else if (launcher_screen) {
         lv_screen_load_anim(launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The "erase" key as Back. Steps OUT of whatever is in front of you — the overlay if
+// there is one, otherwise the app/screen you're in — and stops at Home. On Home a single
+// Back does nothing (nothing to go back to), but a DOUBLE Back sleeps the device — the same
+// as a trackball double-click, for stiff trackballs. The double requirement keeps a stray
+// backspace from making the T-Deck look like it died.
+// -----------------------------------------------------------------------------
+void TFTView_320x240::handleBackGesture(void)
+{
+    // The lock is not something Back gets to dismiss. While the screen is dark a keypress
+    // is already a wake request (see the keyboard driver), handled on the gesture path.
+    if (lockState != LOCK_NONE || tdeck_input_gated || tdeck_hold_dark)
+        return;
+
+    lv_display_trigger_activity(NULL);
+
+    // Overlays sit on top of the screen behind them, so close the thing actually in front
+    // of the user rather than jumping straight past it to Home.
+    if (arrange_overlay) {
+        closeArrange();
+        return;
+    }
+    if (pins_overlay) {
+        closePinsList();
+        return;
+    }
+    // Anywhere but Home: Back steps out to Home.
+    if (launcher_screen && lv_screen_active() != launcher_screen) {
+        lv_screen_load_anim(launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+        return;
+    }
+    // On Home: a DOUBLE Back within 700ms sleeps the device (same as the trackball
+    // double-click). Jake asked for a 1.5s hold, but the T-Deck keyboard reports each key just
+    // once with no auto-repeat, so a timed hold can't be detected — a double-tap is the
+    // reliable equivalent, and needing two presses stops a stray erase from sleeping it.
+    if (launcher_screen && lv_screen_active() == launcher_screen) {
+        static uint32_t lastBackHome = 0;
+        uint32_t now = lv_tick_get();
+        if (lastBackHome != 0 && (now - lastBackHome) < 700) {
+            lastBackHome = 0;
+            lockDevice();
+        } else {
+            lastBackHome = now;
+        }
     }
 }
 
@@ -7094,9 +7265,15 @@ void TFTView_320x240::ui_event_SettingsButton(lv_event_t *e)
             THIS->ui_set_active(objects.settings_button, objects.controller_panel, objects.top_settings_panel);
         }
     } else if (event_code == LV_EVENT_LONG_PRESSED && !advancedMode && THIS->activeSettings == eNone) {
-        ILOG_DEBUG("screen locked");
-        screenLocked = true;
-        screenUnlockRequest = false;
+        // Long-press = turn the screen off. Upstream did this by raising screenLocked, whose only
+        // way back is a CLICK on objects.blank_screen_button — but that button lives on
+        // objects.blank_screen, and on a device WITH a backlight LGFXDriver dims the backlight
+        // instead of ever loading that screen. So the button was unreachable, isScreenLocked()
+        // stayed true forever, and every wake was immediately re-dimmed: a dead screen until
+        // reboot (reported by a web-installer user as "Black screen").
+        // Route it through our own sleep instead, which the trackball double-click can wake.
+        ILOG_DEBUG("screen off via settings long-press");
+        THIS->lockDevice();
         ignoreClicked = true;
     } else if (event_code == LV_EVENT_LONG_PRESSED && advancedMode && THIS->activeSettings == eNone) {
         advancedMode = !advancedMode;

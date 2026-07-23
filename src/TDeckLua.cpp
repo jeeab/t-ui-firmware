@@ -33,6 +33,10 @@ extern "C" bool tdeck_appfs_write(const char *name, const char *data, int len);
 // several; LVGL only ever consumes one). Returns the count, or -1 if no reader is
 // wired up (pre-16.4 device-ui). Lets games use both halves of the screen at once.
 extern "C" int tdeck_touch_read(unsigned short *xs, unsigned short *ys, int max);
+// GPS position for apps (src/TDeckGpsBridge.cpp). Read-only, cheap, safe to call anytime —
+// the first of the "wider toolbox" doors. Returns false until there's a usable fix.
+extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
+extern "C" uint32_t tdeck_gps_num_sats(void);
 // --- other firmware helpers ---------------------------------------------------
 void playBeep();                              // buzz.cpp (C++ linkage)
 extern "C" void tdeck_beep_gain(float gain);  // TDeckBeep.cpp — temporarily boost buzzer volume
@@ -285,6 +289,26 @@ static int api_device_touches(lua_State *L)
     return 1 + 2 * n;
 }
 
+// device.gps() -> lat, lon, sats  — location as plain decimal degrees (e.g. 47.61, -122.33)
+// plus the satellite count. Until there's a fix, lat and lon come back nil but sats still
+// updates, so an app can show the search progressing rather than a dead screen:
+//   local lat, lon, sats = device.gps()
+//   if lat then ... have a position ... else ... still searching, watch sats climb ... end
+// Read-only: it can't move the device or drain anything, which is why it's a safe door to open.
+static int api_device_gps(lua_State *L)
+{
+    int32_t lat = 0, lon = 0;
+    if (tdeck_gps_position(&lat, &lon)) {
+        lua_pushnumber(L, (lua_Number)lat / 1e7); // firmware keeps position in 1e-7 degree units
+        lua_pushnumber(L, (lua_Number)lon / 1e7);
+    } else {
+        lua_pushnil(L); // no fix yet: lat/lon nil...
+        lua_pushnil(L);
+    }
+    lua_pushinteger(L, (lua_Integer)tdeck_gps_num_sats()); // ...but sats always reports
+    return 3;
+}
+
 static void call_optional(const char *fn)
 {
     if (!AppL)
@@ -325,8 +349,11 @@ extern "C" int tdeck_lua_app_start(const char *script)
                                          {"line", api_screen_line},
                                          {"hide", api_screen_hide},
                                          {nullptr, nullptr}};
-    static const luaL_Reg deviceLib[] = {
-        {"beep", api_device_beep}, {"time", api_device_time}, {"touches", api_device_touches}, {nullptr, nullptr}};
+    static const luaL_Reg deviceLib[] = {{"beep", api_device_beep},
+                                         {"time", api_device_time},
+                                         {"touches", api_device_touches},
+                                         {"gps", api_device_gps},
+                                         {nullptr, nullptr}};
     static const luaL_Reg storeLib[] = {{"read", api_store_read}, {"write", api_store_write}, {nullptr, nullptr}};
     static const luaL_Reg canvasLib[] = {{"begin", api_canvas_begin}, {"clear", api_canvas_clear},
                                          {"rect", api_canvas_rect},   {"pixel", api_canvas_pixel},
