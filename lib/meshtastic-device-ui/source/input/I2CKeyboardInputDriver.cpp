@@ -24,6 +24,8 @@ extern volatile bool tdeck_back_request;
 // than to LVGL. Defined in graphics/TFT/LuaApp.cpp.
 extern "C" bool tdeck_lua_app_focused(void);
 extern "C" void tdeck_lua_queue_key(uint32_t key);
+// A Lua app can set keep_back=true to keep the erase/Back key for itself (src/TDeckLua.cpp).
+extern "C" bool tdeck_lua_app_keeps_back(void);
 
 I2CKeyboardInputDriver::KeyboardList I2CKeyboardInputDriver::i2cKeyboardList;
 
@@ -93,7 +95,12 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
                 bool typingHere = bfocus && lv_obj_get_screen(bfocus) == lv_screen_active() &&
                                   (lv_obj_check_type(bfocus, &lv_textarea_class) ||
                                    lv_obj_check_type(bfocus, &lv_keyboard_class));
-                if (!typingHere) {
+                // A Lua app that set keep_back=true keeps the erase key for itself (e.g. a game
+                // whose controls sit next to erase). Then we DON'T quit it — the key falls through
+                // to the Lua hand-off below and reaches the app as on_key("back") for it to use or
+                // ignore. Everything else: erase = Back as usual.
+                bool appKeepsBack = tdeck_lua_app_focused() && tdeck_lua_app_keeps_back();
+                if (!typingHere && !appKeepsBack) {
                     tdeck_back_request = true;
                     data->state = LV_INDEV_STATE_RELEASED;
                     data->key = 0;

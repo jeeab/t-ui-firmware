@@ -37,6 +37,12 @@ extern "C" int tdeck_touch_read(unsigned short *xs, unsigned short *ys, int max)
 // the first of the "wider toolbox" doors. Returns false until there's a usable fix.
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
 extern "C" uint32_t tdeck_gps_num_sats(void);
+// Internet door for apps (src/TDeckNet.cpp). net.fetch starts a Wi-Fi fetch that runs on the
+// main loop (never blocks the app); the app polls net.status()/net.body() on later frames.
+extern "C" bool tdeck_net_fetch(const char *url);
+extern "C" int tdeck_net_poll(void);
+extern "C" int tdeck_net_result(char *buf, int cap);
+extern "C" void tdeck_net_reset(void);
 // --- other firmware helpers ---------------------------------------------------
 void playBeep();                              // buzz.cpp (C++ linkage)
 extern "C" void tdeck_beep_gain(float gain);  // TDeckBeep.cpp — temporarily boost buzzer volume
@@ -44,6 +50,9 @@ extern "C" void tdeck_beep_gain(float gain);  // TDeckBeep.cpp — temporarily b
 extern "C" void tdeck_lua_app_stop(void); // defined below; used by tdeck_lua_app_start
 
 static lua_State *AppL = nullptr;
+// An app can set the global keep_back=true to keep the erase/Back key for itself (so a stray
+// press near its controls doesn't quit it). Read once at load; the keyboard driver checks it.
+static bool s_appKeepsBack = false;
 
 // Route ALL Lua allocations to PSRAM (the big 8MB pool) so apps never starve the
 // scarce internal RAM the mesh stack lives in — this is how the engine scales.
@@ -309,6 +318,57 @@ static int api_device_gps(lua_State *L)
     return 3;
 }
 
+// ---- net.* : fetch data from the internet over Wi-Fi, without freezing the app ----
+// Usage in an app (never blocks — poll from on_tick):
+//   net.fetch("https://api.open-meteo.com/...")   -- start; returns true if it began
+//   local s = net.status()                        -- "idle"/"working"/"done"/"error"
+//   if s == "done" then local text = net.body() ... end   -- body() also clears it
+// Wi-Fi has to be set up in Settings first; net.fetch returns false if it isn't. Bringing
+// Wi-Fi up drops Bluetooth until the next reboot (the radio can't do both) — see TDeckNet.cpp.
+static int api_net_fetch(lua_State *L)
+{
+    const char *url = luaL_checkstring(L, 1);
+    lua_pushboolean(L, tdeck_net_fetch(url));
+    return 1;
+}
+
+static int api_net_status(lua_State *L)
+{
+    static const char *names[4] = {"idle", "working", "done", "error"};
+    int s = tdeck_net_poll();
+    if (s < 0 || s > 3)
+        s = 0;
+    lua_pushstring(L, names[s]);
+    return 1;
+}
+
+// net.body() -> the fetched text once status is "done", else nil. Reading it clears the
+// result and frees the door for the next fetch. Uses a scratch PSRAM buffer so nothing big
+// sits in the scarce internal RAM.
+static int api_net_body(lua_State *L)
+{
+    char *buf = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        lua_pushnil(L);
+        return 1;
+    }
+    int n = tdeck_net_result(buf, 8192);
+    if (n <= 0)
+        lua_pushnil(L);
+    else
+        lua_pushlstring(L, buf, (size_t)n);
+    heap_caps_free(buf);
+    return 1;
+}
+
+// net.reset() -> drop a done/error result without reading it, so the app can retry cleanly.
+static int api_net_reset(lua_State *L)
+{
+    (void)L;
+    tdeck_net_reset();
+    return 0;
+}
+
 static void call_optional(const char *fn)
 {
     if (!AppL)
@@ -355,6 +415,11 @@ extern "C" int tdeck_lua_app_start(const char *script)
                                          {"gps", api_device_gps},
                                          {nullptr, nullptr}};
     static const luaL_Reg storeLib[] = {{"read", api_store_read}, {"write", api_store_write}, {nullptr, nullptr}};
+    static const luaL_Reg netLib[] = {{"fetch", api_net_fetch},
+                                      {"status", api_net_status},
+                                      {"body", api_net_body},
+                                      {"reset", api_net_reset},
+                                      {nullptr, nullptr}};
     static const luaL_Reg canvasLib[] = {{"begin", api_canvas_begin}, {"clear", api_canvas_clear},
                                          {"rect", api_canvas_rect},   {"pixel", api_canvas_pixel},
                                          {"line", api_canvas_line},   {"circle", api_canvas_circle},
@@ -366,6 +431,8 @@ extern "C" int tdeck_lua_app_start(const char *script)
     lua_setglobal(AppL, "device");
     luaL_newlib(AppL, storeLib);
     lua_setglobal(AppL, "store");
+    luaL_newlib(AppL, netLib);
+    lua_setglobal(AppL, "net");
     luaL_newlib(AppL, canvasLib);
     lua_setglobal(AppL, "canvas");
 
@@ -375,8 +442,20 @@ extern "C" int tdeck_lua_app_start(const char *script)
         return -2;
     }
 
+    // Does this app want to keep the Back/erase key? (e.g. a game whose controls sit next to it.)
+    lua_getglobal(AppL, "keep_back");
+    s_appKeepsBack = lua_toboolean(AppL, -1);
+    lua_pop(AppL, 1);
+
     call_optional("on_open");
     return 0;
+}
+
+// True when a Lua app is loaded and asked to keep the erase/Back key (keep_back=true). The
+// keyboard driver uses this: instead of quitting the app, erase is delivered as on_key("back").
+extern "C" bool tdeck_lua_app_keeps_back(void)
+{
+    return AppL != nullptr && s_appKeepsBack;
 }
 
 extern "C" void tdeck_lua_app_tick(uint32_t dt)
@@ -476,6 +555,7 @@ extern "C" void tdeck_lua_app_stop(void)
     call_optional("on_close");
     lua_close(AppL);
     AppL = nullptr;
+    s_appKeepsBack = false;
 }
 
 // ---- Stage-1 self-test (launcher shows "Lua:5050" if Lua runs on-device) ------

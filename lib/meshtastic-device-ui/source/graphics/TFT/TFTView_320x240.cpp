@@ -120,6 +120,9 @@ extern "C" void tdeck_wifi_scan_free(void);
 extern "C" bool tdeck_wifi_connect_now(const char *ssid, const char *psk);
 extern "C" void tdeck_wifi_disconnect_now(void);
 extern "C" bool tdeck_wifi_connected(void);
+// Shut Bluetooth down before Wi-Fi comes up (src/modules/AdminModule.cpp). One 2.4 GHz radio, and
+// the BT stack holds RAM that a TLS handshake needs. Safe to call when BT is already down.
+void disableBluetooth();
 // FTP file-share engine (TDeckFtp.cpp)
 extern "C" void tdeck_ftp_start(const char *user, const char *pass);
 extern "C" void tdeck_ftp_stop(void);
@@ -241,7 +244,7 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.07.22.3"
+#define TUI_VERSION "2026.08.05.1"
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -598,6 +601,18 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 12, 23, 6, 4, 0x0a84ff, 1);  // wings
         icBox(ic, 28, 23, 6, 4, 0x0a84ff, 1);
         icBox(ic, 21, 27, 4, 6, 0xff9f0a, 2);  // thruster
+    } else if (!strcmp(name, "Weather")) {
+        // A sun in the top-left with a few rays, and a white cloud drifting across it. The
+        // cloud is drawn AFTER the sun so it sits in front — "partly cloudy" in one glance.
+        icBox(ic, 6, 3, 15, 15, 0xffd60a, LV_RADIUS_CIRCLE); // sun disc
+        icBox(ic, 12, 0, 3, 2, 0xffd60a, 1);                 // rays around the top/left
+        icBox(ic, 1, 2, 3, 3, 0xffd60a, 1);
+        icBox(ic, 0, 10, 2, 3, 0xffd60a, 1);
+        icBox(ic, 23, 2, 3, 3, 0xffd60a, 1);
+        icBox(ic, 1, 18, 3, 3, 0xffd60a, 1);
+        icBox(ic, 15, 20, 28, 12, 0xf2f2f7, 6);               // cloud base
+        icBox(ic, 18, 14, 14, 14, 0xf2f2f7, LV_RADIUS_CIRCLE); // left puff
+        icBox(ic, 28, 16, 14, 13, 0xf2f2f7, LV_RADIUS_CIRCLE); // right puff
     } else if (!strcmp(name, "Flashlight")) { // bulb + rays
         icBox(ic, 17, 17, 12, 15, 0xffd60a, 4);
         icBox(ic, 19, 13, 8, 5, 0xfff3b0, 2);
@@ -734,6 +749,107 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
     } else { // fallback: a colored rounded square
         icBox(ic, 11, 8, 24, 24, color, 6);
     }
+}
+
+// Draw an app's OWN icon from a little text file it shipped (via Get Apps), so a brand-new app
+// can have an icon with NO firmware flash — the whole point of an open app store. Format of
+// /apps/<id>/icon.txt:
+//     X=RRGGBB        one palette line per colour: a single char, '=', then 6 hex digits
+//     ...picture...   then the picture, one line per row, ONE CHARACTER per pixel
+// A space, a '.', or any character with no palette entry is transparent. Grid up to 40x40; it
+// is scaled up whole-pixel to fill and is centred on the 46x40 tile-icon area. Returns false
+// (and draws nothing) if there's no file or it can't be parsed, so the caller falls back to the
+// built-in icon. Consecutive same-colour pixels in a row are merged into one box, so a full
+// icon is a few dozen objects, not hundreds.
+bool buildTileIconFromFile(lv_obj_t *tile, const char *path)
+{
+#if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+    FsFile f = SDFs.open(path, O_RDONLY);
+    if (!f)
+        return false;
+    static char buf[2560]; // a 40x40 grid plus its palette sits well under this
+    int n = (int)f.read((uint8_t *)buf, sizeof(buf) - 1);
+    f.close();
+    if (n <= 0)
+        return false;
+    buf[n] = 0;
+
+    uint32_t palColor[128] = {0};
+    bool palOpaque[128] = {false};
+    const char *rows[40];
+    int rowLen[40];
+    int rowCount = 0;
+    int width = 0;
+
+    char *p = buf;
+    while (*p && rowCount < 40) {
+        char *line = p;
+        while (*p && *p != '\n' && *p != '\r')
+            p++;
+        int llen = (int)(p - line);
+        while (*p == '\n' || *p == '\r') // terminate + step over the newline(s)
+            *p++ = 0;
+        if (llen == 0 || line[0] == '#')
+            continue;
+        if (llen >= 8 && line[1] == '=') { // palette entry "X=RRGGBB"
+            unsigned char c = (unsigned char)line[0];
+            if (c < 128) {
+                palColor[c] = (uint32_t)strtoul(line + 2, nullptr, 16);
+                palOpaque[c] = true;
+            }
+            continue;
+        }
+        rows[rowCount] = line; // a pixel row
+        rowLen[rowCount] = llen;
+        if (llen > width)
+            width = llen;
+        rowCount++;
+    }
+
+    if (rowCount == 0 || width == 0)
+        return false;
+    if (width > 46)
+        width = 46;
+    int height = rowCount;
+
+    int scale = 46 / width;         // fill the 46x40 area, whole pixels only
+    int sy = 40 / height;
+    if (sy < scale)
+        scale = sy;
+    if (scale < 1)
+        scale = 1;
+    int offX = (46 - width * scale) / 2; // centre it
+    int offY = (40 - height * scale) / 2;
+
+    lv_obj_t *ic = lv_obj_create(tile); // only now that we know the file is a valid icon
+    lv_obj_remove_style_all(ic);
+    lv_obj_set_size(ic, 46, 40);
+    lv_obj_align(ic, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_clear_flag(ic, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ic, LV_OBJ_FLAG_CLICKABLE);
+
+    for (int y = 0; y < height; y++) {
+        const char *row = rows[y];
+        int rlen = rowLen[y];
+        int x = 0;
+        while (x < width) {
+            unsigned char c = (x < rlen) ? (unsigned char)row[x] : ' ';
+            if (c >= 128 || !palOpaque[c]) { // transparent pixel
+                x++;
+                continue;
+            }
+            int runStart = x; // merge a run of the same char into one box
+            while (x < width && (x < rlen ? (unsigned char)row[x] : ' ') == c)
+                x++;
+            icBox(ic, offX + runStart * scale, offY + y * scale, (x - runStart) * scale, scale, palColor[c], 0);
+        }
+    }
+    return true;
+#else
+    (void)tile;
+    (void)path;
+    return false;
+#endif
 }
 } // namespace
 
@@ -1209,7 +1325,17 @@ void TFTView_320x240::buildAppGrid(void)
         lv_obj_add_event_cb(tile, tile_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         lv_obj_add_event_cb(tile, tile_long_cb, LV_EVENT_LONG_PRESSED, NULL);
 
-        buildTileIcon(tile, launchList[i].name, launchList[i].color);
+        // A user app may ship its own icon at /apps/<id>/icon.txt (delivered by Get Apps) — try
+        // that first, so new apps get an icon with no firmware flash. Fall back to the built-in
+        // name-based icon (and, past that, a plain coloured square) when there's no file.
+        bool drewIcon = false;
+        if (launchList[i].userIdx >= 0) {
+            char ip[80];
+            snprintf(ip, sizeof(ip), "/apps/%s/icon.txt", userAppDirs[launchList[i].userIdx]);
+            drewIcon = buildTileIconFromFile(tile, ip);
+        }
+        if (!drewIcon)
+            buildTileIcon(tile, launchList[i].name, launchList[i].color);
 
         lv_obj_t *lbl = lv_label_create(tile);
         lv_label_set_text(lbl, launchList[i].name);
@@ -3694,8 +3820,12 @@ uint8_t *getappsGet(const char *url, int *outLen)
     }
     HTTPClient http;
     http.setReuse(true);
-    http.setConnectTimeout(4000);
-    http.setTimeout(4000);
+    // 4 s was too short for a TLS handshake to GitHub Pages on this chip - Jake saw Get Apps fail
+    // "immediately" even with wi-fi already connected and working. The handshake, not the download,
+    // is the slow part, and it gets slower when memory is tight. Still bounded so a dead server
+    // can't freeze the UI task, just not so tight that a healthy server looks dead.
+    http.setConnectTimeout(12000);
+    http.setTimeout(12000);
     if (!http.begin(*getappsClient, url))
         return nullptr;
     if (http.GET() != HTTP_CODE_OK) {
@@ -3755,8 +3885,8 @@ bool getappsGetToFile(const char *url, const char *path, int *outLen)
     }
     HTTPClient http;
     http.setReuse(true);
-    http.setConnectTimeout(4000);
-    http.setTimeout(4000);
+    http.setConnectTimeout(12000); // same reasoning as getappsGet: the TLS handshake needs headroom
+    http.setTimeout(12000);
     if (!http.begin(*getappsClient, url))
         return false;
     if (http.GET() != HTTP_CODE_OK) {
@@ -3999,6 +4129,14 @@ bool TFTView_320x240::getappsInstall(int idx)
             nf.write((const uint8_t *)a.name, strlen(a.name));
             nf.close();
         }
+        // Best-effort: also grab the app's own icon if it ships one. A 404 just returns false
+        // (most apps won't have one) and the launcher falls back to a built-in icon. This is
+        // what lets any submitted app carry an icon without a firmware change.
+        char iurl[160], ipath[80];
+        snprintf(iurl, sizeof(iurl), "%sapps/%s/icon.txt", kGetAppsBaseUrl, a.id);
+        snprintf(ipath, sizeof(ipath), "/apps/%s/icon.txt", a.id);
+        int ilen = 0;
+        getappsGetToFile(iurl, ipath, &ilen);
         a.installed = true;
         a.outdated = false;
         strncpy(a.have, a.ver, sizeof(a.have) - 1);
@@ -4389,6 +4527,16 @@ void TFTView_320x240::openGetApps(void)
     bool already = tdeck_wifi_connected();
     getapps_own_wifi = !already;
     if (!already) {
+        // Shut Bluetooth down BEFORE wi-fi comes up. They share one 2.4 GHz radio, and the BT stack
+        // also holds the internal RAM a TLS handshake needs — which is why Get Apps could connect to
+        // wi-fi and then fail to fetch. Same cure already proven in TDeckNet.cpp. Latched: deinit on
+        // an already-down stack is pointless and a place double-frees could hide. BT stays down
+        // until the next reboot.
+        static bool s_getappsBtDown = false;
+        if (!s_getappsBtDown) {
+            disableBluetooth();
+            s_getappsBtDown = true;
+        }
         if (!tdeck_wifi_connect_now(db.config.network.wifi_ssid, db.config.network.wifi_psk)) {
             lv_label_set_text(getapps_status, "Set up Wi-Fi in Settings first");
             return;
