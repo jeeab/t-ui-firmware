@@ -123,6 +123,13 @@ extern "C" bool tdeck_wifi_connected(void);
 // Shut Bluetooth down before Wi-Fi comes up (src/modules/AdminModule.cpp). One 2.4 GHz radio, and
 // the BT stack holds RAM that a TLS handshake needs. Safe to call when BT is already down.
 void disableBluetooth();
+// The reserved run of internal RAM a TLS handshake needs (src/TDeckNet.cpp). Released just before
+// a secure fetch and taken back after, because by the time anyone opens Get Apps the heap is too
+// fragmented to find an unbroken 16KB anywhere.
+extern "C" void tdeck_tls_reserve_release(void);
+extern "C" void tdeck_tls_reserve_take(void);
+// Ask the allocator what size it actually failed on, instead of us inferring it (src/TDeckNet.cpp).
+extern "C" void tdeck_tls_report_alloc_fail(void);
 // FTP file-share engine (TDeckFtp.cpp)
 extern "C" void tdeck_ftp_start(const char *user, const char *pass);
 extern "C" void tdeck_ftp_stop(void);
@@ -244,7 +251,16 @@ extern const char *firmware_version;
 
 // Our launcher's own version, shown at the bottom of Settings. Bump this on every release and
 // keep it in step with t-ui-installer/manifest.json, so "what's on the device?" has an answer.
-#define TUI_VERSION "2026.08.05.1"
+// DIAGNOSTIC BUILD SWITCH. Comment this out for anything that ships: it makes the device run
+// the Get Apps fetch by itself at boot (and the version string say so, so a test build can
+// never be mistaken for a release on the Settings screen).
+// #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
+
+#ifdef GETAPPS_SELFTEST
+#define TUI_VERSION "2026.08.05.3-test"
+#else
+#define TUI_VERSION "2026.08.05.3"
+#endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
 lv_obj_t *TFTView_320x240::currentPanel = nullptr;
@@ -983,6 +999,12 @@ void TFTView_320x240::createLauncher(void)
         400, NULL);
     lv_timer_set_repeat_count(bootHome, 15); // ~6s of boot settling (the config-sync can load
                                              // main_screen a few seconds in), then stop
+
+#ifdef GETAPPS_SELFTEST
+    // Diagnostic builds only: exercise the Get Apps catalog fetch unattended, ~20s after boot,
+    // and log what happened. Never in a release build - see getappsSelfTest().
+    lv_timer_create([](lv_timer_t *) { THIS->getappsSelfTest(); }, 1000, NULL);
+#endif
 
 #if defined(INPUTDRIVER_ENCODER_TYPE)
     // Poll the trackball double-click flag (~16x/sec, runs forever) and run the gesture:
@@ -3805,6 +3827,11 @@ const char *kGetAppsCatalogUrl = "https://jeeab.github.io/t-ui/apps/catalog.json
 const char *kGetAppsBaseUrl = "https://jeeab.github.io/t-ui/";
 WiFiClientSecure *getappsClient = nullptr;
 
+// Why the last fetch failed, in a few characters, so the on-screen message can say which of the
+// five very different causes it hit. "Couldn't reach the app list" on its own sent us chasing the
+// wrong one twice. Short strings only — the status label is one line on a 320px screen.
+char getappsFail[24] = "";
+
 // Download a whole (small) file into PSRAM. Returns nullptr on any failure; the caller
 // frees with heap_caps_free. Timeouts are short on purpose: this runs on the UI task, so
 // a stalled server must fail fast rather than freeze the screen the way map tiles used to.
@@ -3814,6 +3841,9 @@ WiFiClientSecure *getappsClient = nullptr;
 // passed ~46 KB - not a size limit anywhere, just no single free run of PSRAM that big.
 uint8_t *getappsGet(const char *url, int *outLen)
 {
+    // Give the TLS handshake the contiguous internal RAM we set aside at boot. Without this
+    // the connection fails with mbedTLS -32512 even though plenty of memory is free overall.
+    tdeck_tls_reserve_release();
     if (!getappsClient) {
         getappsClient = new WiFiClientSecure();
         getappsClient->setInsecure(); // public, read-only content; no room for a CA bundle
@@ -3826,19 +3856,40 @@ uint8_t *getappsGet(const char *url, int *outLen)
     // can't freeze the UI task, just not so tight that a healthy server looks dead.
     http.setConnectTimeout(12000);
     http.setTimeout(12000);
-    if (!http.begin(*getappsClient, url))
+    // Every failure below used to return nullptr silently, so "Couldn't reach the app list"
+    // covered five completely different causes and told us nothing. The internal-heap figure is
+    // the one that matters most: a TLS handshake needs tens of KB of INTERNAL RAM (never PSRAM),
+    // and when Meshtastic's own wi-fi + web server are already up there may not be that much left.
+    ILOG_INFO("getapps: GET %s (after reserve release: free=%u, largest block=%u)", url,
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (!http.begin(*getappsClient, url)) {
+        ILOG_INFO("getapps: FAIL http.begin() - could not set up the connection");
+        strcpy(getappsFail, "connect setup");
         return nullptr;
-    if (http.GET() != HTTP_CODE_OK) {
+    }
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        // Negative codes are the client's own errors, not the server's: -1 connection refused/failed
+        // (a failed TLS handshake looks like this), -3 send failed, -11 timeout.
+        ILOG_INFO("getapps: FAIL http.GET() code=%d (internal heap free=%u)", code,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        tdeck_tls_report_alloc_fail();
+        snprintf(getappsFail, sizeof(getappsFail), "error %d", code);
         http.end();
         return nullptr;
     }
     int len = http.getSize();
     if (len <= 0 || len > 65536) { // a catalog or an app; anything bigger is wrong
+        ILOG_INFO("getapps: FAIL bad length=%d (chunked reply, or a body over 64KB)", len);
+        snprintf(getappsFail, sizeof(getappsFail), "bad size %d", len);
         http.end();
         return nullptr;
     }
     uint8_t *buf = (uint8_t *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
     if (!buf) {
+        ILOG_INFO("getapps: FAIL no PSRAM for %d bytes", len + 1);
+        strcpy(getappsFail, "out of memory");
         http.end();
         return nullptr;
     }
@@ -3864,9 +3915,12 @@ uint8_t *getappsGet(const char *url, int *outLen)
     }
     http.end();
     if (got != len) {
+        ILOG_INFO("getapps: FAIL short read, got %d of %d bytes", got, len);
+        strcpy(getappsFail, "download cut off");
         heap_caps_free(buf);
         return nullptr;
     }
+    ILOG_INFO("getapps: OK, %d bytes", len);
     buf[len] = 0; // the parser below is string-based
     *outLen = len;
     return buf;
@@ -3879,6 +3933,9 @@ uint8_t *getappsGet(const char *url, int *outLen)
 #if defined(ARDUINO_ARCH_ESP32) && HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
 bool getappsGetToFile(const char *url, const char *path, int *outLen)
 {
+    // Give the TLS handshake the contiguous internal RAM we set aside at boot. Without this
+    // the connection fails with mbedTLS -32512 even though plenty of memory is free overall.
+    tdeck_tls_reserve_release();
     if (!getappsClient) {
         getappsClient = new WiFiClientSecure();
         getappsClient->setInsecure(); // public, read-only content; no room for a CA bundle
@@ -4364,6 +4421,88 @@ void TFTView_320x240::getappsSetFilter(int which)
     getappsBuildList();
 }
 
+// Boot self-test (diagnostic builds only). Runs the SAME catalog fetch Get Apps runs, without
+// anybody tapping the screen, and logs every step to the serial console. It exists because the
+// failure only happens on the device: reproducing it needed a person to open Get Apps and read
+// a one-line message back, which is a very slow way to test a guess. This closes the loop.
+//
+// Ticks once a second on the LVGL task — the same task the real fetch runs on, so it reproduces
+// the true memory conditions rather than a friendlier version of them.
+void TFTView_320x240::getappsSelfTest(void)
+{
+#if defined(ARDUINO_ARCH_ESP32) && defined(GETAPPS_SELFTEST)
+    static int step = 0;
+    static uint32_t deadline = 0;
+    static int ticks = 0;
+
+    if (step < 0)
+        return; // finished
+
+    ticks++;
+    if (ticks < 20) // let the radio, wi-fi and UI settle first, like a real user would
+        return;
+
+    switch (step) {
+    case 0: {
+        ILOG_INFO("==== GETAPPS SELFTEST START ====");
+        ILOG_INFO("selftest: internal heap free=%u largest=%u, PSRAM free=%u",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        ILOG_INFO("selftest: bluetooth was %s", db.config.bluetooth.enabled ? "ENABLED in config" : "off in config");
+        disableBluetooth();
+        ILOG_INFO("selftest: after disableBluetooth() internal heap free=%u largest=%u",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        if (tdeck_wifi_connected()) {
+            ILOG_INFO("selftest: wi-fi ALREADY connected (this is the case that kept failing)");
+            step = 2;
+        } else {
+            ILOG_INFO("selftest: wi-fi not up; connecting to ssid='%s'", db.config.network.wifi_ssid);
+            if (!tdeck_wifi_connect_now(db.config.network.wifi_ssid, db.config.network.wifi_psk)) {
+                ILOG_INFO("selftest: RESULT no wi-fi configured - cannot test");
+                step = -1;
+                return;
+            }
+            deadline = lv_tick_get() + 25000;
+            step = 1;
+        }
+        return;
+    }
+    case 1: {
+        if (tdeck_wifi_connected()) {
+            ILOG_INFO("selftest: wi-fi connected");
+            step = 2;
+        } else if (lv_tick_get() > deadline) {
+            ILOG_INFO("selftest: RESULT wi-fi never connected");
+            step = -1;
+        }
+        return;
+    }
+    case 2: {
+        int len = 0;
+        getappsFail[0] = 0;
+        uint8_t *buf = getappsGet(kGetAppsCatalogUrl, &len);
+        if (buf) {
+            ILOG_INFO("selftest: RESULT SUCCESS - catalog fetched, %d bytes", len);
+            int n = getappsParseCatalog((const char *)buf, len);
+            ILOG_INFO("selftest: catalog parsed, %d apps", n);
+            tdeck_tls_report_alloc_fail(); // did anything ELSE fail to allocate meanwhile?
+            heap_caps_free(buf);
+        } else {
+            ILOG_INFO("selftest: RESULT FAILED - reason '%s'", getappsFail);
+        }
+        ILOG_INFO("selftest: internal heap free=%u largest=%u after the attempt",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        ILOG_INFO("==== GETAPPS SELFTEST END ====");
+        step = -1;
+        return;
+    }
+    }
+#endif
+}
+
 // The pump: bring Wi-Fi up if we have to, then fetch the catalog once.
 void TFTView_320x240::getappsPump(void)
 {
@@ -4386,6 +4525,7 @@ void TFTView_320x240::getappsPump(void)
     lv_refr_now(NULL);
 
     int len = 0;
+    getappsFail[0] = 0;
     uint8_t *buf = getappsGet(kGetAppsCatalogUrl, &len);
     getapps_loaded = true; // one attempt per screen visit either way
     if (getapps_timer) {
@@ -4393,7 +4533,10 @@ void TFTView_320x240::getappsPump(void)
         getapps_timer = nullptr;
     }
     if (!buf) {
-        lv_label_set_text(getapps_status, "Couldn't reach the app list");
+        // Say WHICH failure, not just that there was one.
+        char m[64];
+        snprintf(m, sizeof(m), "Couldn't reach the app list%s%s", getappsFail[0] ? ": " : "", getappsFail);
+        lv_label_set_text(getapps_status, m);
         return;
     }
     int n = getappsParseCatalog((const char *)buf, len);
@@ -4434,6 +4577,10 @@ void TFTView_320x240::closeGetApps(void)
         tdeck_wifi_disconnect_now();
         getapps_own_wifi = false;
     }
+    // Claim the TLS block back now the secure client is gone, so the next visit has it too.
+    // Deliberately after `delete getappsClient` — that is what frees the handshake buffers, and
+    // taking the reserve before them would just fail.
+    tdeck_tls_reserve_take();
 #endif
 }
 
@@ -4526,17 +4673,21 @@ void TFTView_320x240::openGetApps(void)
 
     bool already = tdeck_wifi_connected();
     getapps_own_wifi = !already;
+
+    // Shut Bluetooth down BEFORE the fetch, whether or not we're the ones bringing wi-fi up. They
+    // share one 2.4 GHz radio, and the BT stack also holds the internal RAM a TLS handshake needs.
+    // This deliberately sits OUTSIDE the "we turned wi-fi on" branch: when wi-fi is enabled in
+    // Settings the device joins at boot, so `already` is true, the branch never runs, and the
+    // teardown never happened — which is exactly the case that was still failing. Latched, because
+    // deinit on an already-down stack is pointless and a place double-frees could hide. BT stays
+    // down until the next reboot.
+    static bool s_getappsBtDown = false;
+    if (!s_getappsBtDown) {
+        disableBluetooth();
+        s_getappsBtDown = true;
+    }
+
     if (!already) {
-        // Shut Bluetooth down BEFORE wi-fi comes up. They share one 2.4 GHz radio, and the BT stack
-        // also holds the internal RAM a TLS handshake needs — which is why Get Apps could connect to
-        // wi-fi and then fail to fetch. Same cure already proven in TDeckNet.cpp. Latched: deinit on
-        // an already-down stack is pointless and a place double-frees could hide. BT stays down
-        // until the next reboot.
-        static bool s_getappsBtDown = false;
-        if (!s_getappsBtDown) {
-            disableBluetooth();
-            s_getappsBtDown = true;
-        }
         if (!tdeck_wifi_connect_now(db.config.network.wifi_ssid, db.config.network.wifi_psk)) {
             lv_label_set_text(getapps_status, "Set up Wi-Fi in Settings first");
             return;

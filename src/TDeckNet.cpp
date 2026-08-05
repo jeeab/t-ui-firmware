@@ -35,6 +35,124 @@ extern "C" bool tdeck_wifi_connected(void);
 // Safe to call even if BT is already down (deinit is a no-op then).
 void disableBluetooth();
 
+// -----------------------------------------------------------------------------
+// The TLS memory reserve.
+//
+// Measured on Jake's device (2026-08-05): opening Get Apps failed with mbedTLS -32512,
+// "SSL - Memory allocation failed". At that moment there were 79332 bytes of internal RAM
+// free, but the largest single run of it was 16372 bytes. Not a leak and not a shortage: the
+// heap is simply chopped up by the time anyone opens Get Apps, and no amount of freeing things
+// afterwards puts a big enough run back together.
+//
+// How big a run does it need? Measured, not assumed -- the first two answers were both wrong.
+// Handing it a 25588-byte run STILL failed, which rules out the single 16KB record buffer and
+// points at the inbound and outbound buffers being taken together. tdeck_tls_watch_allocs()
+// below now makes the allocator state the real figure rather than us inferring it again.
+//
+// PSRAM cannot help. mbedTLS record buffers must live in internal RAM.
+//
+// So we take the block at the very start of setup(), while the heap is still one clean
+// stretch, and hand it back the moment a fetch needs it. Nothing else can take that run in
+// between. This costs a fixed slice of internal RAM while idle, which is the price of the
+// download working at all -- and it is given back for the duration of every fetch anyway.
+//
+// The cleaner long-term fix is CONFIG_MBEDTLS_DYNAMIC_BUFFER in sdkconfig, which frees the
+// record buffers between handshake phases. That is a full ESP-IDF rebuild and a much bigger
+// change than a fix for this bug warrants right now.
+// -----------------------------------------------------------------------------
+static void *s_tlsReserve = nullptr;
+static size_t s_tlsReserveBytes = 0;
+
+// What the heap was actually asked for when an allocation failed. Guessing the size TLS needs
+// has now been wrong twice (first "16KB", then "25KB is surely enough" - both failed), so let
+// the allocator report the real figure instead. The hook fires inside the failing allocation,
+// so it only records; the printing happens later from a safe place.
+static volatile size_t s_lastFailSize = 0;
+static volatile uint32_t s_lastFailCaps = 0;
+static volatile uint32_t s_failCount = 0;
+
+static void tlsAllocFailedHook(size_t size, uint32_t caps, const char *fn)
+{
+    (void)fn;
+    s_lastFailSize = size;
+    s_lastFailCaps = caps;
+    s_failCount++;
+}
+
+extern "C" void tdeck_tls_watch_allocs(void)
+{
+#if HAS_WIFI
+    heap_caps_register_failed_alloc_callback(tlsAllocFailedHook);
+#endif
+}
+
+// Print (and clear) whatever the last failed allocation was. Called after a failed fetch.
+extern "C" void tdeck_tls_report_alloc_fail(void)
+{
+#if HAS_WIFI
+    if (!s_failCount) {
+        LOG_INFO("tls: no allocation failure was recorded");
+        return;
+    }
+    LOG_INFO("tls: LAST FAILED ALLOC = %u bytes, caps=0x%08x, %u failure(s) total", (unsigned)s_lastFailSize,
+             (unsigned)s_lastFailCaps, (unsigned)s_failCount);
+    LOG_INFO("tls: largest internal block available was %u", (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    s_failCount = 0;
+#endif
+}
+
+// NOTE: this runs as the FIRST statement of setup(), which means the serial console does not
+// exist yet. It must not log. An earlier version called LOG_INFO here and every boot died in
+// RedirectablePrint with a LoadProhibited on a near-null address (EXCVADDR 0x114c) before a
+// single line of output existed. Record the size and let a later caller report it.
+extern "C" void tdeck_tls_reserve_init(void)
+{
+#if HAS_WIFI
+    if (s_tlsReserve)
+        return;
+    // Step down rather than give up: a smaller reserve still helps, and failing to boot over
+    // this would be far worse than a slow download.
+    // Measured on hardware: a 25,588-byte run FAILS, a 47,092-byte run SUCCEEDS. The handshake
+    // takes its inbound and outbound record buffers together (~16.7KB each, so ~34KB). 36KB is
+    // the smallest reserve that clears that with margin -- every KB beyond it is taken from the
+    // mesh stack for the 99% of the time no download is running.
+    static const size_t kTry[] = {36 * 1024, 32 * 1024, 28 * 1024};
+    for (size_t i = 0; i < sizeof(kTry) / sizeof(kTry[0]); i++) {
+        s_tlsReserve = heap_caps_malloc(kTry[i], MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_tlsReserve) {
+            s_tlsReserveBytes = kTry[i];
+            return;
+        }
+    }
+    s_tlsReserveBytes = 0;
+#endif
+}
+
+// Hand the block back so a TLS handshake can have it. Safe to call when it's already released.
+extern "C" void tdeck_tls_reserve_release(void)
+{
+#if HAS_WIFI
+    if (!s_tlsReserve) {
+        LOG_INFO("tls reserve: nothing held (reserve was %u bytes)", (unsigned)s_tlsReserveBytes);
+        return;
+    }
+    heap_caps_free(s_tlsReserve);
+    s_tlsReserve = nullptr;
+    // Safe to log here: this only runs from the UI, long after the console is up.
+    LOG_INFO("tls reserve: released %u bytes, largest internal block now %u", (unsigned)s_tlsReserveBytes,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#endif
+}
+
+// Take it back once the download is done, so the next one has it too. Best-effort: if the
+// heap is busy right now we simply go without, and try again after the following fetch.
+extern "C" void tdeck_tls_reserve_take(void)
+{
+#if HAS_WIFI
+    tdeck_tls_reserve_init();
+#endif
+}
+
 enum NetState { NET_IDLE = 0, NET_START, NET_CONNECTING, NET_FETCH, NET_DONE, NET_ERROR };
 
 static volatile int s_state = NET_IDLE;

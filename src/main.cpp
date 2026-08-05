@@ -342,8 +342,16 @@ void printInfo()
     LOG_INFO("S:B:%d,%s,%s,%s", HW_VENDOR, optstr(APP_VERSION), optstr(APP_ENV), optstr(APP_REPO));
 }
 #ifndef PIO_UNIT_TESTING
+// Hold one contiguous block of internal RAM aside for TLS. See tdeck_tls_reserve_init() in
+// src/TDeckNet.cpp for why this has to happen here, before anything else has run.
+extern "C" void tdeck_tls_reserve_init(void);
+
 void setup()
 {
+    // FIRST, before any other allocation: claim the block a TLS handshake will need later.
+    // Nothing has fragmented the heap yet, so this is the only moment a run of internal RAM
+    // this large is guaranteed to exist.
+    tdeck_tls_reserve_init();
 
     // initialize power HAL layer as early as possible
     powerHAL_init();
@@ -1287,6 +1295,8 @@ extern "C" void tdeck_clock_service(void);
 // T-Deck launcher "internet door" for Lua apps: runs an app's Wi-Fi fetch (BT teardown, join,
 // HTTP) as a non-blocking state machine on this safe thread. Defined in src/TDeckNet.cpp.
 extern "C" void tdeck_net_service(void);
+// Watch for failed heap allocations so a failed secure download can say what size it wanted.
+extern "C" void tdeck_tls_watch_allocs(void);
 // T-Deck launcher Time zone: apply + persist a pending zone change from this (main) thread.
 // Writing settings to flash from the UI task froze the device. Defined in TDeckTimeZone.cpp.
 extern "C" void tdeck_tz_service(void);
@@ -1308,6 +1318,11 @@ void loop()
     tdeck_sound_service();
     tdeck_clock_service();
     tdeck_net_service();
+    static bool s_allocWatchArmed = false;
+    if (!s_allocWatchArmed) { // console is up by the time loop() runs, unlike setup()
+        s_allocWatchArmed = true;
+        tdeck_tls_watch_allocs();
+    }
     tdeck_tz_service();
     tdeck_channel_import_service();
 

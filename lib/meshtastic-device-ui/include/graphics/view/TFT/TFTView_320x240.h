@@ -367,6 +367,7 @@ class TFTView_320x240 : public MeshtasticView
     void openGetApps(void);
     void closeGetApps(void); // hand back Wi-Fi + the TLS client on leaving, by any route
     void getappsPump(void); // connect Wi-Fi, then fetch the catalog once
+    void getappsSelfTest(void); // GETAPPS_SELFTEST builds only: run that fetch at boot, unattended
     void getappsBuildList(void);
     void getappsScheduleRebuild(void); // rebuild rows after the current event, not during it
     int getappsParseCatalog(const char *json, int len);
