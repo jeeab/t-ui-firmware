@@ -160,6 +160,13 @@ static volatile bool s_pending = false; // a fresh request from the app task
 static char s_url[256];
 static uint32_t s_deadline = 0;
 static char *s_body = nullptr; // PSRAM; holds the response body while NET_DONE
+// Did WE bring wi-fi up, or was it already on? Get Apps has always checked this and reused an
+// existing connection; this door did not, and tore wi-fi down and back up for EVERY fetch. With
+// wi-fi enabled in Settings that meant fighting the firmware's own connection manager, two full
+// reconnects per Weather refresh (it fetches twice: where are you, then what's the weather), and
+// the reconnect flapping seen in the logs. Only disconnect what we opened.
+static bool s_ownWifi = false;
+static uint32_t s_dropAt = 0; // if we own wi-fi, when to drop it if no further fetch arrives
 static volatile int s_bodyLen = 0;
 static const int kNetMaxBody = 8192; // app responses are small (weather JSON ~1-2KB)
 
@@ -252,6 +259,12 @@ static WiFiClientSecure *s_client = nullptr;
 // with short timeouts, so it can't wedge the loop for long. Mirrors getappsGet.
 static bool netHttpGet(const char *url)
 {
+    // Hand the TLS handshake the contiguous block reserved at boot. This is the SAME mbedTLS
+    // -32512 failure that broke Get Apps, and it bit here too: the reserve was added for the
+    // Get Apps download path in TFTView and this second, separate download path -- the one every
+    // Lua app uses -- was left without it. Get Apps worked, the Weather app starved.
+    // If a fetch path does TLS, it releases the reserve first. There are only these two.
+    tdeck_tls_reserve_release();
     if (!s_client) {
         s_client = new WiFiClientSecure();
         s_client->setInsecure(); // public, read-only APIs; no room for a CA bundle
@@ -297,6 +310,18 @@ static bool netHttpGet(const char *url)
 extern "C" void tdeck_net_service(void)
 {
 #if HAS_WIFI
+    // Drop a connection WE opened once nothing has needed it for a while. Never touches a
+    // connection someone else owns.
+    if (s_dropAt && (int32_t)(millis() - s_dropAt) > 0 && s_state != NET_START && s_state != NET_CONNECTING &&
+        s_state != NET_FETCH) {
+        s_dropAt = 0;
+        if (s_ownWifi) {
+            LOG_INFO("net: dropping the wi-fi we brought up");
+            tdeck_wifi_disconnect_now();
+            s_ownWifi = false;
+        }
+    }
+
     if (s_pending && (s_state == NET_IDLE || s_state == NET_DONE || s_state == NET_ERROR)) {
         s_pending = false;
         s_state = NET_START;
@@ -312,12 +337,23 @@ extern "C" void tdeck_net_service(void)
             disableBluetooth();
             s_btDown = true;
         }
+        // Already connected? Use it. This is the common case -- wi-fi set up in Settings means
+        // the device joins at boot -- and it turns a ~10s round trip into an immediate one.
+        // Deliberately does NOT clear s_ownWifi: if this is our own connection still inside its
+        // grace period, we must stay responsible for closing it.
+        if (tdeck_wifi_connected()) {
+            LOG_INFO("net: wi-fi already up, reusing it");
+            s_dropAt = 0; // another fetch arrived; cancel any pending shutdown
+            s_state = NET_FETCH;
+            break;
+        }
         LOG_INFO("net: START, firmware wifi ssid='%s'", config.network.wifi_ssid);
         if (!tdeck_wifi_connect_now(config.network.wifi_ssid, config.network.wifi_psk)) {
             LOG_INFO("net: connect_now failed (no ssid on the firmware side?)");
             s_state = NET_ERROR;
             break;
         }
+        s_ownWifi = true;              // we opened it, so we close it
         s_deadline = millis() + 15000; // give the join up to 15s
         s_state = NET_CONNECTING;
         break;
@@ -336,9 +372,23 @@ extern "C" void tdeck_net_service(void)
     }
     case NET_FETCH: {
         bool ok = netHttpGet(s_url);
-        tdeck_wifi_disconnect_now(); // done with Wi-Fi; power it back down
+        // Only close what we opened, and not immediately: an app that fetches twice in a row
+        // (Weather asks where you are, then what the weather is) would otherwise pay for a full
+        // reconnect in between. Hold it briefly instead; the grace period below drops it.
+        if (s_ownWifi)
+            s_dropAt = millis() + 20000;
         s_state = ok ? NET_DONE : NET_ERROR;
         LOG_INFO("net: result = %s", ok ? "DONE" : "FAILED");
+        if (!ok)
+            tdeck_tls_report_alloc_fail(); // say WHICH allocation failed, not just that it did
+        // Drop the secure client and reclaim the reserve for the next fetch. Deleting it first
+        // matters: the handshake buffers are held BY the client, so re-reserving before it's gone
+        // would just fail and leave the following fetch to starve the same way.
+        if (s_client) {
+            delete s_client;
+            s_client = nullptr;
+        }
+        tdeck_tls_reserve_take();
         break;
     }
     default:

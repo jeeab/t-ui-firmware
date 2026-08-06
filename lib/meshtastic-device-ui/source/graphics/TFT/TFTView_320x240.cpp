@@ -257,9 +257,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.08.05.3-test"
+#define TUI_VERSION "2026.08.05.5-test"
 #else
-#define TUI_VERSION "2026.08.05.3"
+#define TUI_VERSION "2026.08.05.5"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -3196,6 +3196,11 @@ void mapdlTilePath(char *buf, size_t cap, uint8_t z, uint32_t x, uint32_t y)
 bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
 {
     if (!mapdlClient) {
+        // Third door onto the same problem. A TLS handshake needs one unbroken ~34KB run of
+        // internal RAM, and by the time anyone downloads a map the heap is in pieces. Released
+        // here rather than per-tile because this client is built once and kept alive across the
+        // whole download; mapdlStop() takes the reserve back when it's deleted.
+        tdeck_tls_reserve_release();
         mapdlClient = new WiFiClientSecure();
         mapdlClient->setInsecure(); // public map data; no room for a CA bundle
     }
@@ -3705,6 +3710,7 @@ void TFTView_320x240::mapdlStop(bool finished)
     if (mapdlClient) { // free the TLS heap (~45KB) the moment we're done with it
         delete mapdlClient;
         mapdlClient = nullptr;
+        tdeck_tls_reserve_take(); // and put the reserve back, now those buffers are gone
     }
     if (mapdl_own_wifi && mapdl_wifi_up)
         tdeck_wifi_disconnect_now();

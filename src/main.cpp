@@ -1295,6 +1295,72 @@ extern "C" void tdeck_clock_service(void);
 // T-Deck launcher "internet door" for Lua apps: runs an app's Wi-Fi fetch (BT teardown, join,
 // HTTP) as a non-blocking state machine on this safe thread. Defined in src/TDeckNet.cpp.
 extern "C" void tdeck_net_service(void);
+
+// DIAGNOSTIC ONLY - comment out for anything that ships.
+// Runs the app internet door exactly the way the Weather app does: two fetches back to back
+// (where am I, then what's the weather) and times each half. Weather felt slow because the door
+// tore wi-fi down between them; this measures whether reusing the connection actually fixed it,
+// with nobody tapping the screen. Same pattern as GETAPPS_SELFTEST.
+// #define NETDOOR_SELFTEST 1   <-- diagnostics OFF for release
+#ifdef NETDOOR_SELFTEST
+extern "C" bool tdeck_net_fetch(const char *url);
+extern "C" int tdeck_net_poll(void);
+extern "C" int tdeck_net_result(char *buf, int cap);
+static void netDoorSelfTest()
+{
+    static int step = 0;
+    static uint32_t t0 = 0, tStart = 0;
+    static char buf[600];
+    if (step < 0 || millis() < 25000) // let wi-fi and the mesh settle, like a real user would
+        return;
+    switch (step) {
+    case 0:
+        LOG_INFO("==== NET DOOR SELFTEST START ====");
+        tStart = t0 = millis();
+        if (!tdeck_net_fetch("https://ipapi.co/latlong/")) {
+            LOG_INFO("selftest: fetch 1 refused - no wi-fi configured?");
+            step = -1;
+            return;
+        }
+        step = 1;
+        return;
+    case 1: {
+        const int s = tdeck_net_poll();
+        if (s == 2) {
+            const int n = tdeck_net_result(buf, sizeof(buf));
+            LOG_INFO("selftest: fetch 1 (location) took %u ms, %d bytes: %s", (unsigned)(millis() - t0), n, buf);
+            t0 = millis();
+            if (!tdeck_net_fetch("https://api.open-meteo.com/v1/forecast?latitude=47.6&longitude=-122.3&current=temperature_2m")) {
+                LOG_INFO("selftest: fetch 2 refused");
+                step = -1;
+                return;
+            }
+            step = 2;
+        } else if (s == 3) {
+            LOG_INFO("selftest: fetch 1 FAILED after %u ms", (unsigned)(millis() - t0));
+            step = -1;
+        }
+        return;
+    }
+    case 2: {
+        const int s = tdeck_net_poll();
+        if (s == 2) {
+            const int n = tdeck_net_result(buf, sizeof(buf));
+            // THIS is the number that matters: before the fix, fetch 2 paid for a full wi-fi
+            // reconnect because the door had just switched wi-fi off.
+            LOG_INFO("selftest: fetch 2 (weather) took %u ms, %d bytes", (unsigned)(millis() - t0), n);
+            LOG_INFO("selftest: BOTH fetches took %u ms total", (unsigned)(millis() - tStart));
+            LOG_INFO("==== NET DOOR SELFTEST END ====");
+            step = -1;
+        } else if (s == 3) {
+            LOG_INFO("selftest: fetch 2 FAILED after %u ms", (unsigned)(millis() - t0));
+            step = -1;
+        }
+        return;
+    }
+    }
+}
+#endif
 // Watch for failed heap allocations so a failed secure download can say what size it wanted.
 extern "C" void tdeck_tls_watch_allocs(void);
 // T-Deck launcher Time zone: apply + persist a pending zone change from this (main) thread.
@@ -1318,6 +1384,9 @@ void loop()
     tdeck_sound_service();
     tdeck_clock_service();
     tdeck_net_service();
+#ifdef NETDOOR_SELFTEST
+    netDoorSelfTest();
+#endif
     static bool s_allocWatchArmed = false;
     if (!s_allocWatchArmed) { // console is up by the time loop() runs, unlike setup()
         s_allocWatchArmed = true;
