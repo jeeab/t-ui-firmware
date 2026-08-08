@@ -233,6 +233,30 @@ class TFTView_320x240 : public MeshtasticView
     void openPinsList(void);
     void closePinsList(void);
     void deletePin(uint32_t id);
+
+    // ---- Maps app: mesh nodes drawn on OUR map, not just the Meshtastic one ----
+    // Jake, 2026-08-07: "on my tdeck maps (the ones not in meshtastic app) im not seeing other
+    // nodes". They were never there — node positions only ever went to the mesh map (`map`), and
+    // the Maps app (`userMap`) only ever drew your own position and your pins.
+    struct NodeMarker {
+        uint32_t nodeNum;
+        lv_obj_t *marker;   // dot on the map (child of maps_map_container)
+        lv_obj_t *labelObj; // short name beside it
+    };
+    // Keyed by the id handed to userMap so the draw callback is a hash lookup, not a scan — a
+    // busy mesh has enough nodes that a linear search per marker per redraw would show.
+    std::unordered_map<uint32_t /*markerId*/, NodeMarker> nodeMarkers;
+    std::unordered_map<uint32_t /*nodeNum*/, uint32_t /*markerId*/> nodeMarkerIdByNode;
+    // Marker ids live in a range pins can never reach (pins count up from 1 and are saved by id),
+    // so the two kinds of marker can share userMap's id space without ever colliding.
+    static constexpr uint32_t kNodeMarkerIdBase = 0xF0000000;
+    uint32_t nextNodeMarkerId = kNodeMarkerIdBase;
+    bool showNodesOnUserMap = true;
+    std::function<void(uint32_t, uint16_t, uint16_t, uint8_t)> drawNodeCB;
+    void addOrUpdateUserMapNode(uint32_t nodeNum, float lat, float lon);
+    void drawAllNodesOnUserMap(void);      // attach every already-known node when the app opens
+    void setShowNodesOnUserMap(bool on);   // the Nodes toggle in the Pins list
+    void removeUserMapNode(uint32_t nodeNum);
     void centerOnPin(uint32_t id);
     void renamePin(uint32_t id, const char *name);
     void openRenamePin(uint32_t id);

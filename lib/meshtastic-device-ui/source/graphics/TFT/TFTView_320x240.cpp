@@ -3014,8 +3014,9 @@ void TFTView_320x240::openMaps(void)
             userMap->setZoom(3);
         }
 
-        loadPins();    // read saved pins from SD (once per boot)
-        drawAllPins(); // attach them to our map
+        loadPins();              // read saved pins from SD (once per boot)
+        drawAllPins();           // attach them to our map
+        drawAllNodesOnUserMap(); // and every mesh node we already have a position for
         // Tell the user what came back from the card (temporary, while we chase the bug):
         // "N pins loaded" vs "no saved pins found" pinpoints save-vs-load at a glance.
         {
@@ -4788,6 +4789,137 @@ void TFTView_320x240::drawAllPins(void)
         userMap->add(p.id, p.lat, p.lon, drawPinCB);
 }
 
+// ---- Mesh nodes on the Maps app -------------------------------------------------------------
+// Node positions have always arrived here (addOrUpdateMap gets every one), but they were only ever
+// handed to the Meshtastic mesh map. The Maps app drew your own dot and your pins and nothing else,
+// which is why Jake could stare at his topo map and never see anybody. Same machinery as the pins,
+// pointed at the other map.
+//
+// Drawn deliberately unlike a pin: a hollow ring rather than a filled dot, in the node's own colour.
+// On a topo tile you need to tell "somebody is here" from "I marked this", at a glance, in the rain.
+void TFTView_320x240::addOrUpdateUserMapNode(uint32_t nodeNum, float lat, float lon)
+{
+    if (!userMap || !showNodesOnUserMap)
+        return;
+
+    auto existing = nodeMarkerIdByNode.find(nodeNum);
+    if (existing != nodeMarkerIdByNode.end()) {
+        userMap->update(existing->second, lat, lon);
+        return;
+    }
+
+    if (!drawNodeCB) {
+        drawNodeCB = [this](uint32_t id, uint16_t x, uint16_t y, uint8_t zoom) {
+            auto it = nodeMarkers.find(id);
+            if (it == nodeMarkers.end() || !it->second.marker)
+                return;
+            NodeMarker &n = it->second;
+            if (!x && !y && !zoom) { // off-screen or filtered out
+                lv_obj_add_flag(n.marker, LV_OBJ_FLAG_HIDDEN);
+                if (n.labelObj)
+                    lv_obj_add_flag(n.labelObj, LV_OBJ_FLAG_HIDDEN);
+                return;
+            }
+            lv_obj_clear_flag(n.marker, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(n.marker);
+            lv_obj_set_pos(n.marker, x - 7, y - 7); // 14x14 ring centred on the point
+            if (n.labelObj) {
+                lv_obj_clear_flag(n.labelObj, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(n.labelObj);
+                lv_obj_set_pos(n.labelObj, x + 10, y - 8);
+            }
+        };
+    }
+
+    uint32_t bgColor, fgColor;
+    std::tie(bgColor, fgColor) = nodeColor(nodeNum);
+
+    NodeMarker n{};
+    n.nodeNum = nodeNum;
+
+    // The ring: transparent middle, thick coloured edge, so the terrain underneath stays readable.
+    n.marker = lv_obj_create(maps_map_container);
+    lv_obj_remove_style_all(n.marker);
+    lv_obj_set_size(n.marker, 14, 14);
+    lv_obj_set_style_radius(n.marker, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(n.marker, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_color(n.marker, lv_color_hex(bgColor), LV_PART_MAIN);
+    lv_obj_set_style_border_width(n.marker, 3, LV_PART_MAIN);
+    lv_obj_set_style_outline_color(n.marker, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_outline_width(n.marker, 1, LV_PART_MAIN);
+    lv_obj_set_style_outline_opa(n.marker, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_add_flag(n.marker, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(n.marker, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(n.marker, LV_OBJ_FLAG_CLICKABLE);
+
+    // Short name, taken from the node panel the rest of the UI already built.
+    const char *shortName = "";
+    auto np = nodes.find(nodeNum);
+    if (np != nodes.end() && np->second)
+        shortName = lv_label_get_text(np->second->LV_OBJ_IDX(node_lbs_idx));
+    n.labelObj = makePinLabel(shortName, bgColor);
+
+    uint32_t markerId = nextNodeMarkerId++;
+    nodeMarkers[markerId] = n;
+    nodeMarkerIdByNode[nodeNum] = markerId;
+    userMap->add(markerId, lat, lon, drawNodeCB);
+}
+
+// Attach every node we already know a position for. Called when the Maps app is built, because
+// most positions arrive long before the app is ever opened.
+void TFTView_320x240::drawAllNodesOnUserMap(void)
+{
+    if (!userMap || !showNodesOnUserMap)
+        return;
+    for (auto &it : nodeObjects) {
+        lv_obj_t *p = nodes[it.first];
+        if (!p)
+            continue;
+        float lat = 1e-7 * (long)p->LV_OBJ_IDX(node_pos1_idx)->user_data;
+        float lon = 1e-7 * (long)p->LV_OBJ_IDX(node_pos2_idx)->user_data;
+        if (lat == 0 && lon == 0)
+            continue;
+        addOrUpdateUserMapNode(it.first, lat, lon);
+    }
+}
+
+void TFTView_320x240::removeUserMapNode(uint32_t nodeNum)
+{
+    auto idIt = nodeMarkerIdByNode.find(nodeNum);
+    if (idIt == nodeMarkerIdByNode.end())
+        return;
+    uint32_t markerId = idIt->second;
+    if (userMap)
+        userMap->remove(markerId);
+    auto mIt = nodeMarkers.find(markerId);
+    if (mIt != nodeMarkers.end()) {
+        if (mIt->second.marker)
+            lv_obj_delete(mIt->second.marker);
+        if (mIt->second.labelObj)
+            lv_obj_delete(mIt->second.labelObj);
+        nodeMarkers.erase(mIt);
+    }
+    nodeMarkerIdByNode.erase(idIt);
+}
+
+// The Nodes switch. Off tears every marker down rather than hiding them, so a busy mesh costs
+// nothing at all when you've turned it off to read the terrain.
+void TFTView_320x240::setShowNodesOnUserMap(bool on)
+{
+    if (showNodesOnUserMap == on)
+        return;
+    showNodesOnUserMap = on;
+    if (on) {
+        drawAllNodesOnUserMap();
+    } else {
+        while (!nodeMarkerIdByNode.empty())
+            removeUserMapNode(nodeMarkerIdByNode.begin()->first);
+    }
+    savePins(); // the setting rides along in the pins file
+    if (userMap)
+        userMap->forceRedraw(true);
+}
+
 void TFTView_320x240::dropPinAt(float lat, float lon)
 {
     if (!userMap)
@@ -4840,6 +4972,11 @@ bool TFTView_320x240::savePins(void)
     if (!f)
         return false;
     char line[112];
+    // The Nodes-on-map switch rides along here rather than in the protobuf config — one line, and
+    // the old parser already skips anything that doesn't start with "<number>|", so a file written
+    // by this build still loads on a build that predates it.
+    snprintf(line, sizeof(line), "#nodes|%u\n", showNodesOnUserMap ? 1u : 0u);
+    f.print(line);
     for (auto &p : mapPins) {
         snprintf(line, sizeof(line), "%u|%.6f|%.6f|%u|%u|%s\n", (unsigned)p.id, p.lat, p.lon, (unsigned)p.color,
                  (unsigned)p.whenEpoch, p.label);
@@ -4871,6 +5008,12 @@ void TFTView_320x240::loadPins(void)
     }
     char line[160];
     while (f.fgets(line, sizeof(line)) > 0) { // SdFat line reader (keeps the trailing newline)
+        // Settings line written by savePins(); everything else in the file is a pin.
+        if (line[0] == '#') {
+            if (!strncmp(line, "#nodes|", 7))
+                showNodesOnUserMap = (line[7] != '0');
+            continue;
+        }
         // Parse "id|lat|lon|color|when|label" WITHOUT scanf %f. THE PINS BUG: on this
         // ESP32's newlib-nano, scanf's float conversion is compiled out, so sscanf("%f")
         // silently failed and EVERY saved pin was dropped on load (the file was fine — the
@@ -4995,6 +5138,29 @@ void TFTView_320x240::openPinsList(void)
     lv_obj_set_style_text_font(al, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(al, "Add pin");
     lv_obj_set_style_text_color(al, lv_color_hex(0x000000), LV_PART_MAIN);
+
+    // Mesh nodes on/off. It lives here because this overlay is already "what gets drawn on my map",
+    // and the top bar has no room left. Off by choice matters: on a busy mesh a few dozen rings will
+    // bury the terrain the tiles were downloaded for.
+    {
+        // Header row, in the gap between the "Pins" title and "Add pin" — the list body starts at
+        // y=42, so anything lower would sit on top of it.
+        lv_obj_t *nodesBtn = lv_btn_create(pins_overlay);
+        lv_obj_set_size(nodesBtn, 92, 28);
+        lv_obj_align(nodesBtn, LV_ALIGN_TOP_LEFT, 56, 6);
+        lv_obj_set_style_bg_color(nodesBtn, lv_color_hex(showNodesOnUserMap ? 0x0a84ff : 0x3a3a3c), LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            nodesBtn,
+            [](lv_event_t *) {
+                THIS->setShowNodesOnUserMap(!THIS->showNodesOnUserMap);
+                lv_async_call([](void *) { THIS->openPinsList(); }, nullptr); // rebuild so the label flips
+            },
+            LV_EVENT_CLICKED, NULL);
+        lv_obj_t *nl = lv_label_create(nodesBtn);
+        lv_obj_set_style_text_font(nl, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(nl, showNodesOnUserMap ? "Nodes: ON" : "Nodes: OFF");
+        lv_obj_center(nl);
+    }
     lv_obj_center(al);
 
     lv_obj_t *list = lv_obj_create(pins_overlay);
@@ -9135,6 +9301,9 @@ void TFTView_320x240::addOrUpdateMap(uint32_t nodeNum, int32_t lat, int32_t lon)
             map->update(it->first, lat * 1e-7, lon * 1e-7);
         }
     }
+    // Same position, also onto OUR map. This is the one line that was missing — every node
+    // position already funnels through here, it just never reached the Maps app.
+    addOrUpdateUserMapNode(nodeNum, lat * 1e-7, lon * 1e-7);
 }
 
 void TFTView_320x240::removeFromMap(uint32_t nodeNum)
@@ -9151,6 +9320,7 @@ void TFTView_320x240::removeFromMap(uint32_t nodeNum)
     nodeObjects.erase(nodeNum);
     lv_obj_remove_event_cb(img, ui_event_mapNodeButton);
     lv_obj_delete(img);
+    removeUserMapNode(nodeNum); // take its ring off the Maps app too, or it hangs there forever
 }
 
 void TFTView_320x240::ui_event_mesh_detector(lv_event_t *e)
