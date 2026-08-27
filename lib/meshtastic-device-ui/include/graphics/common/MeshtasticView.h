@@ -134,6 +134,9 @@ class MeshtasticView : public DeviceGUI
     virtual void handleResponse(uint32_t from, uint32_t id, const meshtastic_Routing &routing, const meshtastic_MeshPacket &p) {}
     virtual void handleResponse(uint32_t from, uint32_t id, const meshtastic_RouteDiscovery &route) {}
     virtual void handlePositionResponse(uint32_t from, uint32_t request_id, int32_t rx_rssi, float rx_snr, bool isNeighbor) {}
+    // A waypoint somebody else shared. An expire time in the past is the mesh's way of retracting
+    // one, so this handles both "here's a pin" and "please drop that pin".
+    virtual void handleWaypoint(uint32_t from, uint8_t ch, const meshtastic_Waypoint &wp) {}
     virtual void packetReceived(const meshtastic_MeshPacket &p);
     virtual void newMessage(uint32_t from, uint32_t to, uint8_t ch, const char *msg, uint32_t &msgtime, bool restore = false) {}
     virtual void restoreMessage(const LogMessage &msg) {}

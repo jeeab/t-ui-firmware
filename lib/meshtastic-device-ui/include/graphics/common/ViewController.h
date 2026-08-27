@@ -69,6 +69,9 @@ class ViewController
     virtual void removeTextMessages(uint32_t from, uint32_t to, uint8_t ch);
     virtual bool requestPosition(uint32_t to, uint8_t ch, uint32_t requestId);
     virtual void traceRoute(uint32_t to, uint8_t ch, uint8_t hopLimit, uint32_t requestId);
+    // Share a map pin as a standard mesh waypoint. `to` is a nodenum, or UINT32_MAX to put it out
+    // on `ch` for everybody. Retracting one is the same call with wp.expire already in the past.
+    virtual bool sendWaypoint(uint32_t to, uint8_t ch, uint8_t hopLimit, const meshtastic_Waypoint &wp);
 
     // helpers
     virtual bool sendAdminMessage(meshtastic_AdminMessage &config, uint32_t nodeId);

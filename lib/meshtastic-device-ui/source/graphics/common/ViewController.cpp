@@ -500,6 +500,20 @@ bool ViewController::requestPosition(uint32_t to, uint8_t ch, uint32_t requestId
                                    .want_ack = false}});
 }
 
+bool ViewController::sendWaypoint(uint32_t to, uint8_t ch, uint8_t hopLimit, const meshtastic_Waypoint &wp)
+{
+    ILOG_DEBUG("sending waypoint id=%u to=0x%08x ch=%u expire=%u", wp.id, to, (unsigned)ch, wp.expire);
+    meshtastic_Data_payload_t payload;
+    payload.size = pb_encode_to_bytes(payload.bytes, DATA_PAYLOAD_LEN, &meshtastic_Waypoint_msg, &wp);
+    if (!payload.size) {
+        ILOG_ERROR("Error encoding protobuf meshtastic_Waypoint!");
+        return false;
+    }
+    // requestId 0: the radio assigns the packet id. Nothing here waits on a reply, so there is no
+    // request to track — and adding one would leave an entry in the handler that never resolves.
+    return send(to, ch, hopLimit, 0, meshtastic_PortNum_WAYPOINT_APP, false, false, payload.bytes, payload.size);
+}
+
 void ViewController::traceRoute(uint32_t to, uint8_t ch, uint8_t hopLimit, uint32_t requestId)
 {
     meshtastic_RouteDiscovery request{};
@@ -961,6 +975,17 @@ bool ViewController::packetReceived(const meshtastic_MeshPacket &p)
             view->updateTime(position.time);
         } else {
             ILOG_ERROR("Error decoding protobuf meshtastic_Position!");
+            return false;
+        }
+        break;
+    }
+    case meshtastic_PortNum_WAYPOINT_APP: {
+        meshtastic_Waypoint waypoint;
+        if (pb_decode_from_bytes(p.decoded.payload.bytes, p.decoded.payload.size, &meshtastic_Waypoint_msg, &waypoint)) {
+            if (p.from != myNodeNum) // our own broadcast coming back around
+                view->handleWaypoint(p.from, p.channel, waypoint);
+        } else {
+            ILOG_ERROR("Error decoding protobuf meshtastic_Waypoint!");
             return false;
         }
         break;

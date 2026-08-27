@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <new> // std::nothrow, so a failed GUI allocation can't abort the boot
 #include <iomanip>
 #include <list>
 #include <locale>
@@ -257,9 +258,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.08.05.5-test"
+#define TUI_VERSION "2026.08.26.1-test"
 #else
-#define TUI_VERSION "2026.08.05.5"
+#define TUI_VERSION "2026.08.26.1"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -270,11 +271,39 @@ time_t TFTView_320x240::startTime = 0;
 uint32_t TFTView_320x240::pinKeys = 0;
 bool TFTView_320x240::screenLocked = false;
 bool TFTView_320x240::screenUnlockRequest = false;
+lv_obj_t *TFTView_320x240::share_overlay = nullptr;
+uint32_t TFTView_320x240::sharing_pin_id = 0;
+std::vector<TFTView_320x240::PendingRetract> TFTView_320x240::pendingRetracts;
+time_t TFTView_320x240::retractLastService = 0;
+lv_obj_t *TFTView_320x240::maps_marker_layer = nullptr;
+lv_obj_t *TFTView_320x240::maps_nodes_btn = nullptr;
+lv_obj_t *TFTView_320x240::maps_nodes_lbl = nullptr;
+lv_obj_t *TFTView_320x240::confirm_overlay = nullptr;
+uint32_t TFTView_320x240::confirm_pin_id = 0;
+uint32_t TFTView_320x240::confirm_dest = 0;
+uint8_t TFTView_320x240::confirm_kind = 0;
 
+// Hand the TLS reserve back. Declared here the same way tdeck_free_heap() above is.
+extern "C" void tdeck_tls_reserve_release(void);
+
+// Building the GUI is one ~16.5KB allocation that must come out of a single contiguous run of
+// internal RAM. The TLS reserve deliberately holds 36KB of exactly that from the first line of
+// setup(), which leaves this allocation sitting on a knife edge -- 8 bytes of growth was enough to
+// turn it into a boot loop (bad_alloc -> terminate -> abort, before the splash ever drew).
+//
+// So: never let that be fatal. If the run isn't there, give the reserve back and try again. The
+// cost is that Get Apps loses its head start and can hit the old fragmentation problem; the
+// alternative is a device that does not boot at all, which is not a trade worth making.
+// (Inlined into both overloads rather than shared in a helper: the constructor is private.)
 TFTView_320x240 *TFTView_320x240::instance(void)
 {
     if (!gui) {
-        gui = new TFTView_320x240(nullptr, DisplayDriverFactory::create(320, 240));
+        DisplayDriver *driver = DisplayDriverFactory::create(320, 240);
+        gui = new (std::nothrow) TFTView_320x240(nullptr, driver);
+        if (!gui) {
+            tdeck_tls_reserve_release();
+            gui = new (std::nothrow) TFTView_320x240(nullptr, driver);
+        }
     }
     return gui;
 }
@@ -282,7 +311,12 @@ TFTView_320x240 *TFTView_320x240::instance(void)
 TFTView_320x240 *TFTView_320x240::instance(const DisplayDriverConfig &cfg)
 {
     if (!gui) {
-        gui = new TFTView_320x240(&cfg, DisplayDriverFactory::create(cfg));
+        DisplayDriver *driver = DisplayDriverFactory::create(cfg);
+        gui = new (std::nothrow) TFTView_320x240(&cfg, driver);
+        if (!gui) {
+            tdeck_tls_reserve_release();
+            gui = new (std::nothrow) TFTView_320x240(&cfg, driver);
+        }
     }
     return gui;
 }
@@ -2723,6 +2757,21 @@ void TFTView_320x240::openMaps(void)
         // hold anywhere on the map to drop a pin at that geographic spot
         lv_obj_add_flag(maps_map_container, LV_OBJ_FLAG_CLICKABLE);
 
+        // Marker layer: same geometry as the tile container, sits on top of it, holds every pin,
+        // node ring, name tag and the "you are here" dot. It exists purely so that markers and
+        // tiles never fight over z-order - tiles are created and destroyed constantly as you pan,
+        // and they always land at the end of their parent's child list. It is created here, right
+        // after the container and before the top bar, so the bar and the cog stay above it.
+        // Not clickable and holding nothing clickable, so presses fall straight through to the
+        // container underneath and panning still works.
+        maps_marker_layer = lv_obj_create(maps_screen);
+        lv_obj_remove_style_all(maps_marker_layer);
+        lv_obj_set_pos(maps_marker_layer, 0, 32);
+        lv_obj_set_size(maps_marker_layer, 320, 208);
+        lv_obj_set_style_bg_opa(maps_marker_layer, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_clear_flag(maps_marker_layer, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(maps_marker_layer, LV_OBJ_FLAG_CLICKABLE);
+
         // Map attribution. TopPlusOpen is BKG open data under dl-de/by-2-0, which requires
         // credit wherever the tiles are displayed - so it belongs here on the device, not
         // only on the website. Kept small and out of the way, but always visible.
@@ -2919,6 +2968,38 @@ void TFTView_320x240::openMaps(void)
         lv_obj_align(maps_sats_label, LV_ALIGN_TOP_MID, 14, 9);
         maps_sats_timer = lv_timer_create([](lv_timer_t *) { THIS->updateMapsSats(); }, 1000, NULL);
 
+        // Nodes on/off, sitting over the map just above the cog. This is the only corner with
+        // room, and it puts "am I seeing other people" where you are actually looking when you
+        // wonder it. The Pins list keeps its copy of the switch; both drive the same setting.
+        maps_nodes_btn = lv_btn_create(maps_screen);
+        lv_obj_set_size(maps_nodes_btn, 80, 26);
+        lv_obj_align(maps_nodes_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -48);
+        lv_obj_set_style_radius(maps_nodes_btn, 13, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_nodes_btn, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            maps_nodes_btn,
+            [](lv_event_t *) {
+                THIS->setShowNodesOnUserMap(!THIS->showNodesOnUserMap);
+                THIS->updateMapsNodesBtn();
+                // Say what actually happened. "On" with nothing on screen is the confusing case,
+                // and it is usually not a fault: a node can only be drawn once it has sent a
+                // position, and plenty of nodes never do.
+                char msg[48];
+                if (!THIS->showNodesOnUserMap)
+                    snprintf(msg, sizeof(msg), "Nodes hidden");
+                else if (THIS->nodeMarkerIdByNode.empty())
+                    snprintf(msg, sizeof(msg), "Nodes on - none have sent a position yet");
+                else
+                    snprintf(msg, sizeof(msg), "Nodes on - %u on the map",
+                             (unsigned)THIS->nodeMarkerIdByNode.size());
+                THIS->mapsShowNotice(msg);
+            },
+            LV_EVENT_CLICKED, NULL);
+        maps_nodes_lbl = lv_label_create(maps_nodes_btn);
+        lv_obj_set_style_text_font(maps_nodes_lbl, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_center(maps_nodes_lbl);
+        updateMapsNodesBtn();
+
         // gear cog, bottom-right over the map: style picker + region downloader
         maps_gear_btn = lv_btn_create(maps_screen);
         lv_obj_set_size(maps_gear_btn, 36, 36);
@@ -2967,6 +3048,15 @@ void TFTView_320x240::openMaps(void)
 
     lv_screen_load_anim(maps_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
     updateMapsSats();
+    // Every open, not just the first. Cheap (already-drawn nodes are a hash lookup), and it keeps
+    // the pill honest if the switch was flipped from the Pins list. Deferred so it runs after the
+    // block below has had its chance to create userMap.
+    lv_async_call(
+        [](void *) {
+            THIS->drawAllNodesOnUserMap();
+            THIS->updateMapsNodesBtn();
+        },
+        nullptr);
 
     if (!userMap) {
         mapsInitTileStyle();
@@ -2984,7 +3074,7 @@ void TFTView_320x240::openMaps(void)
 
         // "you are here" dot (our own marker; the mesh map keeps its own images)
         if (db.config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT) {
-            maps_gps_dot = lv_obj_create(maps_map_container);
+            maps_gps_dot = lv_obj_create(markerParent());
             lv_obj_remove_style_all(maps_gps_dot);
             lv_obj_set_size(maps_gps_dot, 14, 14);
             lv_obj_set_style_radius(maps_gps_dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
@@ -4723,16 +4813,75 @@ TFTView_320x240::MapPin *TFTView_320x240::findPin(uint32_t id)
     return nullptr;
 }
 
-lv_obj_t *TFTView_320x240::makePinMarker(uint32_t color)
+// Waypoint ids come off the mesh and have nothing to do with our local pin ids, so incoming
+// updates and retractions have to be matched on this instead.
+TFTView_320x240::MapPin *TFTView_320x240::findPinByWaypoint(uint32_t wpId)
 {
-    lv_obj_t *m = lv_obj_create(maps_map_container);
+    if (!wpId)
+        return nullptr;
+    for (auto &p : mapPins)
+        if (p.wpId == wpId)
+            return &p;
+    return nullptr;
+}
+
+// Filled dot = a pin I dropped. Hollow ring = a pin somebody shared with me. Same distinction the
+// mesh-node markers already make, so the map only ever teaches you one rule: solid is mine.
+void TFTView_320x240::stylePinMarker(lv_obj_t *m, uint32_t color, bool theirs)
+{
+    if (!m)
+        return;
+    if (theirs) {
+        lv_obj_set_style_bg_opa(m, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_color(m, lv_color_hex(color), LV_PART_MAIN);
+        lv_obj_set_style_border_width(m, 3, LV_PART_MAIN);
+        lv_obj_set_style_outline_color(m, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_outline_width(m, 1, LV_PART_MAIN);
+        lv_obj_set_style_outline_opa(m, LV_OPA_60, LV_PART_MAIN);
+    } else {
+        lv_obj_set_style_bg_color(m, lv_color_hex(color), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(m, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_color(m, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_set_style_border_width(m, 2, LV_PART_MAIN);
+        lv_obj_set_style_outline_width(m, 0, LV_PART_MAIN);
+    }
+}
+
+lv_obj_t *TFTView_320x240::markerParent(void)
+{
+    // loadPins() can run from an arriving waypoint long before the Maps app has ever been built.
+    return maps_marker_layer ? maps_marker_layer : maps_map_container;
+}
+
+// LVGL invalidates on every add/clear of HIDDEN and on every set_pos, whether or not the value
+// actually changed. With 121 nodes that was hundreds of pointless invalidations per pan step, each
+// one costing a re-render and an SPI flush of the tile underneath. Only touch what moved.
+static inline void markerShow(lv_obj_t *o, int16_t x, int16_t y, int16_t &lastX, int16_t &lastY)
+{
+    if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    if (x != lastX || y != lastY) {
+        lv_obj_set_pos(o, x, y);
+        lastX = x;
+        lastY = y;
+    }
+}
+
+static inline void markerHide(lv_obj_t *o)
+{
+    if (o && !lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+lv_obj_t *TFTView_320x240::makePinMarker(uint32_t color, bool theirs)
+{
+    if (!markerParent()) // no Maps app yet; drawAllPins() builds the markers when it opens
+        return nullptr;
+    lv_obj_t *m = lv_obj_create(markerParent());
     lv_obj_remove_style_all(m);
     lv_obj_set_size(m, 14, 14);
     lv_obj_set_style_radius(m, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(m, lv_color_hex(color), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(m, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(m, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_set_style_border_width(m, 2, LV_PART_MAIN);
+    stylePinMarker(m, color, theirs);
     lv_obj_add_flag(m, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(m, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(m, LV_OBJ_FLAG_CLICKABLE);
@@ -4743,7 +4892,9 @@ lv_obj_t *TFTView_320x240::makePinMarker(uint32_t color)
 // readable over any map tile; a thin border in the pin's own color ties it to the dot.
 lv_obj_t *TFTView_320x240::makePinLabel(const char *name, uint32_t color)
 {
-    lv_obj_t *l = lv_label_create(maps_map_container);
+    if (!markerParent())
+        return nullptr;
+    lv_obj_t *l = lv_label_create(markerParent());
     lv_label_set_text(l, name ? name : "");
     lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, lv_color_hex(0xffffff), LV_PART_MAIN);
@@ -4770,23 +4921,26 @@ void TFTView_320x240::drawAllPins(void)
             if (!p || !p->marker)
                 return;
             if (!x && !y && !zoom) { // hide (off-screen / filtered)
-                lv_obj_add_flag(p->marker, LV_OBJ_FLAG_HIDDEN);
-                if (p->labelObj)
-                    lv_obj_add_flag(p->labelObj, LV_OBJ_FLAG_HIDDEN);
+                markerHide(p->marker);
+                markerHide(p->labelObj);
                 return;
             }
-            lv_obj_clear_flag(p->marker, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(p->marker);
-            lv_obj_set_pos(p->marker, x - 7, y - 7); // 14x14 dot centered on the point
-            if (p->labelObj) { // name tag sits just to the right of the dot
-                lv_obj_clear_flag(p->labelObj, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_move_foreground(p->labelObj);
-                lv_obj_set_pos(p->labelObj, x + 10, y - 8);
-            }
+            // No move_foreground: the marker layer is already above the tiles. That call was the
+            // single most expensive thing on this screen - see maps_marker_layer.
+            markerShow(p->marker, (int16_t)(x - 7), (int16_t)(y - 7), p->lastX, p->lastY);
+            if (p->labelObj) // name tag sits just to the right of the dot
+                markerShow(p->labelObj, (int16_t)(x + 10), (int16_t)(y - 8), p->lastLX, p->lastLY);
         };
     }
-    for (auto &p : mapPins)
+    for (auto &p : mapPins) {
+        // Pins can be created while the app is closed (loaded from SD by an incoming waypoint, or
+        // the waypoint itself), and those are still waiting for their on-map objects.
+        if (!p.marker)
+            p.marker = makePinMarker(p.color, p.fromNode != 0);
+        if (!p.labelObj)
+            p.labelObj = makePinLabel(p.label, p.color);
         userMap->add(p.id, p.lat, p.lon, drawPinCB);
+    }
 }
 
 // ---- Mesh nodes on the Maps app -------------------------------------------------------------
@@ -4815,18 +4969,20 @@ void TFTView_320x240::addOrUpdateUserMapNode(uint32_t nodeNum, float lat, float 
                 return;
             NodeMarker &n = it->second;
             if (!x && !y && !zoom) { // off-screen or filtered out
-                lv_obj_add_flag(n.marker, LV_OBJ_FLAG_HIDDEN);
-                if (n.labelObj)
-                    lv_obj_add_flag(n.labelObj, LV_OBJ_FLAG_HIDDEN);
+                markerHide(n.marker);
+                markerHide(n.labelObj);
                 return;
             }
-            lv_obj_clear_flag(n.marker, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(n.marker);
-            lv_obj_set_pos(n.marker, x - 7, y - 7); // 14x14 ring centred on the point
+            markerShow(n.marker, (int16_t)(x - 7), (int16_t)(y - 7), n.lastX, n.lastY);
+            // Names come off when you zoom out. Zoomed out is exactly when every node is on screen
+            // at once, so it is both the moment the names become unreadable soup AND the moment
+            // drawing them costs the most - the rings still tell you somebody is there.
             if (n.labelObj) {
-                lv_obj_clear_flag(n.labelObj, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_move_foreground(n.labelObj);
-                lv_obj_set_pos(n.labelObj, x + 10, y - 8);
+                if (zoom >= kNodeNameZoom) {
+                    markerShow(n.labelObj, (int16_t)(x + 10), (int16_t)(y - 8), n.lastLX, n.lastLY);
+                } else {
+                    markerHide(n.labelObj);
+                }
             }
         };
     }
@@ -4838,7 +4994,7 @@ void TFTView_320x240::addOrUpdateUserMapNode(uint32_t nodeNum, float lat, float 
     n.nodeNum = nodeNum;
 
     // The ring: transparent middle, thick coloured edge, so the terrain underneath stays readable.
-    n.marker = lv_obj_create(maps_map_container);
+    n.marker = lv_obj_create(markerParent());
     lv_obj_remove_style_all(n.marker);
     lv_obj_set_size(n.marker, 14, 14);
     lv_obj_set_style_radius(n.marker, LV_RADIUS_CIRCLE, LV_PART_MAIN);
@@ -4858,6 +5014,11 @@ void TFTView_320x240::addOrUpdateUserMapNode(uint32_t nodeNum, float lat, float 
     if (np != nodes.end() && np->second)
         shortName = lv_label_get_text(np->second->LV_OBJ_IDX(node_lbs_idx));
     n.labelObj = makePinLabel(shortName, bgColor);
+    // Your own pins stay on top of the mesh: node markers drop to the back of the layer once, when
+    // they are made. Doing it here costs one reorder per node ever, instead of one per redraw.
+    lv_obj_move_background(n.marker);
+    if (n.labelObj)
+        lv_obj_move_background(n.labelObj);
 
     uint32_t markerId = nextNodeMarkerId++;
     nodeMarkers[markerId] = n;
@@ -4904,6 +5065,14 @@ void TFTView_320x240::removeUserMapNode(uint32_t nodeNum)
 
 // The Nodes switch. Off tears every marker down rather than hiding them, so a busy mesh costs
 // nothing at all when you've turned it off to read the terrain.
+void TFTView_320x240::updateMapsNodesBtn(void)
+{
+    if (!maps_nodes_btn || !maps_nodes_lbl)
+        return;
+    lv_label_set_text(maps_nodes_lbl, showNodesOnUserMap ? "Nodes ON" : "Nodes OFF");
+    lv_obj_set_style_bg_color(maps_nodes_btn, lv_color_hex(showNodesOnUserMap ? 0x0a84ff : 0x2c2c2e), LV_PART_MAIN);
+}
+
 void TFTView_320x240::setShowNodesOnUserMap(bool on)
 {
     if (showNodesOnUserMap == on)
@@ -4916,6 +5085,7 @@ void TFTView_320x240::setShowNodesOnUserMap(bool on)
             removeUserMapNode(nodeMarkerIdByNode.begin()->first);
     }
     savePins(); // the setting rides along in the pins file
+    updateMapsNodesBtn(); // the pill on the map and the button in the Pins list are one setting
     if (userMap)
         userMap->forceRedraw(true);
 }
@@ -4929,7 +5099,7 @@ void TFTView_320x240::dropPinAt(float lat, float lon)
     p.lat = lat;
     p.lon = lon;
     p.color = kPinColors[p.id % kPinColorCount];
-    p.whenEpoch = 0; // TODO: wire device RTC time
+    p.whenEpoch = (uint32_t)actTime; // 0 until the node has a clock, which is the old behaviour
     snprintf(p.label, sizeof(p.label), "Pin %u", (unsigned)p.id);
     p.marker = makePinMarker(p.color);
     p.labelObj = makePinLabel(p.label, p.color);
@@ -4944,6 +5114,12 @@ void TFTView_320x240::deletePin(uint32_t id)
 {
     for (auto it = mapPins.begin(); it != mapPins.end(); ++it) {
         if (it->id == id) {
+            // Deleting a pin you're sharing retracts it on the way out. Without this the wpId goes
+            // with the pin and there is no longer any way to ask the mesh to drop its copy.
+            if (it->shareKind != ePinNotShared && !it->fromNode) {
+                queueRetract(*it); // outlives the pin: the list is keyed by waypoint id, not pin id
+                sendPinWaypoint(*it, true);
+            }
             if (userMap)
                 userMap->remove(id);
             if (it->marker)
@@ -4965,9 +5141,373 @@ void TFTView_320x240::centerOnPin(uint32_t id)
     }
 }
 
+// ---- Sharing a pin over the mesh ------------------------------------------------------------
+// Jake, 2026-08-13: "i want to be able to choose a person or a channel i want to share it to. I
+// want to be able to see what pins are 'shared' or not shared. and control weather i want to
+// unshare or share a pin."
+//
+// On the wire these are ordinary meshtastic_Waypoints, so a pin shared from here lands on a stock
+// T-Deck and in the phone app too, not just on another T-UI.
+
+// The friendliest name we have for a node: its long name, then its short name, then its number.
+// Points into the node panel's own label, which outlives any overlay that displays it.
+const char *TFTView_320x240::pinNodeName(uint32_t nodeNum)
+{
+    static char fallback[16];
+    auto it = nodes.find(nodeNum);
+    if (it != nodes.end() && it->second) {
+        const char *lbl = lv_label_get_text(it->second->LV_OBJ_IDX(node_lbl_idx));
+        if (lbl && lbl[0])
+            return lbl;
+        const char *lbs = lv_label_get_text(it->second->LV_OBJ_IDX(node_lbs_idx));
+        if (lbs && lbs[0])
+            return lbs;
+    }
+    snprintf(fallback, sizeof(fallback), "!%08x", (unsigned)nodeNum);
+    return fallback;
+}
+
+// An unnamed channel shows as its modem preset ("LongFast"), which is what the settings screens
+// already do — the name Jake sees here matches the name he sees there.
+const char *TFTView_320x240::pinChannelName(uint8_t ch)
+{
+    if (ch >= c_max_channels)
+        return "?";
+    if (db.channel[ch].settings.name[0])
+        return db.channel[ch].settings.name;
+    return LoRaPresets::modemPresetToString(db.config.lora.modem_preset);
+}
+
+// The waypoint id for one of my pins. Derived rather than random so it survives a lost /pins.csv:
+// re-deriving gives the same id, which means a retract still reaches the copies already out there.
+static uint32_t waypointIdFor(uint32_t nodeNum, uint32_t pinId)
+{
+    uint32_t h = (nodeNum ^ (pinId * 2654435761u)) * 2246822519u;
+    h ^= h >> 13;
+    return h ? h : 1; // 0 means "no waypoint yet", so never hand back 0
+}
+
+void TFTView_320x240::sendPinWaypoint(const MapPin &p, bool retract)
+{
+    meshtastic_Waypoint wp = meshtastic_Waypoint_init_zero;
+    wp.id = p.wpId ? p.wpId : waypointIdFor(ownNode, p.id);
+    wp.has_latitude_i = true;
+    wp.latitude_i = (int32_t)(p.lat * 1e7);
+    wp.has_longitude_i = true;
+    wp.longitude_i = (int32_t)(p.lon * 1e7);
+    wp.locked_to = ownNode; // only I get to edit it
+    strncpy(wp.name, p.label, sizeof(wp.name) - 1);
+    // Retracting is the mesh convention: same waypoint id, expire already in the past. If the node
+    // has no clock yet, 1 (one second past the epoch) is still unambiguously the past.
+    if (retract)
+        wp.expire = actTime > 60 ? (uint32_t)actTime - 60 : 1;
+
+    uint32_t to = UINT32_MAX;
+    uint8_t ch = 0;
+    if (p.shareKind == ePinSharedToNode) {
+        to = p.shareDest;
+        auto it = nodes.find(to);
+        if (it != nodes.end() && it->second)
+            ch = (uint8_t)(unsigned long)it->second->user_data;
+    } else if (p.shareKind == ePinSharedToChannel) {
+        ch = (uint8_t)p.shareDest;
+    }
+    controller->sendWaypoint(to, ch, db.config.lora.hop_limit, wp);
+}
+
+// ---- Unshare that keeps trying ---------------------------------------------------------------
+// An unshare used to be one packet, sent once, with nothing waiting on a reply. If the person it
+// was aimed at was out of range or switched off at that moment, it was simply gone, and their copy
+// of the pin was permanent - while our own screen cheerfully said "Not shared". So every
+// retraction now goes on a list that survives the pin being deleted and survives a reboot, and
+// comes off the list only when it times out.
+//
+// Two things drive the re-sends: a slow backoff, and hearing from somebody it is aimed at. The
+// second is the one that actually lands - a packet from a node is proof they are in range right
+// now, which is the only moment a retraction can possibly arrive.
+static uint32_t retractInterval(uint16_t tries)
+{
+    if (tries < 2)
+        return 60; // twice in the first couple of minutes, in case it was a momentary miss
+    if (tries < 4)
+        return 300;
+    if (tries < 6)
+        return 900;
+    if (tries < 8)
+        return 1800;
+    if (tries < 12)
+        return 3600;
+    return 7200; // then a knock every couple of hours for the rest of the week
+}
+
+void TFTView_320x240::queueRetract(const MapPin &p)
+{
+    if (!p.wpId || p.shareKind == ePinNotShared || p.fromNode)
+        return; // never shared, or it is theirs and was never ours to retract
+    for (auto &r : pendingRetracts) {
+        if (r.wpId == p.wpId) { // re-unsharing the same pin restarts the week, doesn't stack up
+            r.kind = p.shareKind;
+            r.dest = p.shareDest;
+            r.lat = p.lat;
+            r.lon = p.lon;
+            r.giveUpAt = curtime + (time_t)kRetractDays * 86400;
+            r.lastSend = curtime;
+            r.tries = 1;
+            return;
+        }
+    }
+    PendingRetract r{};
+    r.wpId = p.wpId;
+    r.lat = p.lat;
+    r.lon = p.lon;
+    r.kind = p.shareKind;
+    r.dest = p.shareDest;
+    r.giveUpAt = curtime + (time_t)kRetractDays * 86400;
+    r.lastSend = curtime; // the caller sends the first one immediately
+    r.tries = 1;
+    pendingRetracts.push_back(r);
+}
+
+// Sharing a pin again must clear any retraction still chasing it, or we would spend the week
+// asking everybody to drop the pin we just handed them.
+void TFTView_320x240::cancelRetract(uint32_t wpId)
+{
+    for (auto it = pendingRetracts.begin(); it != pendingRetracts.end(); ++it) {
+        if (it->wpId == wpId) {
+            pendingRetracts.erase(it);
+            return;
+        }
+    }
+}
+
+bool TFTView_320x240::retractPendingFor(uint32_t wpId)
+{
+    if (!wpId)
+        return false;
+    for (auto &r : pendingRetracts)
+        if (r.wpId == wpId)
+            return true;
+    return false;
+}
+
+void TFTView_320x240::sendRetract(PendingRetract &r)
+{
+    meshtastic_Waypoint wp = meshtastic_Waypoint_init_zero;
+    wp.id = r.wpId;
+    wp.has_latitude_i = true;
+    wp.latitude_i = (int32_t)(r.lat * 1e7);
+    wp.has_longitude_i = true;
+    wp.longitude_i = (int32_t)(r.lon * 1e7);
+    wp.locked_to = ownNode;
+    wp.expire = actTime > 60 ? (uint32_t)actTime - 60 : 1;
+
+    uint32_t to = UINT32_MAX;
+    uint8_t ch = 0;
+    if (r.kind == ePinSharedToNode) {
+        to = r.dest;
+        auto it = nodes.find(to);
+        if (it != nodes.end() && it->second)
+            ch = (uint8_t)(unsigned long)it->second->user_data;
+    } else {
+        ch = (uint8_t)r.dest;
+    }
+    controller->sendWaypoint(to, ch, db.config.lora.hop_limit, wp);
+    r.lastSend = curtime;
+    r.tries++;
+    // Deliberately no savePins() here: this runs unattended for days and the count is not worth a
+    // card write. What has to survive a reboot - the entry itself and its deadline - is already on
+    // the card from queueRetract().
+}
+
+void TFTView_320x240::retractService(void)
+{
+    if (pendingRetracts.empty())
+        return;
+
+    // The clock can jump years forward the moment the mesh hands us real time. Slide the whole
+    // schedule with it, or every deadline would look long past and the list would empty itself.
+    if (retractLastService && curtime - retractLastService > 3600) {
+        time_t jump = curtime - retractLastService;
+        for (auto &r : pendingRetracts) {
+            r.giveUpAt += jump;
+            r.lastSend += jump;
+        }
+    }
+    retractLastService = curtime;
+
+    bool changed = false;
+    for (auto it = pendingRetracts.begin(); it != pendingRetracts.end();) {
+        if (curtime >= it->giveUpAt || it->tries >= kRetractMaxTries) {
+            it = pendingRetracts.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (changed)
+        savePins();
+
+    // One packet at a time, and never more than one every 30s across the whole list. This is a
+    // shared radio channel; no unshare of ours is worth crowding it.
+    static time_t lastAny = 0;
+    if (curtime - lastAny < 30)
+        return;
+    for (auto &r : pendingRetracts) {
+        if (curtime - r.lastSend >= (time_t)retractInterval(r.tries)) {
+            sendRetract(r);
+            lastAny = curtime;
+            return;
+        }
+    }
+}
+
+// Somebody just spoke. If a retraction is aimed at them - or at a channel they are on - this is
+// the best chance it will ever get, so take it regardless of where the backoff had got to.
+void TFTView_320x240::retractOnNodeHeard(uint32_t nodeNum)
+{
+    if (pendingRetracts.empty() || nodeNum == ownNode)
+        return;
+    uint8_t ch = 0;
+    auto it = nodes.find(nodeNum);
+    if (it != nodes.end() && it->second)
+        ch = (uint8_t)(unsigned long)it->second->user_data;
+    for (auto &r : pendingRetracts) {
+        bool aimedHere = (r.kind == ePinSharedToNode) ? (r.dest == nodeNum) : ((uint8_t)r.dest == ch);
+        if (!aimedHere)
+            continue;
+        if (curtime - r.lastSend < 60) // a chatty node shouldn't turn into a transmitter
+            continue;
+        sendRetract(r);
+        return; // one packet per thing we hear
+    }
+}
+
+void TFTView_320x240::sharePin(uint32_t id, uint8_t kind, uint32_t dest)
+{
+    MapPin *p = findPin(id);
+    if (!p || p->fromNode) // somebody else's pin isn't mine to hand around
+        return;
+    p->shareKind = kind;
+    p->shareDest = dest;
+    if (!p->wpId)
+        p->wpId = waypointIdFor(ownNode, p->id);
+    cancelRetract(p->wpId); // sharing it again calls off any retraction still chasing it
+    sendPinWaypoint(*p, false);
+    savePins();
+
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Shared with %s",
+             kind == ePinSharedToChannel ? pinChannelName((uint8_t)dest) : pinNodeName(dest));
+    mapsShowNotice(msg);
+}
+
+void TFTView_320x240::unsharePin(uint32_t id)
+{
+    MapPin *p = findPin(id);
+    if (!p || p->shareKind == ePinNotShared)
+        return;
+    if (!p->fromNode) {
+        queueRetract(*p);          // remembered first: the send below is only the first attempt
+        sendPinWaypoint(*p, true); // asks the mesh to drop it — cannot be forced, see the UI wording
+    }
+    p->shareKind = ePinNotShared;
+    p->shareDest = 0;
+    savePins();
+    mapsShowNotice("Asked them to drop it - still asking");
+}
+
+// The plain-English line under each pin's name in the list.
+void TFTView_320x240::pinShareText(const MapPin &p, char *out, size_t len)
+{
+    if (p.fromNode)
+        snprintf(out, len, "From %s", pinNodeName(p.fromNode));
+    else if (p.shareKind == ePinSharedToNode)
+        snprintf(out, len, "Shared with %s", pinNodeName(p.shareDest));
+    else if (p.shareKind == ePinSharedToChannel)
+        snprintf(out, len, "Shared to %s", pinChannelName((uint8_t)p.shareDest));
+    else
+        snprintf(out, len, "Not shared");
+}
+
+// A waypoint arrived from somebody else. Same call handles a new pin, an update to one they
+// already sent, and a retraction (expire set in the past).
+void TFTView_320x240::handleWaypoint(uint32_t from, uint8_t ch, const meshtastic_Waypoint &wp)
+{
+    if (!wp.id)
+        return;
+    loadPins(); // the Maps app may never have been opened; don't let this be the thing that saves
+
+    MapPin *p = findPinByWaypoint(wp.id);
+
+    // Retraction. Only honour it from the node that shared it with us, so a stray packet can't
+    // clear somebody else's pin off the map.
+    bool expired = wp.expire && actTime > 0 && wp.expire <= (uint32_t)actTime;
+    if (expired || (wp.expire && wp.expire <= 1)) {
+        if (p && p->fromNode == from)
+            deletePin(p->id);
+        return;
+    }
+
+    float lat = wp.has_latitude_i ? wp.latitude_i * 1e-7f : 0.f;
+    float lon = wp.has_longitude_i ? wp.longitude_i * 1e-7f : 0.f;
+    if (lat == 0.f && lon == 0.f)
+        return;
+
+    if (p) {
+        if (p->fromNode != from) // ours, or another node's — don't let a stranger move it
+            return;
+        p->lat = lat;
+        p->lon = lon;
+        if (wp.name[0]) {
+            strncpy(p->label, wp.name, sizeof(p->label) - 1);
+            p->label[sizeof(p->label) - 1] = 0;
+            if (p->labelObj)
+                lv_label_set_text(p->labelObj, p->label);
+        }
+        if (userMap)
+            userMap->update(p->id, lat, lon);
+        savePins();
+        return;
+    }
+
+    MapPin np{};
+    np.id = nextPinId++;
+    np.lat = lat;
+    np.lon = lon;
+    np.color = kPinColors[np.id % kPinColorCount];
+    np.whenEpoch = (uint32_t)actTime;
+    np.fromNode = from;
+    np.wpId = wp.id;
+    np.shareKind = ePinNotShared; // it's shared *with* me; I'm not the one sharing it
+    if (wp.name[0])
+        strncpy(np.label, wp.name, sizeof(np.label) - 1);
+    else
+        snprintf(np.label, sizeof(np.label), "Pin from %s", pinNodeName(from));
+
+    // The Maps app builds these on demand; with no map container yet there is nothing to parent
+    // them to, so hold the pin and let loadPins/drawAllPins draw it when the app opens.
+    if (maps_map_container) {
+        np.marker = makePinMarker(np.color, true); // hollow ring: somebody else's
+        np.labelObj = makePinLabel(np.label, np.color);
+    }
+    mapPins.push_back(np);
+    if (userMap && np.marker)
+        userMap->add(np.id, lat, lon, drawPinCB);
+    savePins();
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%s shared a pin", pinNodeName(from));
+    mapsShowNotice(msg);
+}
+
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
 bool TFTView_320x240::savePins(void)
 {
+    // Both of these used to be reachable only from the Maps app, i.e. long after the card was
+    // mounted. An incoming shared waypoint can now call them at any point after boot, so they have
+    // to check the card is actually there first — same guard diagLog() already uses.
+    if (!sdCard)
+        return false;
     FsFile f = SDFs.open("/pins.csv", O_WRONLY | O_CREAT | O_TRUNC);
     if (!f)
         return false;
@@ -4980,6 +5520,24 @@ bool TFTView_320x240::savePins(void)
     for (auto &p : mapPins) {
         snprintf(line, sizeof(line), "%u|%.6f|%.6f|%u|%u|%s\n", (unsigned)p.id, p.lat, p.lon, (unsigned)p.color,
                  (unsigned)p.whenEpoch, p.label);
+        f.print(line);
+    }
+    // Share state goes in its own "#share|" lines AFTER the pins, for two reasons: the loader has
+    // to have the pin in hand before it can attach anything to it, and a build that predates
+    // sharing skips every "#" line it doesn't know — so this file still opens cleanly there
+    // instead of losing all the pins.
+    for (auto &p : mapPins) {
+        if (p.shareKind == ePinNotShared && !p.fromNode)
+            continue;
+        snprintf(line, sizeof(line), "#share|%u|%u|%u|%u|%u\n", (unsigned)p.id, (unsigned)p.shareKind, (unsigned)p.shareDest,
+                 (unsigned)p.fromNode, (unsigned)p.wpId);
+        f.print(line);
+    }
+    // Retractions still in flight. These outlive the pin they came from - a deleted shared pin
+    // leaves one behind on purpose - so they are keyed by waypoint id and stand on their own.
+    for (auto &r : pendingRetracts) {
+        snprintf(line, sizeof(line), "#retract|%u|%u|%u|%.6f|%.6f|%u|%u\n", (unsigned)r.wpId, (unsigned)r.kind,
+                 (unsigned)r.dest, r.lat, r.lon, (unsigned)r.giveUpAt, (unsigned)r.tries);
         f.print(line);
     }
     f.sync(); // force the write + directory entry out to the card before we drop the handle
@@ -4996,6 +5554,8 @@ void TFTView_320x240::loadPins(void)
 {
     if (pinsLoaded)
         return;
+    if (!sdCard) // no card mounted yet: stay unloaded so the Maps app still reads them later
+        return;
     pinsLoaded = true;
     if (!SDFs.exists("/pins.csv")) {
         diagLog("pins load: /pins.csv MISSING (nothing was saved)");
@@ -5010,8 +5570,72 @@ void TFTView_320x240::loadPins(void)
     while (f.fgets(line, sizeof(line)) > 0) { // SdFat line reader (keeps the trailing newline)
         // Settings line written by savePins(); everything else in the file is a pin.
         if (line[0] == '#') {
-            if (!strncmp(line, "#nodes|", 7))
+            if (!strncmp(line, "#nodes|", 7)) {
                 showNodesOnUserMap = (line[7] != '0');
+            } else if (!strncmp(line, "#retract|", 9)) {
+                // "#retract|wpid|kind|dest|lat|lon|giveup|tries"
+                char *e = line + 9;
+                unsigned wpid = strtoul(e, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned kind = strtoul(e + 1, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned dest = strtoul(e + 1, &e, 10);
+                if (*e != '|')
+                    continue;
+                float rlat = strtof(e + 1, &e);
+                if (*e != '|')
+                    continue;
+                float rlon = strtof(e + 1, &e);
+                if (*e != '|')
+                    continue;
+                unsigned giveup = strtoul(e + 1, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned tries = strtoul(e + 1, &e, 10);
+                if (!wpid)
+                    continue;
+                PendingRetract r{};
+                r.wpId = wpid;
+                r.kind = (uint8_t)kind;
+                r.dest = dest;
+                r.lat = rlat;
+                r.lon = rlon;
+                r.tries = (uint16_t)tries;
+                // A deadline written before the mesh handed us real time is meaningless now, so
+                // give it a fresh week rather than expiring it the instant it loads.
+                r.giveUpAt =
+                    (time_t)giveup > (time_t)1700000000 ? (time_t)giveup : curtime + (time_t)kRetractDays * 86400;
+                // Try again shortly after boot: a device that just came on is often a device that
+                // just went out, which is exactly when the missing node may be within reach again.
+                r.lastSend = curtime - (time_t)retractInterval(r.tries) + 120;
+                pendingRetracts.push_back(r);
+            } else if (!strncmp(line, "#share|", 7)) {
+                // "#share|id|kind|dest|from|wpid" — written after every pin, so the pin exists.
+                char *e = line + 7;
+                unsigned sid = strtoul(e, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned kind = strtoul(e + 1, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned dest = strtoul(e + 1, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned from = strtoul(e + 1, &e, 10);
+                if (*e != '|')
+                    continue;
+                unsigned wpid = strtoul(e + 1, &e, 10);
+                MapPin *sp = findPin(sid);
+                if (sp) {
+                    sp->shareKind = (uint8_t)kind;
+                    sp->shareDest = dest;
+                    sp->fromNode = from;
+                    sp->wpId = wpid;
+                    stylePinMarker(sp->marker, sp->color, sp->fromNode != 0); // ring if it's theirs
+                }
+            }
             continue;
         }
         // Parse "id|lat|lon|color|when|label" WITHOUT scanf %f. THE PINS BUG: on this
@@ -5052,8 +5676,12 @@ void TFTView_320x240::loadPins(void)
         for (char *c = p.label; *c; c++)
             if (*c == '\n' || *c == '\r')
                 *c = 0;
-        p.marker = makePinMarker(p.color);
-        p.labelObj = makePinLabel(p.label, p.color);
+        // An arriving waypoint can pull the file in before the Maps app has ever been built, and
+        // there is no container to parent a marker to yet. drawAllPins() fills them in on open.
+        if (maps_map_container) {
+            p.marker = makePinMarker(p.color);
+            p.labelObj = makePinLabel(p.label, p.color);
+        }
         mapPins.push_back(p);
         if (id >= nextPinId)
             nextPinId = id + 1;
@@ -5178,34 +5806,92 @@ void TFTView_320x240::openPinsList(void)
         return;
     }
 
-    for (auto &p : mapPins) {
+    // A-Z by name, which is the one ordering Jake asked for. Sorted by pointer so the pins vector
+    // itself keeps its id order — everything else (findPin, the file, the map ids) leans on that.
+    std::vector<MapPin *> sorted;
+    sorted.reserve(mapPins.size());
+    for (auto &p : mapPins)
+        sorted.push_back(&p);
+    std::sort(sorted.begin(), sorted.end(), [](const MapPin *a, const MapPin *b) {
+        const char *x = a->label, *y = b->label;
+        for (; *x && *y; ++x, ++y) {
+            char cx = (*x >= 'A' && *x <= 'Z') ? *x + 32 : *x; // case-insensitive: "apple" by "Apple"
+            char cy = (*y >= 'A' && *y <= 'Z') ? *y + 32 : *y;
+            if (cx != cy)
+                return cx < cy;
+        }
+        return *y != 0;
+    });
+
+    for (MapPin *pp : sorted) {
+        MapPin &p = *pp;
         lv_obj_t *row = lv_obj_create(list);
         lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, 302, 44);
+        lv_obj_set_size(row, 302, 54); // taller than it was: the share line lives underneath
         lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+        // Matches the map: filled dot for my pin, hollow ring for one shared with me.
         lv_obj_t *dot = lv_obj_create(row);
         lv_obj_remove_style_all(dot);
         lv_obj_set_size(dot, 14, 14);
         lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(dot, lv_color_hex(p.color), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_align(dot, LV_ALIGN_LEFT_MID, 8, 0);
+        if (p.fromNode) {
+            lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_border_color(dot, lv_color_hex(p.color), LV_PART_MAIN);
+            lv_obj_set_style_border_width(dot, 3, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_bg_color(dot, lv_color_hex(p.color), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+        }
+        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 8, 8);
+
+        bool mine = (p.fromNode == 0);
+        bool shared = (p.shareKind != ePinNotShared);
 
         lv_obj_t *name = lv_label_create(row);
         lv_label_set_text(name, p.label);
         lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
-        lv_obj_set_width(name, 112); // bounded so long names don't run under the buttons
+        lv_obj_set_width(name, 78); // pulled in to make room for Share; long names still ellipsize
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 30, 0);
+        lv_obj_align(name, LV_ALIGN_TOP_LEFT, 30, 6);
 
-        // Name (rename), Go (center map), Del — three 44px buttons across the right.
+        // Jake, 2026-08-26: sharing is a button now, sitting right after the name, and it flips to
+        // Unshare once the pin is out there. The line underneath went back to just reporting the
+        // state, because two things you can tap that do the same job is one thing too many.
+        // Somebody else's pin gets no button at all — it isn't mine to hand around.
+        if (mine) {
+            lv_obj_t *shr = lv_btn_create(row);
+            lv_obj_set_size(shr, 56, 28);
+            lv_obj_align(shr, LV_ALIGN_TOP_LEFT, 112, 2);
+            lv_obj_set_style_bg_color(shr, lv_color_hex(shared ? 0x5a5a5e : 0x0a84ff), LV_PART_MAIN);
+            lv_obj_add_event_cb(
+                shr,
+                [](lv_event_t *e) {
+                    uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+                    MapPin *sp = THIS->findPin(id);
+                    if (!sp)
+                        return;
+                    if (sp->shareKind != ePinNotShared) // already out there: ask before pulling it back
+                        lv_async_call([](void *ud) { THIS->openPinConfirm((uint32_t)(uintptr_t)ud, ePinNotShared, 0); },
+                                      (void *)(uintptr_t)id);
+                    else
+                        lv_async_call([](void *ud) { THIS->openSharePicker((uint32_t)(uintptr_t)ud); },
+                                      (void *)(uintptr_t)id);
+                },
+                LV_EVENT_CLICKED, (void *)(uintptr_t)p.id);
+            lv_obj_t *sl = lv_label_create(shr);
+            lv_label_set_text(sl, shared ? "Unshare" : "Share");
+            lv_obj_set_style_text_font(sl, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_center(sl);
+        }
+
+        // Name (rename), Go (center map), Del — the rest of the top row, right of Share.
         lv_obj_t *ren = lv_btn_create(row);
-        lv_obj_set_size(ren, 44, 30);
-        lv_obj_align(ren, LV_ALIGN_RIGHT_MID, -104, 0);
+        lv_obj_set_size(ren, 40, 28);
+        lv_obj_align(ren, LV_ALIGN_TOP_LEFT, 172, 2);
         lv_obj_set_style_bg_color(ren, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
         lv_obj_add_event_cb(
             ren,
@@ -5220,8 +5906,8 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_center(rl);
 
         lv_obj_t *go = lv_btn_create(row);
-        lv_obj_set_size(go, 44, 30);
-        lv_obj_align(go, LV_ALIGN_RIGHT_MID, -56, 0);
+        lv_obj_set_size(go, 40, 28);
+        lv_obj_align(go, LV_ALIGN_TOP_LEFT, 216, 2);
         lv_obj_add_event_cb(
             go,
             [](lv_event_t *e) {
@@ -5235,8 +5921,8 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_center(gl);
 
         lv_obj_t *del = lv_btn_create(row);
-        lv_obj_set_size(del, 44, 30);
-        lv_obj_align(del, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_set_size(del, 40, 28);
+        lv_obj_align(del, LV_ALIGN_TOP_LEFT, 260, 2);
         lv_obj_set_style_bg_color(del, lv_color_hex(0x8a2a24), LV_PART_MAIN);
         lv_obj_add_event_cb(
             del,
@@ -5249,7 +5935,284 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_t *dl = lv_label_create(del);
         lv_label_set_text(dl, "Del");
         lv_obj_center(dl);
+
+        // The share line. Full width, plain English, and purely a readout now that the Share
+        // button above does the acting — Jake liked the sentence, so it stays; it just no longer
+        // pretends to be a control. Somebody else's pin reads "From <them>".
+        char status[80];
+        pinShareText(p, status, sizeof(status));
+        // An unshare is not over when you tap it - it is over when it lands, or when we give up a
+        // week later. Say so, rather than showing a flat "Not shared" that may not be true yet.
+        bool asking = (mine && !shared && retractPendingFor(p.wpId));
+        if (asking)
+            strncat(status, " - still asking", sizeof(status) - strlen(status) - 1);
+
+        lv_obj_t *strip = lv_obj_create(row);
+        lv_obj_remove_style_all(strip);
+        lv_obj_set_size(strip, 294, 20);
+        lv_obj_align(strip, LV_ALIGN_TOP_LEFT, 4, 32);
+        lv_obj_set_style_radius(strip, 5, LV_PART_MAIN);
+        lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+        if (mine) {
+            lv_obj_set_style_bg_color(strip, lv_color_hex(shared ? 0x0a3a1c : 0x2c2c2e), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, LV_PART_MAIN);
+        }
+
+        lv_obj_t *st = lv_label_create(strip);
+        lv_label_set_text(st, status);
+        lv_obj_set_style_text_font(st, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(st, lv_color_hex(mine ? (shared ? 0x30d158 : 0x8e8e93) : 0x64d2ff), LV_PART_MAIN);
+        lv_obj_set_width(st, 286);
+        lv_label_set_long_mode(st, LV_LABEL_LONG_DOT);
+        lv_obj_align(st, LV_ALIGN_LEFT_MID, 6, 0);
     }
+
+    // Deleting a shared pin still leaves us asking the mesh to drop their copies, and that has no
+    // row to sit on any more. One quiet line so it is never happening invisibly.
+    int orphans = 0;
+    for (auto &r : pendingRetracts) {
+        bool hasRow = false;
+        for (auto &p : mapPins)
+            if (p.wpId == r.wpId)
+                hasRow = true;
+        if (!hasRow)
+            orphans++;
+    }
+    if (orphans) {
+        char foot[72];
+        snprintf(foot, sizeof(foot), "Still asking the mesh to drop %d deleted pin%s", orphans, orphans == 1 ? "" : "s");
+        lv_obj_t *fl = lv_label_create(list);
+        lv_label_set_text(fl, foot);
+        lv_obj_set_style_text_font(fl, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(fl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
+}
+
+// ---- Share picker: who do you want this pin to go to? ---------------------------------------
+// Channels first (a channel reaches everybody on it), then every node we've heard from. Picking
+// one opens the confirm card rather than sending straight away.
+void TFTView_320x240::closeSharePicker(void)
+{
+    if (share_overlay) {
+        lv_obj_delete_async(share_overlay);
+        share_overlay = nullptr;
+    }
+}
+
+void TFTView_320x240::openSharePicker(uint32_t id)
+{
+    closePinsList();
+    closeSharePicker();
+    sharing_pin_id = id;
+    MapPin *p = findPin(id);
+    if (!p)
+        return;
+
+    share_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(share_overlay);
+    lv_obj_set_size(share_overlay, 320, 240);
+    lv_obj_set_style_bg_color(share_overlay, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(share_overlay, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(share_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(share_overlay);
+    char t[48];
+    snprintf(t, sizeof(t), "Share \"%s\" with", p->label);
+    lv_label_set_text(title, t);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_width(title, 236);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 10);
+
+    lv_obj_t *closeBtn = lv_btn_create(share_overlay);
+    lv_obj_set_size(closeBtn, 62, 28);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_add_event_cb(
+        closeBtn,
+        [](lv_event_t *) {
+            THIS->closeSharePicker();
+            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+        },
+        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(closeBtn);
+    lv_label_set_text(cl, "Back");
+    lv_obj_center(cl);
+
+    lv_obj_t *list = lv_obj_create(share_overlay);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 314, 194);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 42);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list, 6, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+
+    // The destination is packed into the callback's user_data: high bit set = a channel index,
+    // otherwise a nodenum. Nodenums never use the top bit, so the two can't be confused.
+    auto addChoice = [&](const char *text, const char *sub, uint32_t packed, uint32_t accent) {
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, 302, sub ? 42 : 34);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+        lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            row,
+            [](lv_event_t *e) {
+                // Picking a destination no longer sends anything on its own — it asks first.
+                uint32_t packed = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+                uint32_t pinId = THIS->sharing_pin_id;
+                if (packed & 0x80000000u)
+                    THIS->openPinConfirm(pinId, ePinSharedToChannel, packed & 0x7fffffffu);
+                else
+                    THIS->openPinConfirm(pinId, ePinSharedToNode, packed);
+            },
+            LV_EVENT_CLICKED, (void *)(uintptr_t)packed);
+
+        lv_obj_t *bar = lv_obj_create(row);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 4, sub ? 28 : 20);
+        lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(accent), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_align(bar, LV_ALIGN_LEFT_MID, 4, 0);
+
+        lv_obj_t *lbl = lv_label_create(row);
+        lv_label_set_text(lbl, text);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_set_width(lbl, 272);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 16, sub ? 3 : 7);
+        if (sub) {
+            lv_obj_t *s = lv_label_create(row);
+            lv_label_set_text(s, sub);
+            lv_obj_set_style_text_font(s, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(s, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+            lv_obj_align(s, LV_ALIGN_TOP_LEFT, 16, 22);
+        }
+    };
+
+    for (uint8_t i = 0; i < c_max_channels; i++) {
+        if (db.channel[i].role == meshtastic_Channel_Role_DISABLED)
+            continue;
+        addChoice(pinChannelName(i), "everyone on this channel", 0x80000000u | i, 0x0a84ff);
+    }
+
+    int nodeCount = 0;
+    for (auto &it : nodes) {
+        if (it.first == ownNode || !it.second)
+            continue;
+        addChoice(pinNodeName(it.first), nullptr, it.first, 0xbf5af2);
+        nodeCount++;
+    }
+
+    if (!nodeCount) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "No other nodes heard yet.");
+        lv_obj_set_style_text_font(none, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
+}
+
+// ---- "Are you sure?" ------------------------------------------------------------------------
+// Jake, 2026-08-26: "maybe a prompt after clicking a channel to share to... same when clicking the
+// unshare button." Both directions get one. Sharing puts a place he cares about in front of other
+// people, and unsharing is a *request* the mesh cannot be forced to honour — anybody out of range
+// when it goes out keeps their copy. Neither belongs to a stray brush of the screen.
+void TFTView_320x240::closePinConfirm(void)
+{
+    if (confirm_overlay) {
+        lv_obj_delete_async(confirm_overlay);
+        confirm_overlay = nullptr;
+    }
+}
+
+void TFTView_320x240::openPinConfirm(uint32_t id, uint8_t kind, uint32_t dest)
+{
+    closePinConfirm();
+    MapPin *p = findPin(id);
+    if (!p)
+        return;
+    confirm_pin_id = id;
+    confirm_kind = kind;
+    confirm_dest = dest;
+
+    // Unsharing reads who it is going out to off the pin; sharing reads it off the tapped row.
+    bool unshare = (kind == ePinNotShared);
+    const char *who = unshare ? (p->shareKind == ePinSharedToChannel ? pinChannelName((uint8_t)p->shareDest)
+                                                                    : pinNodeName(p->shareDest))
+                              : (kind == ePinSharedToChannel ? pinChannelName((uint8_t)dest) : pinNodeName(dest));
+
+    char body[144];
+    if (unshare)
+        snprintf(body, sizeof(body), "Asks %s to drop it. Keeps asking for a week - if they never come back in range, they keep it.", who);
+    else if (kind == ePinSharedToChannel)
+        snprintf(body, sizeof(body), "\"%s\" goes out to everyone on %s.", p->label, who);
+    else
+        snprintf(body, sizeof(body), "\"%s\" goes out to %s.", p->label, who);
+
+    // Dims whatever list is underneath and swallows taps, so the two buttons are the only way out.
+    confirm_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(confirm_overlay);
+    lv_obj_set_size(confirm_overlay, 320, 240);
+    lv_obj_set_style_bg_color(confirm_overlay, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(confirm_overlay, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_clear_flag(confirm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(confirm_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *card = lv_obj_create(confirm_overlay);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 280, 140);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 10, LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, unshare ? "Stop sharing this pin?" : "Share this pin?");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 14);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 252);
+    lv_label_set_text(msg, body);
+    lv_obj_set_style_text_font(msg, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(msg, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 14, 40);
+
+    // Cancel on the left, where a mis-aimed tap is least costly.
+    lv_obj_t *cancel = lv_btn_create(card);
+    lv_obj_set_size(cancel, 120, 34);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 12, -12);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_add_event_cb(cancel, [](lv_event_t *) { THIS->closePinConfirm(); }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_center(cl);
+
+    lv_obj_t *ok = lv_btn_create(card);
+    lv_obj_set_size(ok, 120, 34);
+    lv_obj_align(ok, LV_ALIGN_BOTTOM_RIGHT, -12, -12);
+    lv_obj_set_style_bg_color(ok, lv_color_hex(unshare ? 0x8a5a24 : 0x0a84ff), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        ok,
+        [](lv_event_t *) {
+            uint32_t id = THIS->confirm_pin_id;
+            uint8_t kind = THIS->confirm_kind;
+            uint32_t dest = THIS->confirm_dest;
+            THIS->closePinConfirm();
+            if (kind == ePinNotShared)
+                THIS->unsharePin(id);
+            else
+                THIS->sharePin(id, kind, dest);
+            THIS->closeSharePicker(); // no-op when the unshare came from the pins list
+            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+        },
+        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *okl = lv_label_create(ok);
+    lv_label_set_text(okl, unshare ? "Unshare" : "Share");
+    lv_obj_center(okl);
 }
 
 // Full-screen, readable memory/crash readout — the "hard to see the numbers" fix.
@@ -13693,6 +14656,7 @@ void TFTView_320x240::updateNodesFiltered(bool reset)
  */
 void TFTView_320x240::updateLastHeard(uint32_t nodeNum)
 {
+    retractOnNodeHeard(nodeNum); // they are demonstrably in range this second - best chance we get
     auto it = nodes.find(nodeNum);
     if (it != nodes.end() && it->second) {
         time_t lastHeard = (time_t)it->second->LV_OBJ_IDX(node_lh_idx)->user_data;
@@ -13973,6 +14937,7 @@ void TFTView_320x240::task_handler(void)
 
             if (curtime - lastrun5 >= 5) { // call every 5s
                 lastrun5 = curtime;
+                retractService(); // keep asking for unshared pins to be dropped
                 if (scans > 0 && activePanel == objects.signal_scanner_panel) {
                     scanSignal(scans);
                     scans--;

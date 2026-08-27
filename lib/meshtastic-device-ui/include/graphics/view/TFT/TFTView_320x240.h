@@ -81,6 +81,7 @@ class TFTView_320x240 : public MeshtasticView
     void handleResponse(uint32_t from, uint32_t id, const meshtastic_Routing &routing, const meshtastic_MeshPacket &p) override;
     void handleResponse(uint32_t from, uint32_t id, const meshtastic_RouteDiscovery &route) override;
     void handlePositionResponse(uint32_t from, uint32_t request_id, int32_t rx_rssi, float rx_snr, bool isNeighbor) override;
+    void handleWaypoint(uint32_t from, uint8_t ch, const meshtastic_Waypoint &wp) override;
     void notifyRestoreMessages(int32_t percentage) override;
     void notifyMessagesRestored(void) override;
     void notifyConnected(const char *info) override;
@@ -209,14 +210,24 @@ class TFTView_320x240 : public MeshtasticView
     std::function<void(uint32_t id, uint16_t x, uint16_t y, uint8_t)> drawObjectCB;
 
     // ---- Maps app: user-dropped pins on our own map screen (long-press to drop) ----
+    // A pin can be shared over the mesh. On the wire it is a plain meshtastic_Waypoint, which is
+    // what every other Meshtastic client already speaks — so a pin shared from here shows up on a
+    // stock T-Deck and in the phone app, not only on another T-UI.
+    enum PinShare : uint8_t { ePinNotShared = 0, ePinSharedToNode = 1, ePinSharedToChannel = 2 };
     struct MapPin {
         uint32_t id;
         float lat, lon;
         uint32_t color;
         uint32_t whenEpoch; // unix time dropped (0 = unknown)
         char label[24];
-        lv_obj_t *marker;   // the on-map dot (child of maps_map_container)
-        lv_obj_t *labelObj; // the pin's name shown next to the dot (also a child)
+        lv_obj_t *marker;    // the on-map dot (child of maps_map_container)
+        lv_obj_t *labelObj;  // the pin's name shown next to the dot (also a child)
+        uint8_t shareKind;   // PinShare: who I'm sharing this one with, if anybody
+        uint32_t shareDest;  // nodenum (ePinSharedToNode) or channel index (ePinSharedToChannel)
+        uint32_t fromNode;   // 0 = mine, else the node that shared it with me
+        uint32_t wpId;       // waypoint id on the mesh; 0 until first shared. Retracting reuses it.
+        int16_t lastX, lastY;   // last drawn position, so a redraw that changes nothing costs nothing
+        int16_t lastLX, lastLY; // ...and the same for the name tag beside it
     };
     std::vector<MapPin> mapPins;
     uint32_t nextPinId = 1;
@@ -224,7 +235,9 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *pins_overlay = nullptr;
     std::function<void(uint32_t, uint16_t, uint16_t, uint8_t)> drawPinCB;
     MapPin *findPin(uint32_t id);
-    lv_obj_t *makePinMarker(uint32_t color);
+    MapPin *findPinByWaypoint(uint32_t wpId);
+    lv_obj_t *makePinMarker(uint32_t color, bool theirs = false);
+    void stylePinMarker(lv_obj_t *m, uint32_t color, bool theirs); // filled dot = mine, ring = theirs
     lv_obj_t *makePinLabel(const char *name, uint32_t color); // name tag drawn beside a pin
     void dropPinAt(float lat, float lon);
     void drawAllPins(void);
@@ -234,14 +247,67 @@ class TFTView_320x240 : public MeshtasticView
     void closePinsList(void);
     void deletePin(uint32_t id);
 
+    // ---- Maps app: sharing a pin over the mesh ----
+    void sharePin(uint32_t id, uint8_t kind, uint32_t dest); // send it, remember who to
+    void unsharePin(uint32_t id);                            // ask everyone to drop it again
+    void sendPinWaypoint(const MapPin &p, bool retract);     // the actual WAYPOINT_APP send
+    void pinShareText(const MapPin &p, char *out, size_t len); // the row's plain-English status line
+    void openSharePicker(uint32_t id);                       // choose a channel or a node
+    void closeSharePicker(void);
+    // Jake, 2026-08-26: "maybe a prompt after clicking a channel to share to... same when clicking
+    // the unshare button". kind == ePinNotShared means unshare; anything else is a share to dest.
+    void openPinConfirm(uint32_t id, uint8_t kind, uint32_t dest);
+    void closePinConfirm(void);
+
+    // ---- Unshare that keeps trying ----
+    // Jake, 2026-08-26: "so lets say i unshare my pin from my howe group. but my dad isnt in range
+    // when i unshare it. will he always have that pin?" He would have. The retraction was a single
+    // unacknowledged packet: miss it and his copy was his forever. It is now remembered and
+    // re-sent on a backoff, and immediately whenever we hear from somebody it is aimed at.
+    struct PendingRetract {
+        uint32_t wpId;   // the only field the far end matches on
+        float lat, lon;  // last known spot, so other clients still see a well-formed waypoint
+        uint32_t dest;   // nodenum (ePinSharedToNode) or channel index (ePinSharedToChannel)
+        time_t giveUpAt; // stop asking after this - see kRetractDays
+        time_t lastSend;
+        uint16_t tries;
+        uint8_t kind;
+    };
+    static constexpr int kRetractDays = 7;      // how long we keep asking
+    static constexpr uint16_t kRetractMaxTries = 60;
+    // static for the same load-bearing reason as share_overlay: the GUI object must not grow.
+    static std::vector<PendingRetract> pendingRetracts;
+    static time_t retractLastService;
+    void queueRetract(const MapPin &p);       // remember one, so it outlives the pin and the boot
+    void cancelRetract(uint32_t wpId);        // re-sharing must not leave a retraction chasing it
+    void sendRetract(PendingRetract &r);
+    void retractService(void);                // from the 5s tick
+    void retractOnNodeHeard(uint32_t nodeNum); // they just came back in range - try now
+    bool retractPendingFor(uint32_t wpId);    // drives the "still asking" line in the pins list
+    const char *pinNodeName(uint32_t nodeNum);               // friendliest name we have for a node
+    const char *pinChannelName(uint8_t ch);                  // channel name, or the preset's name
+    // static, not instance members, and that is load-bearing: the TFTView_320x240 object is a
+    // single ~16.5KB allocation that has to come out of ONE contiguous run of internal RAM, and it
+    // sits right on the edge of the largest run available after the 36KB TLS reserve. Adding these
+    // two as instance members grew the object by 8 bytes and the device stopped booting. There is
+    // only ever one GUI, so they cost nothing in .bss — same reasoning as screenLocked below.
+    static lv_obj_t *share_overlay;
+    static uint32_t sharing_pin_id;
+    static lv_obj_t *confirm_overlay; // the "are you sure?" card, over whichever list opened it
+    static uint32_t confirm_pin_id;   // what the two buttons act on — lambdas can't capture
+    static uint32_t confirm_dest;
+    static uint8_t confirm_kind;
+
     // ---- Maps app: mesh nodes drawn on OUR map, not just the Meshtastic one ----
     // Jake, 2026-08-07: "on my tdeck maps (the ones not in meshtastic app) im not seeing other
     // nodes". They were never there — node positions only ever went to the mesh map (`map`), and
     // the Maps app (`userMap`) only ever drew your own position and your pins.
     struct NodeMarker {
         uint32_t nodeNum;
-        lv_obj_t *marker;   // dot on the map (child of maps_map_container)
+        lv_obj_t *marker;   // ring on the map (child of maps_marker_layer)
         lv_obj_t *labelObj; // short name beside it
+        int16_t lastX, lastY;   // last drawn position - see markerShow()
+        int16_t lastLX, lastLY;
     };
     // Keyed by the id handed to userMap so the draw callback is a hash lookup, not a scan — a
     // busy mesh has enough nodes that a linear search per marker per redraw would show.
@@ -255,7 +321,24 @@ class TFTView_320x240 : public MeshtasticView
     std::function<void(uint32_t, uint16_t, uint16_t, uint8_t)> drawNodeCB;
     void addOrUpdateUserMapNode(uint32_t nodeNum, float lat, float lon);
     void drawAllNodesOnUserMap(void);      // attach every already-known node when the app opens
-    void setShowNodesOnUserMap(bool on);   // the Nodes toggle in the Pins list
+    void setShowNodesOnUserMap(bool on);   // the Nodes toggle
+    // Jake, 2026-08-26: "can you put nodes back on my normal map with a toggle for on/off". The
+    // switch existed but lived in the Pins list, which is a strange place to look for "am I seeing
+    // other people" - so it is now a pill on the map itself, above the cog. Static, not instance
+    // members, for the same load-bearing reason as share_overlay: the GUI object must not grow.
+    static lv_obj_t *maps_nodes_btn;
+    static lv_obj_t *maps_nodes_lbl;
+    // Jake, 2026-08-26: "any way to make it less laggy showing all the nodes? i have like 121 on
+    // there." Every marker used to be a child of the tile container, which meant the draw callback
+    // had to shove each one to the front on every single redraw so the freshly-loaded tiles didn't
+    // bury it - 242 reorders of a 242-child list per pan step, each one invalidating. The markers
+    // now live in their own transparent layer ABOVE the tiles, where z-order is free.
+    static lv_obj_t *maps_marker_layer;
+    // Below this zoom the node name tags come off: 121 of them overlap into soup anyway, and that
+    // is precisely the zoom at which every one of them is on screen and being redrawn.
+    static constexpr uint8_t kNodeNameZoom = 13;
+    lv_obj_t *markerParent(void); // the layer, or the tile container before the layer exists
+    void updateMapsNodesBtn(void);
     void removeUserMapNode(uint32_t nodeNum);
     void centerOnPin(uint32_t id);
     void renamePin(uint32_t id, const char *name);
