@@ -85,16 +85,27 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // games, tools and built-in screens alike (an earlier version sat after the Lua
             // hand-off, so games like Pinball swallowed the key and Back did nothing in them).
             // The ONE exception is real typing: if an editable text box (or the on-screen
-            // keyboard) on the CURRENT screen has focus, backspace stays a backspace so you can
+            // keyboard) the user is LOOKING AT has focus, backspace stays a backspace so you can
             // still correct a Wi-Fi password, a PIN, or a note — you leave those editors with the
             // trackball double-click. Lua apps have no text boxes, so Back always works in them.
+            // "Looking at" is the active screen OR either overlay layer (lv_layer_top /
+            // lv_layer_sys). That second half matters: the Wi-Fi network + password boxes, the
+            // pin-rename box and the new-folder box are all built on lv_layer_top, and
+            // lv_obj_get_screen() on anything parented there returns the LAYER, never
+            // lv_screen_active(). An active-screen-only test therefore called every one of those
+            // "not typing" and ate the erase key as Back — you could not correct a typo in a
+            // Wi-Fi password. Testing the overlay layers too covers those and any future entry
+            // box built on an overlay. (The same allowance is made for ordinary keys further
+            // down, in the "keys belong to the screen the user is looking at" check.)
             // handleBackGesture() decides whether Back is actually allowed (never off the lock pad).
             if (data->key == LV_KEY_BACKSPACE && !tdeck_prog_mode) {
                 lv_group_t *bgrp = lv_indev_get_group(indev);
                 lv_obj_t *bfocus = bgrp ? lv_group_get_focused(bgrp) : nullptr;
-                bool typingHere = bfocus && lv_obj_get_screen(bfocus) == lv_screen_active() &&
-                                  (lv_obj_check_type(bfocus, &lv_textarea_class) ||
-                                   lv_obj_check_type(bfocus, &lv_keyboard_class));
+                lv_obj_t *bscr = bfocus ? lv_obj_get_screen(bfocus) : nullptr;
+                bool visibleHere =
+                    bscr && (bscr == lv_screen_active() || bscr == lv_layer_top() || bscr == lv_layer_sys());
+                bool typingHere = visibleHere && (lv_obj_check_type(bfocus, &lv_textarea_class) ||
+                                                  lv_obj_check_type(bfocus, &lv_keyboard_class));
                 // A Lua app that set keep_back=true keeps the erase key for itself (e.g. a game
                 // whose controls sit next to erase). Then we DON'T quit it — the key falls through
                 // to the Lua hand-off below and reaches the app as on_key("back") for it to use or
