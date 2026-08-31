@@ -74,3 +74,8 @@ build/wasm/
 build/wasm-obj/
 build/wasm-*.log
 .emsdk/
+
+# Machine-local PlatformIO overrides (per-board package store). Never committed:
+# each board on this PC points at its own copy of the Espressif packages so a build
+# for one can never overwrite the other board's PSRAM driver.
+platformio_local*.ini
