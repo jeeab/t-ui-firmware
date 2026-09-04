@@ -367,7 +367,13 @@ class TFTView_320x240 : public MeshtasticView
         int builtinIdx;         // >=0 => kApps[builtinIdx]; -1 => a user SD app
         int userIdx;            // >=0 => userAppDirs[userIdx]; -1 => a built-in app
     };
-    static const int kMaxUserApps = 12;
+    // 12 was too few and failed SILENTLY. With 17 app folders on the card the scan simply
+    // stopped at twelve, so the last few were never discovered - no tile, no error, nothing
+    // in the launcher at all. Jake installed the Sun app and it never appeared; the folders
+    // come back in creation order, so the newest app is exactly the one that gets dropped.
+    // 26 leaves real headroom: 12 built-ins + 26 = 38, inside launchList/appOrder's 40, and
+    // the array itself only costs 26 * 24 bytes.
+    static const int kMaxUserApps = 26;
     char userAppDirs[kMaxUserApps][24]; // folder names under /apps that hold a main.lua
     int userAppCount = 0;
     LaunchDesc launchList[40];           // the assembled, ordered grid (stable storage for tiles)

@@ -1,6 +1,23 @@
 #include "graphics/common/SdCard.h"
 #include "util/ILog.h"
 
+// A style folder is a NAME, like "USGS-Topo". A folder whose name is all digits is a zoom
+// LEVEL, which means the card has tiles sitting directly in /maps with no style folder around
+// them. Those must never be offered as styles: picking "12" would build the path
+// /maps/12/<z>/<x>/<y> and the map would go blank. A user reported exactly that - "map style
+// 0, 1, 10, 11, 12, 13, all of these close my map" - and it looked like confusion rather than
+// the bug it was (jeeab/t-ui#11).
+static bool tdeckIsZoomFolder(const char *name)
+{
+    if (!name || !*name)
+        return false;
+    for (const char *p = name; *p; p++)
+        if (*p < '0' || *p > '9')
+            return false;
+    return true;
+}
+
+
 #ifndef SD_SPI_FREQUENCY
 #define SD_SPI_FREQUENCY 50000000
 #endif
@@ -145,7 +162,7 @@ std::set<std::string> SDCard::loadMapStyles(const char *folder)
 
             std::string path = style.name();
             std::string dir = path.substr(path.find_last_of("/") + 1);
-            if (/* style.isDirectory() && */ dir.c_str()[0] != '.') {
+            if (/* style.isDirectory() && */ dir.c_str()[0] != '.' && !tdeckIsZoomFolder(dir.c_str())) {
                 ILOG_DEBUG("SD: found map style: %s", dir.c_str());
                 styles.insert(dir);
             }
@@ -290,7 +307,7 @@ std::set<std::string> SdFsCard::loadMapStyles(const char *folder)
             style.getName(name, sizeof(name));
             std::string path = name;
             std::string dir = path.substr(path.find_last_of("/") + 1);
-            if (style.isDirectory() && dir.c_str()[0] != '.') {
+            if (style.isDirectory() && dir.c_str()[0] != '.' && !tdeckIsZoomFolder(dir.c_str())) {
                 ILOG_DEBUG("SdFs: found map style: %s", dir.c_str());
                 styles.insert(dir);
             }

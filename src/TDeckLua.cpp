@@ -37,6 +37,11 @@ extern "C" int tdeck_touch_read(unsigned short *xs, unsigned short *ys, int max)
 // the first of the "wider toolbox" doors. Returns false until there's a usable fix.
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
 extern "C" uint32_t tdeck_gps_num_sats(void);
+// Wall-clock date and time for apps (src/TDeckGpsBridge.cpp). device.time() only ever
+// reported milliseconds since boot, which is fine for animation timing and useless for
+// anything calendar-shaped - a sunrise calculation needs to know what day it is. Returns
+// false until the device has a real time (it gets one from the GPS satellites).
+extern "C" bool tdeck_wall_clock(int *year, int *mon, int *day, int *hour, int *min, int *sec, int *offset);
 // Internet door for apps (src/TDeckNet.cpp). net.fetch starts a Wi-Fi fetch that runs on the
 // main loop (never blocks the app); the app polls net.status()/net.body() on later frames.
 extern "C" bool tdeck_net_fetch(const char *url);
@@ -110,12 +115,20 @@ static int api_screen_box(lua_State *L)
 static int api_store_read(lua_State *L)
 {
     const char *name = luaL_checkstring(L, 1);
-    static char buf[4096];
-    int n = tdeck_appfs_read(name, buf, sizeof(buf));
+    // Was a permanent 4KB static. An app reads its saved data occasionally, so holding scarce
+    // internal RAM for it the whole time the device is on is a poor trade - PSRAM for the length
+    // of the call instead.
+    char *buf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        lua_pushnil(L);
+        return 1;
+    }
+    int n = tdeck_appfs_read(name, buf, 4096);
     if (n < 0)
         lua_pushnil(L);
     else
         lua_pushlstring(L, buf, (size_t)n);
+    heap_caps_free(buf);
     return 1;
 }
 
@@ -304,6 +317,31 @@ static int api_device_touches(lua_State *L)
 //   local lat, lon, sats = device.gps()
 //   if lat then ... have a position ... else ... still searching, watch sats climb ... end
 // Read-only: it can't move the device or drain anything, which is why it's a safe door to open.
+// device.clock() -> year, month, day, hour, min, sec, utc_offset  — the local date and time,
+// with the timezone offset in seconds (daylight saving already applied). All nil until the
+// device has heard the time from the GPS satellites, so an app can say "waiting for a fix"
+// rather than printing a wrong answer confidently:
+//
+//   local y, mo, d, h, mi, s, off = device.clock()
+//   if y then ... we know the date ... else ... still waiting ... end
+static int api_device_clock(lua_State *L)
+{
+    int y, mo, d, h, mi, sec, off;
+    if (!tdeck_wall_clock(&y, &mo, &d, &h, &mi, &sec, &off)) {
+        for (int i = 0; i < 7; i++)
+            lua_pushnil(L);
+        return 7;
+    }
+    lua_pushinteger(L, y);
+    lua_pushinteger(L, mo);
+    lua_pushinteger(L, d);
+    lua_pushinteger(L, h);
+    lua_pushinteger(L, mi);
+    lua_pushinteger(L, sec);
+    lua_pushinteger(L, off);
+    return 7;
+}
+
 static int api_device_gps(lua_State *L)
 {
     int32_t lat = 0, lon = 0;
@@ -413,6 +451,7 @@ extern "C" int tdeck_lua_app_start(const char *script)
                                          {"time", api_device_time},
                                          {"touches", api_device_touches},
                                          {"gps", api_device_gps},
+                                         {"clock", api_device_clock},
                                          {nullptr, nullptr}};
     static const luaL_Reg storeLib[] = {{"read", api_store_read}, {"write", api_store_write}, {nullptr, nullptr}};
     static const luaL_Reg netLib[] = {{"fetch", api_net_fetch},

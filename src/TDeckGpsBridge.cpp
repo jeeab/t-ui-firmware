@@ -12,6 +12,8 @@
 // readout, so no locking is needed.
 // -----------------------------------------------------------------------------
 #include "GPSStatus.h"
+#include "gps/RTC.h"
+#include <time.h>
 
 extern "C" uint32_t tdeck_gps_num_sats(void)
 {
@@ -45,5 +47,37 @@ extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon)
         return false;
     *lat = la;
     *lon = lo;
+    return true;
+}
+
+// Wall-clock date and time for Lua apps (device.clock()). The device has no battery-backed
+// clock: it learns the time from the GPS satellites, so before a fix there is genuinely no
+// date to report and we say so rather than handing back 1970.
+//
+// getValidTime(..., true) returns seconds already shifted into the configured time zone, and
+// the zone strings carry their daylight-saving rules (see TDeckTimeZone.cpp), so the local
+// fields below follow DST without any extra work here. Asking for the same instant twice -
+// once local, once UTC - gives the offset to hand back, which is what an app needs to turn a
+// UTC calculation (a sunrise, say) into a time on the user's own clock.
+extern "C" bool tdeck_wall_clock(int *year, int *mon, int *day, int *hour, int *min, int *sec, int *offset)
+{
+    uint32_t utc = getValidTime(RTCQuality::RTCQualityDevice, false);
+    if (!utc)
+        return false; // no fix yet -> no honest answer
+    uint32_t local = getValidTime(RTCQuality::RTCQualityDevice, true);
+
+    // `local` is already offset, so read its fields with gmtime: applying the zone twice
+    // would put the clock out by the offset again.
+    time_t t = (time_t)local;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+
+    *year = tmv.tm_year + 1900;
+    *mon = tmv.tm_mon + 1;
+    *day = tmv.tm_mday;
+    *hour = tmv.tm_hour;
+    *min = tmv.tm_min;
+    *sec = tmv.tm_sec;
+    *offset = (int)((int64_t)local - (int64_t)utc);
     return true;
 }

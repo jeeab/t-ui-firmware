@@ -93,6 +93,13 @@ extern "C" bool tdeck_lock_enabled(void);
 extern "C" void tdeck_lock_set_enabled(bool en);
 // Keyboard backlight follows the screen (src/TDeckKeyboardLight.cpp). Persisted in NVS;
 // default OFF, so a device nobody has touched keeps its keys dark exactly as before.
+extern "C" bool tdeck_trackball_nav_enabled(void);
+extern "C" bool tdeck_trackball_click_enabled(void);
+extern "C" bool tdeck_powersave_enabled(void);
+extern "C" void tdeck_powersave_set_enabled(bool en);
+extern "C" void tdeck_powersave_dark(bool dark);
+extern "C" void tdeck_trackball_click_set_enabled(bool en);
+extern "C" void tdeck_trackball_nav_set_enabled(bool en);
 extern "C" bool tdeck_kbdlight_enabled(void);
 extern "C" void tdeck_kbdlight_set_enabled(bool en);
 // 12/24-hour clock (src/TDeckClockFormat.cpp). Drives Meshtastic's own
@@ -178,6 +185,10 @@ extern "C" void tdeck_sound_set_enabled(bool on);
 #if defined(INPUTDRIVER_ENCODER_TYPE)
 // Set by the trackball driver on a double-click; polled by the launcher to go Home.
 extern volatile bool tb_home_request;
+// Trackball rolled up/down: move a whole row (-1 up, +1 down). Handled here rather than in
+// the driver because only the launcher knows its grid is 3 tiles across; everywhere else a
+// row is just the next item.
+extern volatile int tb_nav_rows;
 #endif
 
 // Lock/wake gating, shared with the display + input drivers (declared extern in LGFXDriver.h,
@@ -187,6 +198,11 @@ extern volatile bool tb_home_request;
 //  tdeck_hold_dark   -> manual lock: LGFXDriver snaps the backlight to black and holds it.
 volatile bool tdeck_input_gated = false;
 volatile bool tdeck_hold_dark = false;
+
+// How long the PIN pad may sit untouched before the screen goes black again. Fixed rather
+// than a setting: it is a lock screen, and ten seconds is long enough to type a six-digit
+// code but short enough that waking the device by accident in a pocket costs nothing.
+static const uint32_t kLockPadIdleMs = 10000;
 volatile bool tdeck_prog_mode = false;     // BT programming-mode screen up: suppress dim/gate/lock
 volatile bool tdeck_prog_key_exit = false; // a keypress in programming mode requests exit (set by kbd driver)
 //  tdeck_wake_request -> a physical keyboard key was pressed while the screen was dark/gated.
@@ -258,9 +274,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.08.30.1-test"
+#define TUI_VERSION "2026.09.03.1-test"
 #else
-#define TUI_VERSION "2026.08.30.1"
+#define TUI_VERSION "2026.09.03.1"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -907,6 +923,116 @@ bool buildTileIconFromFile(lv_obj_t *tile, const char *path)
  * @brief Build the custom launcher home screen (grid of app tiles from kApps[]).
  *        Must be called after ui_init() so objects.* screens/panels exist.
  */
+// ---------------------------------------------------------------------------------------
+// Trackball navigation: make a screen focusable.
+//
+// This UI was built for touch, so almost nothing was ever put in an LVGL input group - only a
+// handful of text boxes and the games' key catchers. Group membership is what PREV/NEXT move
+// between, so sending navigation keys at these screens did nothing at all: there was no focus
+// to move, nothing highlighted, and Enter had no target. Hence "up and down scroll but nothing
+// selects".
+//
+// So when trackball navigation is on, walk the screen and put everything clickable into the
+// group, and give each one a visible focus ring - without a highlight, moving the focus is
+// invisible and the whole thing feels broken even when it is working.
+//
+// Deliberately NOT recursive into clickable things: a launcher tile owns a label and an icon,
+// and those must not become separate stops. Containers that are not themselves clickable are
+// walked through, which is how the tiles inside each launcher page are reached.
+// True while the PIN screen is up. The trackball driver asks so it can swallow navigation and
+// select keys there: the focus group still holds the launcher's tiles (we deliberately leave it
+// alone on the lock screen), and without this a click could fire a tile sitting behind the PIN
+// pad - on a locked device.
+extern "C" bool tdeck_lockscreen_active(void)
+{
+    return objects.lock_screen && lv_screen_active() == objects.lock_screen;
+}
+
+static void tdeckCollectFocusables(lv_obj_t *parent, lv_group_t *g, int depth = 0)
+{
+    if (!parent || depth > 6)
+        return;
+    uint32_t n = lv_obj_get_child_count(parent);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *c = lv_obj_get_child(parent, i);
+        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+            continue;
+        // Match on the WIDGET TYPE, not on the clickable flag. In LVGL 9 a plain container is
+        // clickable by default, so a flag test would stop at the launcher's page containers and
+        // never reach the tiles inside them - the grid would look empty to the trackball.
+        bool isControl = lv_obj_check_type(c, &lv_button_class) || lv_obj_check_type(c, &lv_switch_class) ||
+                         lv_obj_check_type(c, &lv_checkbox_class) || lv_obj_check_type(c, &lv_dropdown_class) ||
+                         lv_obj_check_type(c, &lv_slider_class) || lv_obj_check_type(c, &lv_textarea_class);
+        if (isControl) {
+            lv_group_add_obj(g, c);
+            // The focus ring. Local styles, so repeated rebuilds just overwrite.
+            lv_obj_set_style_outline_width(c, 3, LV_PART_MAIN | LV_STATE_FOCUSED);
+            lv_obj_set_style_outline_color(c, lv_color_hex(0x0a84ff), LV_PART_MAIN | LV_STATE_FOCUSED);
+            lv_obj_set_style_outline_opa(c, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUSED);
+            lv_obj_set_style_outline_pad(c, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
+            // Lift the background a little as well. A thin ring alone is easy to lose against
+            // the near-black tiles, and if you cannot see where the focus is, working navigation
+            // still feels broken - which was the whole complaint that started this.
+            lv_obj_set_style_bg_color(c, lv_color_hex(0x2f2f33), LV_PART_MAIN | LV_STATE_FOCUSED);
+        } else {
+            tdeckCollectFocusables(c, g, depth + 1);
+        }
+    }
+}
+
+// Rebuild the group for whatever screen is on display. Called when the screen changes and when
+// the setting is switched on. With navigation off this clears the group instead, so a device
+// that never enables it behaves exactly as it always did.
+static void tdeckRefreshNavGroup(lv_obj_t *scr)
+{
+    // Do NOTHING unless the user actually asked for trackball navigation.
+    //
+    // The first version of this cleared the group on EVERY screen change whether the feature was
+    // on or not, and that is what broke unlocking. lv_group_remove_all_objs() is not a quiet
+    // operation: it sends LV_EVENT_DEFOCUSED to whatever currently has focus. Do that in the
+    // middle of a screen transition - which is exactly when this ran - and the object being
+    // notified can already be on its way out. A device you cannot get past the PIN screen on is
+    // the worst thing this feature could possibly cost, so it now touches nothing at all unless
+    // it has been switched on, and it stays away from the lock screen entirely.
+    // ---------------------------------------------------------------------------------------
+    // DISABLED - this approach cannot work, and it crashed the device.
+    //
+    // The default LVGL group is NOT free for us to use: updateLastHeard() (search for
+    // _lv_ll_move_before in this file) reaches into lv_group_get_default()->obj_ll and reorders
+    // it by hand every time a packet arrives, so the node list can float the most recently heard
+    // node to the top. It caches a reference node in that list.
+    //
+    // Clearing and repopulating the same group left that cached pointer dangling, and the next
+    // incoming mesh packet dereferenced it: Guru Meditation / LoadProhibited, roughly 44 seconds
+    // after boot, over and over - a device that looked bootlooping but was really crashing on
+    // whatever packet arrived first. Decoded backtrace:
+    //     lv_ll_move_before <- updateLastHeard <- packetReceived <- ViewController::runOnce
+    //
+    // Doing this properly means a SEPARATE lv_group for trackball navigation and switching the
+    // keypad indev between it and the default one - not borrowing the group the node list owns.
+    // Until that is built, this does nothing at all.
+    return;
+
+    if (!tdeck_trackball_nav_enabled() || !scr)
+        return;
+    // Never the lock screen. Its PIN pad is a button matrix, which is not a thing we would add to
+    // the group anyway, so there is nothing to gain here and everything to lose.
+    if (scr == objects.lock_screen)
+        return;
+    // Nor while the screen is dark or locking - focus should sit still until the user is back.
+    if (tdeck_input_gated)
+        return;
+    lv_group_t *g = lv_group_get_default();
+    if (!g)
+        return;
+    lv_group_remove_all_objs(g);
+    tdeckCollectFocusables(scr, g);
+    // Land on the first item so something is highlighted the moment you arrive.
+    lv_obj_t *first = lv_group_get_focused(g);
+    if (!first && lv_group_get_obj_count(g) > 0)
+        lv_group_focus_next(g);
+}
+
 void TFTView_320x240::createLauncher(void)
 {
     ILOG_DEBUG("createLauncher()");
@@ -1054,6 +1180,71 @@ void TFTView_320x240::createLauncher(void)
                 tdeck_back_request = false;
                 THIS->handleBackGesture();
             }
+            // The PIN pad had no timeout of its own: wake the device, don't type the code, and
+            // it sat there lit until the battery ran down. The main screen timeout does not cover
+            // it, because the pad counts as an active screen. Ten seconds without a touch and it
+            // goes back to black - the same state lockDevice() puts it in, so a double-click or a
+            // key brings the pad straight back. Any partly-typed PIN is discarded on the way, which
+            // is what you want anyway.
+            if (THIS->lockState == LOCK_ENTRY && lv_display_get_inactive_time(NULL) > kLockPadIdleMs)
+                THIS->lockDevice();
+
+            // Screen dark or awake? Watched here rather than wired into every lock/wake path,
+            // because there are five of those and missing one would leave the processor slowed
+            // down with the screen on. One place, checked 16x a second, cannot drift.
+            {
+                static bool lastDark = false;
+                if (tdeck_hold_dark != lastDark) {
+                    lastDark = tdeck_hold_dark;
+                    tdeck_powersave_dark(lastDark);
+                }
+            }
+
+            // Keep the focus group pointed at the screen the user is actually looking at. There
+            // is no central "screen changed" hook, and this poll already runs 16x a second, so
+            // it is the natural place to notice. Cheap: the walk only happens on a change.
+            {
+                static lv_obj_t *lastNavScreen = nullptr;
+                static lv_obj_t *pendingScreen = nullptr;
+                static uint8_t settleTicks = 0;
+                static bool lastNavOn = false;
+                lv_obj_t *scr = lv_screen_active();
+                bool navOn = tdeck_trackball_nav_enabled();
+                if (scr != lastNavScreen || navOn != lastNavOn) {
+                    // Wait for the screen to stop changing before touching focus. Screen loads
+                    // here are animated, and rearranging the group while one is still running is
+                    // how the lock screen got broken the first time. Three ticks of this 60ms
+                    // poll is ~180ms - comfortably past the 100ms fade - and nobody can roll a
+                    // trackball fast enough to notice the wait.
+                    if (scr != pendingScreen) {
+                        pendingScreen = scr;
+                        settleTicks = 0;
+                    } else if (++settleTicks >= 3) {
+                        lastNavScreen = scr;
+                        lastNavOn = navOn;
+                        settleTicks = 0;
+                        tdeckRefreshNavGroup(scr);
+                    }
+                }
+            }
+
+            // Rolled up or down with trackball navigation on. On the launcher that means the
+            // tile above or below (the grid is 3 across, so three steps); on an ordinary list
+            // or settings page it is simply the next line.
+            if (tb_nav_rows) {
+                int dir = tb_nav_rows;
+                tb_nav_rows = 0;
+                lv_group_t *g = lv_group_get_default();
+                if (g) {
+                    int steps = (THIS->launcher_screen && lv_screen_active() == THIS->launcher_screen) ? 3 : 1;
+                    for (int i = 0; i < steps; i++) {
+                        if (dir > 0)
+                            lv_group_focus_next(g);
+                        else
+                            lv_group_focus_prev(g);
+                    }
+                }
+            }
             if (!tb_home_request && !tdeck_wake_request)
                 return;
             tb_home_request = false;
@@ -1063,6 +1254,10 @@ void TFTView_320x240::createLauncher(void)
         60, NULL);
 #endif
 
+    // 250ms, not 60. This only reads one bool set by the keyboard driver, and it ran 16 times a
+    // second for the whole life of the device to notice a key combo nobody presses in a normal
+    // week. A fifth of a second later is imperceptible to a human reaching for Alt+C, and it is
+    // ~13 fewer wake-ups per second on a chip that has plenty else to do.
     // Poll the Alt+C calibration request (keyboard-driven, so NOT gated on the trackball). When the
     // lock pad is up, Alt+C runs touch calibration then re-shows the pad — a reliable way to fix a
     // miscalibrated screen without needing a working touch to reach Settings.
@@ -1075,7 +1270,7 @@ void TFTView_320x240::createLauncher(void)
             if (THIS->lockpad_screen && lv_screen_active() == THIS->lockpad_screen)
                 THIS->startCalibrationFromLock();
         },
-        60, NULL);
+        250, NULL); // was 60ms - see note above
 
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
     // The SD card often isn't mounted yet the instant the grid first builds — which leaves
@@ -1145,6 +1340,12 @@ void TFTView_320x240::scanUserApps(void)
             userAppCount++;
         }
     }
+    // Say so if we ran out of room. Hitting the cap used to be completely silent - the extra
+    // apps just were not there, with nothing anywhere to say why - and folders come back in
+    // creation order, so the app that vanishes is the one you just installed. That is the worst
+    // possible one to lose quietly.
+    if (userAppCount >= kMaxUserApps)
+        ILOG_WARN("[DeviceUI] user app limit reached (%d) - later apps in /apps were NOT loaded", kMaxUserApps);
     dir.close();
 #endif
 }
@@ -1205,9 +1406,30 @@ void TFTView_320x240::applyAppOrder(void)
                 placed[i] = true;
                 break;
             }
-    for (int i = 0; i < launchCount && oc < launchCount; i++) // append anything not listed
+    // Anything the saved order does not mention is NEW - an app installed since the order was
+    // last written. Those go to the FRONT, not the back. Appending them was quietly hostile: with
+    // twenty-odd apps a newly installed one landed on the last page, behind several swipes, so it
+    // looked like it had not installed at all. (Jake hit this with the Sun app: "I didn't see it,
+    // maybe on a new page I can't get to".) Putting new apps first means the thing you just
+    // installed is the thing you see. Rearranging the grid saves the order, which pins it wherever
+    // you actually want it.
+    int newCount = 0;
+    for (int i = 0; i < launchCount; i++)
         if (!placed[i])
-            ordered[oc++] = launchList[i];
+            newCount++;
+    if (newCount > 0 && oc + newCount <= (int)(sizeof(ordered) / sizeof(ordered[0]))) {
+        for (int i = oc - 1; i >= 0; i--) // shift the known order back to make room
+            ordered[i + newCount] = ordered[i];
+        int n = 0;
+        for (int i = 0; i < launchCount; i++)
+            if (!placed[i])
+                ordered[n++] = launchList[i];
+        oc += newCount;
+    } else {
+        for (int i = 0; i < launchCount && oc < launchCount; i++) // no room: fall back to appending
+            if (!placed[i])
+                ordered[oc++] = launchList[i];
+    }
     for (int i = 0; i < oc; i++)
         launchList[i] = ordered[i];
     launchCount = oc;
@@ -2037,10 +2259,51 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_color(kbdHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 814);
 
+    // The two trackball switches that used to sit here (roll-to-navigate and click-to-select)
+    // are gone. They promised something the firmware cannot currently deliver: navigation needs
+    // the widgets to be in an LVGL input group, and the default group is already owned by the
+    // node list, which reorders its internal linked list by hand on every received packet (see
+    // tdeckRefreshNavGroup). Borrowing it crashed the device. A switch that does nothing is worse
+    // than no switch, so they come out until this is rebuilt on a group of its own.
+    //
+    // What survives, and needs no setting: HOLD the trackball for Home, and double-click for Home.
+
+    // "Power saving" — drops the processor to 40MHz while the screen is dark and locked. Off by
+    // default: it is a real behaviour change, and a wrong clock shows up while the device is
+    // locked in a pocket, which is exactly when nobody is watching. It also stands down entirely
+    // whenever Wi-Fi or Bluetooth is up, so the saving lands on a quiet device and nowhere else.
+    lv_obj_t *psLbl = lv_label_create(settings_screen);
+    lv_label_set_text(psLbl, "Power saving");
+    lv_obj_set_style_text_color(psLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(psLbl, LV_ALIGN_TOP_LEFT, 16, 866);
+
+    lv_obj_t *psSwitch = lv_switch_create(settings_screen);
+    lv_obj_set_size(psSwitch, 56, 28);
+    lv_obj_align(psSwitch, LV_ALIGN_TOP_RIGHT, -16, 860);
+    lv_obj_set_style_bg_color(psSwitch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (tdeck_powersave_enabled())
+        lv_obj_add_state(psSwitch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(
+        psSwitch,
+        [](lv_event_t *e) {
+            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+            tdeck_powersave_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *psHint = lv_label_create(settings_screen);
+    lv_obj_set_width(psHint, 288);
+    lv_label_set_long_mode(psHint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(psHint, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(psHint, "Slows the processor while the screen is off and locked.\n"
+                              "Stands down while Wi-Fi or Bluetooth is on.");
+    lv_obj_set_style_text_color(psHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(psHint, LV_ALIGN_TOP_LEFT, 16, 898);
+
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 860);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 946);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2064,7 +2327,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 904);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 990);
 }
 
 /**
@@ -2474,6 +2737,40 @@ void TFTView_320x240::wifiEntryPrompt(bool psk)
     lv_obj_set_width(wifi_ta, 292);
     lv_obj_align(wifi_ta, LV_ALIGN_TOP_MID, 0, 74);
     lv_obj_add_event_cb(wifi_ta, [](lv_event_t *) { THIS->wifiEntryCommit(); }, LV_EVENT_READY, NULL);
+
+    // "Show password" (t-ui#12). Typing a long Wi-Fi key blind is bad enough; the same report
+    // also said "the text is out of the screen", because a one-line box shows only as much as
+    // fits and a long key runs off the end with no way to see what you typed. Both complaints
+    // are really the same trip, so one control fixes both: ticking this unmasks the text AND
+    // drops the one-line restriction, so the whole key wraps into view at once. Untick and it
+    // goes back to a masked single line. Only offered for the password - the network name is
+    // never masked, so it would do nothing there.
+    if (psk) {
+        lv_obj_t *showCb = lv_checkbox_create(wifi_ovl);
+        lv_checkbox_set_text(showCb, "Show password");
+        lv_obj_set_style_text_color(showCb, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(showCb, LV_ALIGN_TOP_LEFT, 14, 116);
+        lv_obj_add_event_cb(
+            showCb,
+            [](lv_event_t *e) {
+                lv_obj_t *cb = (lv_obj_t *)lv_event_get_target(e);
+                bool show = lv_obj_has_state(cb, LV_STATE_CHECKED);
+                if (!THIS->wifi_ta)
+                    return;
+                lv_textarea_set_password_mode(THIS->wifi_ta, !show);
+                // Wrapped while visible so the end of a long key is reachable; back to a
+                // single line when masked, which is what the dots are sized for.
+                lv_textarea_set_one_line(THIS->wifi_ta, !show);
+                lv_obj_set_width(THIS->wifi_ta, 292);
+                lv_obj_set_height(THIS->wifi_ta, show ? 76 : LV_SIZE_CONTENT);
+                lv_obj_align(THIS->wifi_ta, LV_ALIGN_TOP_MID, 0, 74);
+                // Keep typing where the user left off - changing the mode moves focus.
+                lv_group_t *g = lv_group_get_default();
+                if (g)
+                    lv_group_focus_obj(THIS->wifi_ta);
+            },
+            LV_EVENT_VALUE_CHANGED, NULL);
+    }
 
     if (lv_group_get_default()) {
         lv_group_add_obj(lv_group_get_default(), wifi_ta);
@@ -3234,6 +3531,7 @@ struct MapDlSource {
     const char *ext;    // tile format written to .format ("jpg"/"png")
     uint8_t estKB;      // typical tile size for the estimate
     const char *credit; // attribution the source's licence asks for
+    uint8_t maxZoom;    // deepest zoom the SERVICE actually holds
 };
 // Each source carries the credit its licence asks for. USGS is US-government work and
 // public domain, so its line is courtesy; TopPlusOpen is BKG open data published under
@@ -3241,14 +3539,40 @@ struct MapDlSource {
 // appear on the device, not just on the website.
 const MapDlSource kMapDlSources[] = {
     {"(US) USGS Topo", "USGS-Topo", "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
-     "jpg", 20, "Map: USGS The National Map (public domain)"},
+     "jpg", 20, "Map: USGS The National Map (public domain)", 16},
+    // Satellite/aerial photography, same National Map service and the same public-domain terms
+    // as the topo above. Folder matches the style name the desktop downloader writes, so the two
+    // fill the SAME set of tiles rather than making a second, competing satellite folder.
+    // NOTE: this service has no imagery above zoom 16 - asking for 17 or 18 returns "not found",
+    // not a sharper picture. Same is true of the topo layer.
+    {"(US) USGS Satellite", "USGS-Imagery",
+     "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}", "jpg", 24,
+     "Imagery: USGS The National Map (public domain)", 16},
     {"(EU) TopPlusOpen", "TopPlusOpen",
      "https://sgx.geodatenzentrum.de/wmts_topplus_open/tile/1.0.0/web/default/WEBMERCATOR/{z}/{y}/{x}.png", "png", 35,
-     "Map: (c) BKG TopPlusOpen, dl-de/by-2-0"},
+     "Map: (c) BKG TopPlusOpen, dl-de/by-2-0", 18},
 };
 // Detail levels offered on the download screen. Both dropdowns share this list; the value is
 // the index + 1, so the last entry here is the deepest zoom the downloader will fetch.
 const char *kMapDlDetailOpts = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18";
+
+// The Detail dropdowns used to offer 1-18 whatever the source was, but a service only holds the
+// zoom levels it holds: ask USGS for 17 or 18 and every tile comes back "not found". That is a
+// download that runs, takes time and quietly produces nothing - the worst kind of failure,
+// because from the outside it looks like it worked. Each source now declares its real ceiling
+// and the list stops there, so a level that cannot work is never offered.
+static std::string mapdlDetailOpts(uint8_t maxZoom)
+{
+    if (maxZoom < 1 || maxZoom > 18)
+        maxZoom = 18;
+    std::string o;
+    for (uint8_t z = 1; z <= maxZoom; z++) {
+        if (z > 1)
+            o += "\n";
+        o += std::to_string((int)z);
+    }
+    return o;
+}
 
 int s_mapdlSrcIdx = 0; // which source the download screen has selected
 inline const MapDlSource &mapdlSrc(void)
@@ -3284,6 +3608,13 @@ void mapdlTilePath(char *buf, size_t cap, uint8_t z, uint32_t x, uint32_t y)
              (unsigned long)y, mapdlSrc().ext);
 }
 
+// Why the last tile failed. The downloader used to report a bare count - "427 failed" - which
+// says nothing about whether the server refused us, the wi-fi dropped, or the TLS handshake could
+// not find memory. Get Apps had exactly this problem and it sent us chasing the wrong cause twice
+// (see getappsFail), so the map downloader gets the same treatment.
+char mapdlFail[24] = "";
+static uint8_t mapdlFailStreak = 0;
+
 bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
 {
     if (!mapdlClient) {
@@ -3301,20 +3632,42 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
     http.setReuse(true); // keep-alive on the shared client
     http.setConnectTimeout(8000);
     http.setTimeout(8000);
-    if (!http.begin(*mapdlClient, url))
+    if (!http.begin(*mapdlClient, url)) {
+        strcpy(mapdlFail, "connect setup");
+        mapdlFailStreak++;
         return false;
+    }
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
+        // Negative codes are ours, not the server's: -1 is a refused connection or a failed TLS
+        // handshake, -11 a timeout. A positive code is the server actually answering (404 = this
+        // service has no tile at that zoom).
+        snprintf(mapdlFail, sizeof(mapdlFail), "error %d", code);
         http.end();
+        // A shared keep-alive connection that has been closed by the far end fails every
+        // subsequent tile, for ever, because the client is only built once. Throw it away after a
+        // few failures in a row and let the next tile build a fresh one - and hand the TLS
+        // reserve back so the new handshake has the contiguous internal RAM it needs.
+        if (++mapdlFailStreak >= 4 && mapdlClient) {
+            delete mapdlClient;
+            mapdlClient = nullptr;
+            tdeck_tls_reserve_take();
+            mapdlFailStreak = 0;
+            ILOG_INFO("mapdl: connection reset after repeated failures, will rebuild TLS client");
+        }
         return false;
     }
     int len = http.getSize();
     if (len <= 0 || len > 262144) {
+        snprintf(mapdlFail, sizeof(mapdlFail), "bad size %d", len);
+        mapdlFailStreak++;
         http.end();
         return false;
     }
     uint8_t *buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
     if (!buf) {
+        strcpy(mapdlFail, "out of memory");
+        mapdlFailStreak++;
         http.end();
         return false;
     }
@@ -3647,6 +4000,20 @@ void TFTView_320x240::openMapDownload(void)
             mapdl_src_dd,
             [](lv_event_t *e) {
                 s_mapdlSrcIdx = (int)lv_dropdown_get_selected((lv_obj_t *)lv_event_get_target(e));
+                // Sources have different ceilings (USGS stops at 16, TopPlusOpen goes to 18), so
+                // the Detail lists are rebuilt for whichever one is now selected. Clamp the two
+                // selections too: coming down from 18 to a 16-max source must not leave the
+                // dropdown pointing past the end of its own list.
+                if (THIS->mapdl_zmin_dd && THIS->mapdl_zmax_dd) {
+                    uint8_t mx = mapdlSrc().maxZoom ? mapdlSrc().maxZoom : 18;
+                    uint32_t zmin = lv_dropdown_get_selected(THIS->mapdl_zmin_dd);
+                    uint32_t zmax = lv_dropdown_get_selected(THIS->mapdl_zmax_dd);
+                    std::string opts = mapdlDetailOpts(mx);
+                    lv_dropdown_set_options(THIS->mapdl_zmin_dd, opts.c_str());
+                    lv_dropdown_set_options(THIS->mapdl_zmax_dd, opts.c_str());
+                    lv_dropdown_set_selected(THIS->mapdl_zmin_dd, zmin < mx ? zmin : (uint32_t)(mx - 1));
+                    lv_dropdown_set_selected(THIS->mapdl_zmax_dd, zmax < mx ? zmax : (uint32_t)(mx - 1));
+                }
                 THIS->mapdlUpdateEstimate();
             },
             LV_EVENT_VALUE_CHANGED, NULL);
@@ -3659,7 +4026,7 @@ void TFTView_320x240::openMapDownload(void)
         mapdl_zmin_dd = lv_dropdown_create(mapdl_screen);
         // 1-15: low zooms are nearly free (a handful of tiles) and give the zoomed-out
         // view, so the default range includes them all
-        lv_dropdown_set_options(mapdl_zmin_dd, kMapDlDetailOpts);
+        lv_dropdown_set_options(mapdl_zmin_dd, mapdlDetailOpts(mapdlSrc().maxZoom).c_str());
         lv_dropdown_set_selected(mapdl_zmin_dd, 0);
         lv_obj_set_width(mapdl_zmin_dd, 66);
         lv_obj_align(mapdl_zmin_dd, LV_ALIGN_TOP_LEFT, 98, 158);
@@ -3672,7 +4039,7 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 172, 166);
 
         mapdl_zmax_dd = lv_dropdown_create(mapdl_screen);
-        lv_dropdown_set_options(mapdl_zmax_dd, kMapDlDetailOpts);
+        lv_dropdown_set_options(mapdl_zmax_dd, mapdlDetailOpts(mapdlSrc().maxZoom).c_str());
         // Default stays at 15. Each extra level is ~4x the tiles, so 18 is ~64x a 15 -
         // it's there when you want a small area in close detail, not as a default.
         lv_dropdown_set_selected(mapdl_zmax_dd, 14);
@@ -3819,8 +4186,12 @@ void TFTView_320x240::mapdlStop(bool finished)
             lv_obj_remove_state(mapdl_zmax_dd, LV_STATE_DISABLED);
         char buf[96];
         if (finished)
-            snprintf(buf, sizeof(buf), "Done! %lu new, %lu had, %lu failed", (unsigned long)mapdl_done,
-                     (unsigned long)mapdl_skipped, (unsigned long)mapdl_failed);
+            if (mapdl_failed && mapdlFail[0])
+                snprintf(buf, sizeof(buf), "Done! %lu new, %lu had, %lu failed (%s)", (unsigned long)mapdl_done,
+                         (unsigned long)mapdl_skipped, (unsigned long)mapdl_failed, mapdlFail);
+            else
+                snprintf(buf, sizeof(buf), "Done! %lu new, %lu had, %lu failed", (unsigned long)mapdl_done,
+                         (unsigned long)mapdl_skipped, (unsigned long)mapdl_failed);
         else
             snprintf(buf, sizeof(buf), "Stopped at %lu of %lu tiles", (unsigned long)(mapdl_done + mapdl_skipped),
                      (unsigned long)mapdl_total);
@@ -6888,7 +7259,17 @@ void TFTView_320x240::filesCopyNow(void)
 {
 #if defined(HAS_SDCARD) && !defined(HAS_SD_MMC) && !defined(ARCH_PORTDUINO)
     static constexpr uint64_t kMaxCopyBytes = 8ULL * 1024 * 1024; // keep the UI responsive
-    static uint8_t copyBuf[4096];
+    // 4KB of INTERNAL RAM used to sit here permanently for something that runs for a few seconds
+    // when you paste a file. Internal RAM is the scarce kind on this chip - it is what a TLS
+    // handshake needs a contiguous run of - so it is worth not squatting on it. Taken from PSRAM
+    // for the duration of the copy instead, and handed straight back.
+    uint8_t *copyBuf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!copyBuf)
+        return; // stays armed, same as the other early exits below
+    struct CopyBufGuard { // freed however this function leaves, including the early returns below
+        uint8_t *p;
+        ~CopyBufGuard() { heap_caps_free(p); }
+    } copyBufGuard{copyBuf};
 
     const char *base = strrchr(copySrcPath, '/');
     base = base ? base + 1 : copySrcPath;
@@ -6935,7 +7316,7 @@ void TFTView_320x240::filesCopyNow(void)
 
     bool ok = true;
     int n;
-    while ((n = src.read(copyBuf, sizeof(copyBuf))) > 0) {
+    while ((n = src.read(copyBuf, 4096)) > 0) {
         if (out.write(copyBuf, n) != n) {
             ok = false;
             break;
@@ -8017,6 +8398,9 @@ void TFTView_320x240::enterProgrammingMode(void)
         // driver) OR a trackball double-click (tb_home_request) exits programming mode. The
         // launcher's own poll timer doesn't run on this screen, so add one here. Created once;
         // it only acts while tdeck_prog_mode is set, so it can't disturb normal use.
+        // 250ms rather than 60: this lives for the rest of the session to watch a flag that is
+        // false except during programming mode, and a quarter-second before the screen reacts to
+        // a key press there is not something anyone can feel.
         static bool progExitTimerMade = false;
         if (!progExitTimerMade) {
             progExitTimerMade = true;
@@ -8036,7 +8420,7 @@ void TFTView_320x240::enterProgrammingMode(void)
                         THIS->exitProgrammingMode();
                     }
                 },
-                60, NULL);
+                250, NULL);
         }
         ILOG_INFO("### MUI programming mode entered (nodeId=!%08x) ###", ownNode);
     }

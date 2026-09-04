@@ -36,8 +36,13 @@ struct TileCacheEntry {
     lv_image_header_t header;
     uint32_t stamp = 0;
 };
-constexpr int kTileCacheSlots = 18; // two full screens' worth (~9 visible) — zooming
-                                    // back to the previous level stays instant
+// 12, not 18. Each slot is a decoded 256x256 tile - 128KB - so 18 slots reserve 2.3MB of a
+// 2.4MB PSRAM pool, and the device's own low-water records show PSRAM getting down to 65KB free
+// in map-heavy sessions. A cache that leaves no room for the thing it is caching for is not
+// helping. 12 still holds a full screen (~9 visible) plus three, so panning back a step is still
+// instant, while handing ~768KB back to everything else that needs PSRAM - not least the decode
+// buffer each new tile has to allocate before it can be cached at all.
+constexpr int kTileCacheSlots = 12;
 TileCacheEntry s_tileCache[kTileCacheSlots];
 uint32_t s_tileStamp = 0;
 

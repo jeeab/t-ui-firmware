@@ -15,12 +15,16 @@
 //   * the worst-case memory lows from the PREVIOUS session, persisted to NVS so
 //     they survive the crash+reboot (getMinFree* alone resets every boot).
 // -----------------------------------------------------------------------------
+#include "configuration.h" // LOG_INFO - the boot-time diagnostics line below
 #include <Arduino.h>
 #include <Preferences.h>
 #include <esp_system.h>
 
 #include "concurrency/OSThread.h" // currentThread — names the thread a stalled main loop is stuck in
 #include "SPILock.h" // spiLock — the one lock every SPI/flash user waits on; a wedged holder = the freeze
+
+// Defined further down; used by the boot-time diagnostics line below.
+extern "C" const char *tdeck_prev_reason_str(void);
 
 extern "C" uint32_t tdeck_free_heap(void)
 {
@@ -133,6 +137,16 @@ extern "C" void tdeck_diag_boot(void)
             p.end();
         }
     }
+
+    // Say all of it over the cable, once, at boot. These numbers only existed inside an on-screen
+    // panel you had to tap the memory readout to find - which is useless when the interesting
+    // moment is a crash that already happened, or when nobody is holding the device. One line in
+    // the serial log means a capture taken minutes later still answers "was it running out of
+    // memory, or did something hang?" without anyone touching the screen.
+    LOG_INFO("diag: last restart=%s | prev run low: fast=%uk psram=%uk | stall=%ums thread=%s lock=%s",
+             tdeck_prev_reason_str(), (unsigned)(s_prevHeapLow / 1024), (unsigned)(s_prevPsramLow / 1024),
+             (unsigned)s_prevStallMs, s_prevStallThread[0] ? s_prevStallThread : "-",
+             s_prevStallLock[0] ? s_prevStallLock : "-");
 
     // Seed this session's saved lows with the current (high) free values, and
     // write them so a crash before the first new-low still leaves a sane record.
