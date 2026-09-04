@@ -95,9 +95,6 @@ extern "C" void tdeck_lock_set_enabled(bool en);
 // default OFF, so a device nobody has touched keeps its keys dark exactly as before.
 extern "C" bool tdeck_trackball_nav_enabled(void);
 extern "C" bool tdeck_trackball_click_enabled(void);
-extern "C" bool tdeck_powersave_enabled(void);
-extern "C" void tdeck_powersave_set_enabled(bool en);
-extern "C" void tdeck_powersave_dark(bool dark);
 extern "C" void tdeck_trackball_click_set_enabled(bool en);
 extern "C" void tdeck_trackball_nav_set_enabled(bool en);
 extern "C" bool tdeck_kbdlight_enabled(void);
@@ -274,9 +271,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.09.03.1-test"
+#define TUI_VERSION "2026.09.04.1-test"
 #else
-#define TUI_VERSION "2026.09.03.1"
+#define TUI_VERSION "2026.09.04.1"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -1188,17 +1185,6 @@ void TFTView_320x240::createLauncher(void)
             // is what you want anyway.
             if (THIS->lockState == LOCK_ENTRY && lv_display_get_inactive_time(NULL) > kLockPadIdleMs)
                 THIS->lockDevice();
-
-            // Screen dark or awake? Watched here rather than wired into every lock/wake path,
-            // because there are five of those and missing one would leave the processor slowed
-            // down with the screen on. One place, checked 16x a second, cannot drift.
-            {
-                static bool lastDark = false;
-                if (tdeck_hold_dark != lastDark) {
-                    lastDark = tdeck_hold_dark;
-                    tdeck_powersave_dark(lastDark);
-                }
-            }
 
             // Keep the focus group pointed at the screen the user is actually looking at. There
             // is no central "screen changed" hook, and this poll already runs 16x a second, so
@@ -2268,42 +2254,10 @@ void TFTView_320x240::createSettingsScreen(void)
     //
     // What survives, and needs no setting: HOLD the trackball for Home, and double-click for Home.
 
-    // "Power saving" — drops the processor to 40MHz while the screen is dark and locked. Off by
-    // default: it is a real behaviour change, and a wrong clock shows up while the device is
-    // locked in a pocket, which is exactly when nobody is watching. It also stands down entirely
-    // whenever Wi-Fi or Bluetooth is up, so the saving lands on a quiet device and nowhere else.
-    lv_obj_t *psLbl = lv_label_create(settings_screen);
-    lv_label_set_text(psLbl, "Power saving");
-    lv_obj_set_style_text_color(psLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(psLbl, LV_ALIGN_TOP_LEFT, 16, 866);
-
-    lv_obj_t *psSwitch = lv_switch_create(settings_screen);
-    lv_obj_set_size(psSwitch, 56, 28);
-    lv_obj_align(psSwitch, LV_ALIGN_TOP_RIGHT, -16, 860);
-    lv_obj_set_style_bg_color(psSwitch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    if (tdeck_powersave_enabled())
-        lv_obj_add_state(psSwitch, LV_STATE_CHECKED);
-    lv_obj_add_event_cb(
-        psSwitch,
-        [](lv_event_t *e) {
-            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
-            tdeck_powersave_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
-        },
-        LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t *psHint = lv_label_create(settings_screen);
-    lv_obj_set_width(psHint, 288);
-    lv_label_set_long_mode(psHint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_font(psHint, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_label_set_text(psHint, "Slows the processor while the screen is off and locked.\n"
-                              "Stands down while Wi-Fi or Bluetooth is on.");
-    lv_obj_set_style_text_color(psHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(psHint, LV_ALIGN_TOP_LEFT, 16, 898);
-
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 946);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 872);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2327,7 +2281,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 990);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 916);
 }
 
 /**
