@@ -144,6 +144,11 @@ extern "C" bool tdeck_ftp_running(void);
 extern "C" void snake_open(void);
 // Stopwatch module (StopwatchApp.cpp) — opened from its launcher tile.
 extern "C" void stopwatch_open(void);
+// Nodes + Favorites (NodesApp.cpp). Two launcher screens over one list, fed by the
+// extern "C" bridge in src/TDeckNodesBridge.cpp so that MUI's own node panels are
+// left completely untouched — Jake wants future device-ui updates to merge cleanly.
+extern "C" void nodes_open(void);
+extern "C" void favorites_open(void);
 // Notes module (NotesApp.cpp) — .txt notes on the SD card.
 extern "C" void notes_open(void);
 extern "C" void notes_open_file(const char *path); // Files app opens .txt files with this
@@ -608,6 +613,12 @@ static const LauncherApp kApps[] = {
     {"Flashlight", &img_nodes_button_image, 0xffd60a, nullptr, nullptr, nullptr, &TFTView_320x240::openFlashlightAction},
     // Stopwatch = self-contained count-up timer module (StopwatchApp.cpp).
     {"Stopwatch", &img_messages_button_image, 0x64d2ff, nullptr, nullptr, nullptr, &stopwatch_open},
+    // Nodes = our own node list (NodesApp.cpp), with a star on each row. Deliberately
+    // NOT the Mesh app's node panel: keeping it separate is what makes a device-ui
+    // update a clean merge.
+    {"Nodes", &img_nodes_button_image, 0x5ac8fa, nullptr, nullptr, nullptr, &nodes_open},
+    // Favorites = the same list filtered to the starred ones.
+    {"Favorites", &img_nodes_button_image, 0xffd60a, nullptr, nullptr, nullptr, &favorites_open},
 };
 
 // --- simple per-app icons, drawn from lv_obj primitives (no image assets needed) ---
