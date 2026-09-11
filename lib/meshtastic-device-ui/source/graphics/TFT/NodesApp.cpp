@@ -99,18 +99,38 @@ void distText(uint32_t num, char *out, size_t n)
 }
 
 void rebuild(void);
+lv_obj_t *starIcon(lv_obj_t *p, int size, uint32_t color, int w);
 
 // Tapping the star toggles it, then the list is REBUILT rather than patched: on
 // Favorites an un-starred row has to leave, and on Nodes a starred one re-sorts to
 // the top. Both fall out of a rebuild for free.
+// ⚠️ EVERY handler defers its work with lv_async_call, and the reason is not tidiness.
+//
+// Jake: "froze the device when i clicked it. didnt force a reboot, just froze."
+//
+// onStar() used to toggle the flag and call rebuild() directly. rebuild() starts with
+// lv_obj_clean(listCont) — which DELETES THE VERY BUTTON THAT IS DISPATCHING THIS EVENT. LVGL then
+// carries on walking freed memory after the callback returns: a use-after-free, which hangs exactly
+// the way Jake describes rather than panicking. Screen loads (chat/map) are deferred for the same
+// reason: they tear down the screen these widgets live on.
+//
+// lv_async_call runs the work from the LVGL loop once event dispatch has finished and nothing is
+// mid-walk. TFTView_320x240.cpp already uses this same pattern after a launcher tap (rebuildAppGrid).
 void onStar(lv_event_t *e)
 {
     const int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= kMaxRows)
         return;
-    const uint32_t num = rowNode[idx];
-    tdeck_node_set_favorite(num, !tdeck_node_is_favorite(num));
-    rebuild();
+    lv_async_call(
+        [](void *p) {
+            const int i = (int)(intptr_t)p;
+            if (i < 0 || i >= kMaxRows)
+                return;
+            const uint32_t num = rowNode[i];
+            tdeck_node_set_favorite(num, !tdeck_node_is_favorite(num));
+            rebuild();
+        },
+        (void *)(intptr_t)idx);
 }
 
 // A five-pointed star. lv_line does not copy its points, so the shape is built once into a static
@@ -138,11 +158,62 @@ lv_obj_t *starIcon(lv_obj_t *p, int size, uint32_t color, int w)
     return l;
 }
 
+// ⚠️ DRAWN, NOT FONT GLYPHS. LV_SYMBOL_ENVELOPE / LV_SYMBOL_GPS rendered as EMPTY BOXES on the
+// device — this build's label font does not carry the symbol range, and a missing glyph draws as
+// nothing at all rather than as an error. Shapes always render, so the icons are primitives like the
+// star. Same static-points rule as starIcon(): lv_line does not copy its array, but the geometry is
+// identical for every row and the points are relative to each line object.
+void envelopeIcon(lv_obj_t *p)
+{
+    lv_obj_t *body = lv_obj_create(p);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_size(body, 26, 18);
+    lv_obj_center(body);
+    lv_obj_set_style_border_color(body, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+    lv_obj_set_style_border_width(body, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(body, 3, LV_PART_MAIN);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_CLICKABLE);
+
+    static lv_point_precise_t flap[3] = {{2, 2}, {13, 11}, {24, 2}}; // the V of the envelope
+    lv_obj_t *l = lv_line_create(body);
+    lv_line_set_points(l, flap, 3);
+    lv_obj_set_style_line_color(l, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+    lv_obj_set_style_line_width(l, 2, LV_PART_MAIN);
+}
+
+void pinIcon(lv_obj_t *p, uint32_t colour)
+{
+    lv_obj_t *head = lv_obj_create(p);
+    lv_obj_remove_style_all(head);
+    lv_obj_set_size(head, 16, 16);
+    lv_obj_align(head, LV_ALIGN_CENTER, 0, -4);
+    lv_obj_set_style_radius(head, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_border_color(head, lv_color_hex(colour), LV_PART_MAIN);
+    lv_obj_set_style_border_width(head, 3, LV_PART_MAIN);
+    lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(head, LV_OBJ_FLAG_CLICKABLE);
+
+    static lv_point_precise_t tail[3] = {{0, 0}, {5, 8}, {10, 0}}; // the point of the pin
+    lv_obj_t *l = lv_line_create(p);
+    lv_line_set_points(l, tail, 3);
+    lv_obj_align(l, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_set_style_line_color(l, lv_color_hex(colour), LV_PART_MAIN);
+    lv_obj_set_style_line_width(l, 3, LV_PART_MAIN);
+}
+
 void onChat(lv_event_t *e)
 {
     const int i = (int)(intptr_t)lv_event_get_user_data(e);
-    if (i >= 0 && i < kMaxRows)
-        tui_open_chat_with(rowNode[i]);
+    if (i < 0 || i >= kMaxRows)
+        return;
+    lv_async_call(
+        [](void *p) {
+            const int k = (int)(intptr_t)p;
+            if (k >= 0 && k < kMaxRows)
+                tui_open_chat_with(rowNode[k]);
+        },
+        (void *)(intptr_t)i);
 }
 
 void onMap(lv_event_t *e)
@@ -150,18 +221,25 @@ void onMap(lv_event_t *e)
     const int i = (int)(intptr_t)lv_event_get_user_data(e);
     if (i < 0 || i >= kMaxRows)
         return;
-    int32_t la = 0, lo = 0;
-    if (tdeck_node_position(rowNode[i], &la, &lo))
-        tui_show_node_on_map(rowNode[i], la, lo);
+    lv_async_call(
+        [](void *p) {
+            const int k = (int)(intptr_t)p;
+            if (k < 0 || k >= kMaxRows)
+                return;
+            int32_t la = 0, lo = 0;
+            if (tdeck_node_position(rowNode[k], &la, &lo))
+                tui_show_node_on_map(rowNode[k], la, lo);
+        },
+        (void *)(intptr_t)i);
 }
 
 // One action button: a flat tile with either a symbol glyph or a drawn star.
-lv_obj_t *actionBtn(lv_obj_t *parent, int x, int w, const char *sym, uint32_t fg, lv_event_cb_t cb, int idx)
+lv_obj_t *actionBtn(lv_obj_t *parent, int x, int w, lv_event_cb_t cb, int idx)
 {
     lv_obj_t *b = lv_obj_create(parent);
     lv_obj_remove_style_all(b);
     lv_obj_set_size(b, w, 38);
-    lv_obj_set_pos(b, x, 44);
+    lv_obj_set_pos(b, x, 46);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(b, 6, LV_PART_MAIN);
@@ -169,12 +247,6 @@ lv_obj_t *actionBtn(lv_obj_t *parent, int x, int w, const char *sym, uint32_t fg
     lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
     if (cb)
         lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
-    if (sym) {
-        lv_obj_t *l = lv_label_create(b);
-        lv_label_set_text(l, sym);
-        lv_obj_set_style_text_color(l, lv_color_hex(fg), LV_PART_MAIN);
-        lv_obj_center(l);
-    }
     return b;
 }
 
@@ -196,7 +268,7 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     lv_obj_set_width(name, 290);
-    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 8, 4);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 8, 3);
 
     char age[12], dist[24], batt[12], detail[72];
     ageText(tdeck_node_age_secs(num), age, sizeof(age));
@@ -214,20 +286,22 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     lv_obj_t *sub = lv_label_create(row);
     lv_label_set_text(sub, detail[0] ? detail : "nothing heard yet");
     lv_obj_set_style_text_color(sub, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(sub, LV_ALIGN_BOTTOM_LEFT, 8, -4);
+    // TOP-aligned, not BOTTOM: bottom-aligning put this line straight under the buttons, which is
+    // the text Jake saw being covered.
+    lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 8, 24);
 
     // Three actions along the bottom: message, show on map, favourite.
     const int bw = 96;
-    actionBtn(row, 4, bw, LV_SYMBOL_ENVELOPE, 0x0a84ff, onChat, idx);
+    envelopeIcon(actionBtn(row, 4, bw, onChat, idx));
 
     // The map button is only live for a node that has actually reported a position — a dead button
     // is clearer than one that looks alive and does nothing.
     int32_t la = 0, lo = 0;
     const bool hasPos = tdeck_node_position(num, &la, &lo);
-    actionBtn(row, 8 + bw, bw, LV_SYMBOL_GPS, hasPos ? 0x5ac8fa : 0x48484a, hasPos ? onMap : nullptr, idx);
+    pinIcon(actionBtn(row, 8 + bw, bw, hasPos ? onMap : nullptr, idx), hasPos ? 0x5ac8fa : 0x48484a);
 
     // Star: yellow and thick when favourited, a thin grey outline when not.
-    lv_obj_t *fav = actionBtn(row, 12 + 2 * bw, bw, nullptr, 0, onStar, idx);
+    lv_obj_t *fav = actionBtn(row, 12 + 2 * bw, bw, onStar, idx);
     const bool on = tdeck_node_is_favorite(num);
     lv_obj_t *st = starIcon(fav, 24, on ? 0xffd60a : 0x6a6a70, on ? 4 : 2);
     lv_obj_center(st);
