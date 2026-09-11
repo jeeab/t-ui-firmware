@@ -824,10 +824,12 @@ class TFTView_320x240 : public MeshtasticView
     // get at it, but a static member can.
     static void tuiOpenChatWith(uint32_t nodeNum);
     static void tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
+    static void tuiOpenChannelChat(uint8_t ch);
 
   private:
     void openChatWithNode(uint32_t nodeNum);
     void showNodeOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
+    void openChannelChat(uint8_t ch);
     static void ui_event_positionButton(lv_event_t *e);
 
     // animations

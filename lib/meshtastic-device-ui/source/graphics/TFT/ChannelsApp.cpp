@@ -32,6 +32,9 @@ extern "C" int tdeck_channel_nodes(int chIdx, uint32_t *out, int maxN);
 extern "C" const char *tdeck_node_name(uint32_t num);
 extern "C" uint32_t tdeck_node_age_secs(uint32_t num);
 
+// --- MUI shim (TFTView_320x240.cpp) ---
+extern "C" void tui_open_channel_chat(uint8_t ch);
+
 namespace
 {
 const int kMaxMembers = 60;
@@ -102,6 +105,15 @@ void peopleIcon(lv_obj_t *p)
     box(17, 5, 8, 8, 0x5ac8fa, 4);   // front head
 }
 
+// Jake: "in Channels ... can clicking the channel bring you to that conversation?"
+// Deferred like every other handler here: this loads a different screen, which would tear down the
+// widgets still dispatching the event.
+void onOpenChat(lv_event_t *e)
+{
+    const int ch = (int)(intptr_t)lv_event_get_user_data(e);
+    lv_async_call([](void *p) { tui_open_channel_chat((uint8_t)(intptr_t)p); }, (void *)(intptr_t)ch);
+}
+
 void onOpenMembers(lv_event_t *e)
 {
     viewChannel = (int)(intptr_t)lv_event_get_user_data(e);
@@ -124,6 +136,10 @@ void buildChannelList(void)
             continue; // disabled slots are not channels
         shown++;
         lv_obj_t *row = makeRow(56);
+        // The row itself opens the conversation. The people button is a child with its own handler,
+        // so it takes its own taps and does not fall through to this.
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, onOpenChat, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
         const char *nm = tdeck_channel_name(i);
         makeLabel(row, (nm && nm[0]) ? nm : "(unnamed)", 0xffffff, LV_ALIGN_TOP_LEFT, 10, 6);

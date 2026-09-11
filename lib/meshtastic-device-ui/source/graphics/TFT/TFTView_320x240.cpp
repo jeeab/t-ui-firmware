@@ -10313,6 +10313,17 @@ void TFTView_320x240::tuiOpenChatWith(uint32_t nodeNum)
         instance()->openChatWithNode(nodeNum);
 }
 
+extern "C" void tui_open_channel_chat(uint8_t ch)
+{
+    TFTView_320x240::tuiOpenChannelChat(ch);
+}
+
+void TFTView_320x240::tuiOpenChannelChat(uint8_t ch)
+{
+    if (instance())
+        instance()->openChannelChat(ch);
+}
+
 // Pin button: centre OUR Maps app on the node and open it. Deliberately userMap, not MUI's own
 // `map` — Jake asked for "our map app".
 extern "C" void tui_show_node_on_map(uint32_t nodeNum, int32_t latI, int32_t lonI)
@@ -10326,13 +10337,33 @@ void TFTView_320x240::tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t l
         instance()->showNodeOnUserMap(nodeNum, latI, lonI);
 }
 
+// Jake: "the message button ... brings you to the node list in the meshtastic app looking at it,
+// but could it make a new message conversation with that node instead?"
+//
+// Yes — and MUI already does exactly this for its own chat rows: showMessages(nodeNum) opens the
+// conversation and CREATES the container when there is not one yet (newMessageContainer), so a node
+// never messaged before works the same as one you talk to daily. The first version of this only
+// scrolled the node list to them, which is a different thing entirely.
+//
+// ui_set_active is called unconditionally rather than inside showMessages: that function only
+// switches panels when MUI happens to have a node panel for this number, and a node we can see but
+// it has not built a row for would otherwise leave the user staring at the previous screen.
 void TFTView_320x240::openChatWithNode(uint32_t nodeNum)
 {
-    auto it = nodes.find(nodeNum);
-    if (it == nodes.end())
-        return; // MUI has no panel for it yet; nothing to open
-    ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
-    lv_obj_scroll_to_view(it->second, LV_ANIM_OFF);
+    showMessages(nodeNum);
+    ui_set_active(objects.messages_button, objects.messages_panel, objects.top_messages_panel);
+    lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+}
+
+// Tapping a channel in the Channels app opens that channel's group conversation.
+void TFTView_320x240::openChannelChat(uint8_t ch)
+{
+    // showMessages(uint8_t) dereferences channel[ch] for the title, so a slot MUI has not built a
+    // label for would take the device down. Check before, not after.
+    if (ch >= c_max_channels || !channel[ch])
+        return;
+    showMessages(ch);
+    ui_set_active(objects.messages_button, objects.messages_panel, objects.top_group_chat_panel);
     lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }
 

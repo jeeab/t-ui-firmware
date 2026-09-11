@@ -79,3 +79,7 @@ build/wasm-*.log
 # each board on this PC points at its own copy of the Espressif packages so a build
 # for one can never overwrite the other board's PSRAM driver.
 platformio_local*.ini
+
+# local build/flash logs and scratch patches
+*.log
+*.patch

@@ -309,6 +309,14 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
 
 void rebuild(void)
 {
+    // Jake: "when favoriting a node, it scrolls you back to the top (can it bring that favorite to
+    // the top, but keep your location on scrolling?)"
+    //
+    // lv_obj_clean throws the scroll away with the children. Remember where he was and put it back.
+    // The starred row really does move to the top — that is the sort doing its job — so everything
+    // below it shifts by one row; holding the PIXEL offset keeps the view within a row of where it
+    // was instead of jumping to the start of a long list.
+    const int32_t keepScroll = lv_obj_get_scroll_y(listCont);
     lv_obj_clean(listCont);
     static uint32_t all[kMaxRows];
     const int n = tdeck_nodes_list(all, kMaxRows);
@@ -321,6 +329,10 @@ void rebuild(void)
         shown++;
     }
     lv_label_set_text(titleLbl, favOnly ? "Favorites" : "Nodes");
+    // After the rows exist, so LVGL knows how far it is allowed to scroll.
+    lv_obj_update_layout(listCont);
+    if (keepScroll > 0)
+        lv_obj_scroll_to_y(listCont, keepScroll, LV_ANIM_OFF);
     if (shown == 0) {
         lv_label_set_text(emptyLbl, favOnly ? "No favorites yet." : "No nodes heard yet.");
         lv_obj_clear_flag(emptyLbl, LV_OBJ_FLAG_HIDDEN);
