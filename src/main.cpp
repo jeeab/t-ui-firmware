@@ -1290,6 +1290,7 @@ extern "C" void tdeck_gps_control_service(void);
 // thread, because set_favorite() re-sorts the node database and writes it to flash — work that
 // froze the device when the LVGL task did it directly. See src/TDeckNodesBridge.cpp.
 extern "C" void tdeck_nodes_service(void);
+extern "C" void tdeck_nodes_dump(void); // one-shot diagnostic, 45 s after boot
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
@@ -1386,6 +1387,7 @@ void loop()
     tdeck_mesh_switch_service();
     tdeck_gps_control_service();
     tdeck_nodes_service();
+    tdeck_nodes_dump();
     tdeck_sound_service();
     tdeck_clock_service();
     tdeck_net_service();

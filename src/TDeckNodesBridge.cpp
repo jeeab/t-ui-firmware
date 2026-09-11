@@ -182,6 +182,7 @@ extern "C" void tdeck_nodes_service(void)
 // need to use to reach this node"). So the app lists who we have HEARD on a
 // channel, and says so in those words rather than implying a roster.
 // -----------------------------------------------------------------------------
+#include "MessageStore.h"
 #include "mesh/Channels.h"
 
 extern "C" int tdeck_channel_count(void)
@@ -216,21 +217,60 @@ extern "C" int tdeck_channel_precision(int idx)
     return (int)channels.getByIndex((ChannelIndex)idx).settings.module_settings.position_precision;
 }
 
-// Nodes last heard on this channel, ourselves excluded, most-recently-heard first.
+// Who is active on this channel, ourselves excluded, most-recently-heard first.
+//
+// ⭐ CORRECTED 2026-09-11. The first version filtered on NodeInfoLite::channel, and a dump of Jake's
+// device showed why that could never work: ALL 150 nodes, his own relays and Max included, were
+// filed under ch=0. That field records the channel a node's NODEINFO arrived on, and Meshtastic
+// broadcasts NodeInfo on the PRIMARY channel — so it is 0 for essentially everyone, forever. A
+// secondary channel could never list a soul no matter how much traffic it carried. Jake found it
+// immediately: "I messaged the howe group, but the channels app/nodes i clicked, didnt see anyone."
+//
+// The stored MESSAGES do know. Each one carries its sender and the channelIndex it arrived on, so
+// the distinct senders on a channel are exactly the people talking on it — which is what "who is in
+// this channel" actually means to someone using it. The nodeDB channel field is still folded in
+// afterwards, because it costs nothing and occasionally catches a node that has sent NodeInfo over
+// a secondary channel.
 extern "C" int tdeck_channel_nodes(int chIdx, uint32_t *out, int maxN)
 {
     if (!out || maxN <= 0 || !nodeDB)
         return 0;
     const uint32_t me = nodeDB->getNodeNum();
-    const size_t total = nodeDB->getNumMeshNodes();
     int n = 0;
+
+    // Newest first, so the list is ordered by who spoke most recently.
+    const auto &msgs = messageStore.getMessages();
+    for (auto it = msgs.rbegin(); it != msgs.rend() && n < maxN; ++it) {
+        if ((int)it->channelIndex != chIdx)
+            continue;
+        const uint32_t s = it->sender;
+        if (!s || s == me)
+            continue;
+        bool seen = false;
+        for (int k = 0; k < n; k++)
+            if (out[k] == s) {
+                seen = true;
+                break;
+            }
+        if (!seen)
+            out[n++] = s;
+    }
+
+    const size_t total = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < total && n < maxN; i++) {
         meshtastic_NodeInfoLite *e = nodeDB->getMeshNodeByIndex(i);
         if (!e || !e->num || e->num == me)
             continue;
         if ((int)e->channel != chIdx)
             continue;
-        out[n++] = e->num;
+        bool seen = false;
+        for (int k = 0; k < n; k++)
+            if (out[k] == e->num) {
+                seen = true;
+                break;
+            }
+        if (!seen)
+            out[n++] = e->num;
     }
     for (int a = 1; a < n; a++) {
         const uint32_t key = out[a];
@@ -247,4 +287,42 @@ extern "C" int tdeck_channel_nodes(int chIdx, uint32_t *out, int maxN)
         out[b + 1] = key;
     }
     return n;
+}
+
+// -----------------------------------------------------------------------------
+// One-shot dump, 45 s after boot. Jake, on the colour: "I messaged the howe group, but
+// the channels app/nodes i clicked, didnt see anyone it in yet ... on the favs, can it
+// show the battery percent of those nodes? some dont allow me to click the maps on them?"
+//
+// Three questions, all answerable only by what the device actually holds. Prints each
+// node with the channel it is filed under, whether it has told us a battery level, and
+// whether it has a position — which is exactly the set of facts behind an empty channel
+// list, a missing percentage and a dead map button. Called from the main loop.
+// -----------------------------------------------------------------------------
+extern "C" void tdeck_nodes_dump(void)
+{
+    static bool done = false;
+    if (done || millis() < 45000 || !nodeDB)
+        return;
+    done = true;
+    for (int ci = 0; ci < (int)channels.getNumChannels(); ci++) {
+        if (channels.getByIndex((ChannelIndex)ci).role == meshtastic_Channel_Role_DISABLED)
+            continue;
+        LOG_INFO("[TUIDUMP] channel %d '%s' role=%d", ci, channels.getName((ChannelIndex)ci),
+                 (int)channels.getByIndex((ChannelIndex)ci).role);
+    }
+    const size_t n = nodeDB->getNumMeshNodes();
+    LOG_INFO("[TUIDUMP] %u nodes", (unsigned)n);
+    for (size_t i = 0; i < n; i++) {
+        meshtastic_NodeInfoLite *e = nodeDB->getMeshNodeByIndex(i);
+        if (!e || !e->num)
+            continue;
+        meshtastic_DeviceMetrics m;
+        const bool hasTel = nodeDB->copyNodeTelemetry(e->num, m) && m.has_battery_level;
+        meshtastic_PositionLite p;
+        const bool hasPos = nodeDB->copyNodePosition(e->num, p) && (p.latitude_i || p.longitude_i);
+        LOG_INFO("[TUIDUMP] 0x%08x ch=%u fav=%d batt=%d pos=%d %s", (unsigned)e->num, (unsigned)e->channel,
+                 (int)nodeDB->isFavorite(e->num), hasTel ? (int)m.battery_level : -1, (int)hasPos,
+                 e->long_name[0] ? e->long_name : "(no name)");
+    }
 }

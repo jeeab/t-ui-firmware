@@ -280,11 +280,18 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
         snprintf(batt, sizeof(batt), "USB"); // Meshtastic sends >100 for "not on a battery"
     else
         snprintf(batt, sizeof(batt), "%d%%", b);
-    // Anything the node has not told us is left out rather than shown as a zero.
-    snprintf(detail, sizeof(detail), "%s%s%s%s%s", dist, (dist[0] && batt[0]) ? "  ·  " : "", batt,
-             ((dist[0] || batt[0]) && age[0]) ? "  ·  seen " : (age[0] ? "seen " : ""), age);
+    // Jake: "some dont allow me to click the maps on them?" — the pin is disabled when a node has
+    // never reported a position, which was correct but invisible. Say "no position" instead of
+    // leaving a gap, so the dead button explains itself.
+    //
+    // Same for the battery: a dump of his device showed three of his four favourites have never sent
+    // a battery level at all (batt=-1), so the percentage was not missing from the UI, it was missing
+    // from the mesh. Showing "no battery" beats silently omitting it and looking broken.
+    const char *distTxt = dist[0] ? dist : "no position";
+    const char *battTxt = batt[0] ? batt : "no battery";
+    snprintf(detail, sizeof(detail), "%s  ·  %s%s%s", distTxt, battTxt, age[0] ? "  ·  seen " : "", age);
     lv_obj_t *sub = lv_label_create(row);
-    lv_label_set_text(sub, detail[0] ? detail : "nothing heard yet");
+    lv_label_set_text(sub, detail);
     lv_obj_set_style_text_color(sub, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     // TOP-aligned, not BOTTOM: bottom-aligning put this line straight under the buttons, which is
     // the text Jake saw being covered.
