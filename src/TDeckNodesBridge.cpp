@@ -29,6 +29,13 @@
 #include "mesh/NodeDB.h"
 #include <cstring>
 
+// Pending favourite toggle, handed from the UI thread to tdeck_nodes_service() on the firmware
+// thread. Declared up here because tdeck_node_is_favorite() reads them before the setter appears.
+static volatile uint32_t s_favPendingNum = 0;
+static volatile bool s_favPendingOn = false;
+static volatile bool s_favPending = false;
+
+
 // Node numbers for the launcher's list, ready to draw: OURSELVES EXCLUDED, and
 // ordered favourites-first, then most-recently-heard within each group. Sorting
 // here rather than in the UI keeps the two apps identical by construction — the
@@ -124,17 +131,44 @@ extern "C" bool tdeck_node_position(uint32_t num, int32_t *latI, int32_t *lonI)
 
 extern "C" bool tdeck_node_is_favorite(uint32_t num)
 {
+    // Answer optimistically for a toggle that has not been applied yet, so the star flips under the
+    // finger instead of waiting a loop for the firmware thread to catch up.
+    if (s_favPending && s_favPendingNum == num)
+        return s_favPendingOn;
     return nodeDB && nodeDB->isFavorite(num);
 }
 
-// Toggling writes through to the same flag the phone app reads, and asks NodeDB to
-// persist it so a reboot does not quietly forget which nodes Jake picked.
+// ⛔ NEVER TOUCH STORAGE FROM THE UI THREAD. Jake, twice: "froze when i added something to my
+// favorites."
+//
+// NodeDB::set_favorite() is not the small flag write it looks like — it calls sortMeshDB() AND
+// saveNodeDatabaseToDisk() internally, so one tap re-sorts the whole database and writes all 250
+// nodes to flash. The first version of this then called saveToDisk() on top of that, writing them
+// twice. Doing that from the LVGL task, while the mesh task owns the same storage, is the deadlock
+// this project already has a rule about (the map pins defer their SD writes to a service tick for
+// exactly this reason). The first freeze left a 0-byte nodes.proto.tmp and cost Jake 250 nodes.
+//
+// So the tap only RECORDS the request. tdeck_nodes_service(), called from the main loop on the
+// firmware thread, is what actually touches nodeDB — the thread that owns it, where a flash write
+// is ordinary.
 extern "C" void tdeck_node_set_favorite(uint32_t num, bool on)
 {
+    s_favPendingNum = num;
+    s_favPendingOn = on;
+    s_favPending = true; // set LAST: the service tick reads this to decide the rest is valid
+}
+
+// Runs on the firmware thread from the main loop. Cheap: one bool test in the common case.
+extern "C" void tdeck_nodes_service(void)
+{
+    if (!s_favPending)
+        return;
+    s_favPending = false;
     if (!nodeDB)
         return;
-    nodeDB->set_favorite(on, num);
-    nodeDB->saveToDisk(SEGMENT_DEVICESTATE);
+    const uint32_t num = s_favPendingNum;
+    const bool on = s_favPendingOn;
+    nodeDB->set_favorite(on, num); // this saves the database itself - do NOT save again
     LOG_INFO("[TUIFAV] 0x%08x %s", (unsigned)num, on ? "favourited" : "un-favourited");
 }
 

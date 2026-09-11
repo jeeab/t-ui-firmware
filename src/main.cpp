@@ -1286,6 +1286,10 @@ extern "C" void tdeck_mesh_switch_service(void);
 // T-Deck launcher GPS on/off: apply any pending request from the UI task on this (main)
 // thread — the safe GPS context. Defined in src/TDeckGpsControl.cpp.
 extern "C" void tdeck_gps_control_service(void);
+// Applies a favourite toggle requested by the Nodes/Favorites apps. It runs HERE, on the firmware
+// thread, because set_favorite() re-sorts the node database and writes it to flash — work that
+// froze the device when the LVGL task did it directly. See src/TDeckNodesBridge.cpp.
+extern "C" void tdeck_nodes_service(void);
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
@@ -1381,6 +1385,7 @@ void loop()
     tdeck_loop_heartbeat();
     tdeck_mesh_switch_service();
     tdeck_gps_control_service();
+    tdeck_nodes_service();
     tdeck_sound_service();
     tdeck_clock_service();
     tdeck_net_service();
