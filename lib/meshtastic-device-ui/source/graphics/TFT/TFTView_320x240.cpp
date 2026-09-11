@@ -643,6 +643,35 @@ lv_obj_t *icRing(lv_obj_t *p, int x, int y, int d, uint32_t color, int borderW)
     lv_obj_set_style_border_width(o, borderW, LV_PART_MAIN);
     return o;
 }
+// A five-pointed star outline, drawn with lv_line.
+//
+// ⚠️ lv_line does NOT copy its point array — the points must outlive the object. So the shape is
+// built ONCE into a static array in the line object's own coordinate space, and every star just
+// positions its object; they can all share the one array precisely because the points are relative.
+lv_obj_t *icStar(lv_obj_t *p, int x, int y, int size, uint32_t color, int w)
+{
+    static lv_point_precise_t pts[11];
+    static int builtFor = -1;
+    if (builtFor != size) {
+        builtFor = size;
+        const double R = size / 2.0, r = R * 0.42, cx = R, cy = R;
+        for (int i = 0; i < 10; i++) {
+            const double ang = (-90.0 + i * 36.0) * M_PI / 180.0;
+            const double rad = (i % 2 == 0) ? R : r;
+            pts[i].x = (lv_value_precise_t)(cx + rad * cos(ang));
+            pts[i].y = (lv_value_precise_t)(cy + rad * sin(ang));
+        }
+        pts[10] = pts[0]; // close it
+    }
+    lv_obj_t *l = lv_line_create(p);
+    lv_line_set_points(l, pts, 11);
+    lv_obj_set_pos(l, x, y);
+    lv_obj_set_style_line_color(l, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_style_line_width(l, w, LV_PART_MAIN);
+    lv_obj_set_style_line_rounded(l, true, LV_PART_MAIN);
+    return l;
+}
+
 void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
 {
     lv_obj_t *ic = lv_obj_create(tile); // transparent 46x40 icon canvas near the tile top
@@ -708,6 +737,13 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icRing(ic, 10, 8, 26, color, 3);
         icBox(ic, 20, 2, 6, 6, color, 1);
         icBox(ic, 22, 15, 2, 9, color, 1);
+    } else if (!strcmp(name, "Nodes")) { // two upper-torso silhouettes, the back one offset
+        icBox(ic, 6, 16, 16, 12, 0x6a6a70, 6);  // back shoulders
+        icRing(ic, 9, 6, 10, 0x6a6a70, 5);      // back head (filled by a thick border)
+        icBox(ic, 18, 18, 20, 14, color, 7);    // front shoulders
+        icRing(ic, 23, 6, 12, color, 6);        // front head
+    } else if (!strcmp(name, "Favorites")) { // five-pointed star outline
+        icStar(ic, 8, 6, 30, color, 3);
     } else if (!strcmp(name, "Files")) { // folder
         icBox(ic, 8, 7, 15, 5, color, 1);
         icBox(ic, 6, 11, 34, 24, color, 3);
@@ -10249,6 +10285,55 @@ void TFTView_320x240::ui_event_chatNodeButton(lv_event_t *e)
         if (panel != currentPanel)
             ui_event_NodeButton(e);
     }
+}
+
+// --- shims for the Nodes/Favorites apps (NodesApp.cpp) -------------------------------------------
+// Those apps are deliberately independent of MUI, so they reach these two actions through extern "C"
+// rather than through this class — the same boundary the firmware bridges use. Both reuse the exact
+// navigation MUI already performs for its own buttons, so behaviour cannot drift from the built-in
+// paths.
+
+// Envelope button: hand the node to MUI, the way its own chat shortcut does.
+extern "C" void tui_open_chat_with(uint32_t nodeNum)
+{
+    TFTView_320x240::tuiOpenChatWith(nodeNum);
+}
+
+void TFTView_320x240::tuiOpenChatWith(uint32_t nodeNum)
+{
+    if (instance())
+        instance()->openChatWithNode(nodeNum);
+}
+
+// Pin button: centre OUR Maps app on the node and open it. Deliberately userMap, not MUI's own
+// `map` — Jake asked for "our map app".
+extern "C" void tui_show_node_on_map(uint32_t nodeNum, int32_t latI, int32_t lonI)
+{
+    TFTView_320x240::tuiShowOnUserMap(nodeNum, latI, lonI);
+}
+
+void TFTView_320x240::tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI)
+{
+    if (instance() && (latI || lonI))
+        instance()->showNodeOnUserMap(nodeNum, latI, lonI);
+}
+
+void TFTView_320x240::openChatWithNode(uint32_t nodeNum)
+{
+    auto it = nodes.find(nodeNum);
+    if (it == nodes.end())
+        return; // MUI has no panel for it yet; nothing to open
+    ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
+    lv_obj_scroll_to_view(it->second, LV_ANIM_OFF);
+    lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+}
+
+void TFTView_320x240::showNodeOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI)
+{
+    (void)nodeNum;
+    openMaps();
+    if (userMap)
+        userMap->setScrolledPosition(latI * 1e-7, lonI * 1e-7);
 }
 
 void TFTView_320x240::ui_event_positionButton(lv_event_t *e)

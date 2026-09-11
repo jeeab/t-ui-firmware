@@ -38,6 +38,10 @@ extern "C" bool tdeck_node_is_favorite(uint32_t num);
 extern "C" void tdeck_node_set_favorite(uint32_t num, bool on);
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
 
+// --- MUI shims (TFTView_320x240.cpp) ---
+extern "C" void tui_open_chat_with(uint32_t nodeNum);
+extern "C" void tui_show_node_on_map(uint32_t nodeNum, int32_t latI, int32_t lonI);
+
 namespace
 {
 // A busy mesh holds hundreds of nodes. Building one row widget per node is exactly
@@ -109,11 +113,78 @@ void onStar(lv_event_t *e)
     rebuild();
 }
 
+// A five-pointed star. lv_line does not copy its points, so the shape is built once into a static
+// array in the line's own coordinate space and every star just positions its object.
+lv_obj_t *starIcon(lv_obj_t *p, int size, uint32_t color, int w)
+{
+    static lv_point_precise_t pts[11];
+    static int builtFor = -1;
+    if (builtFor != size) {
+        builtFor = size;
+        const double R = size / 2.0, r = R * 0.42, c = R;
+        for (int i = 0; i < 10; i++) {
+            const double ang = (-90.0 + i * 36.0) * M_PI / 180.0;
+            const double rad = (i % 2 == 0) ? R : r;
+            pts[i].x = (lv_value_precise_t)(c + rad * cos(ang));
+            pts[i].y = (lv_value_precise_t)(c + rad * sin(ang));
+        }
+        pts[10] = pts[0];
+    }
+    lv_obj_t *l = lv_line_create(p);
+    lv_line_set_points(l, pts, 11);
+    lv_obj_set_style_line_color(l, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_style_line_width(l, w, LV_PART_MAIN);
+    lv_obj_set_style_line_rounded(l, true, LV_PART_MAIN);
+    return l;
+}
+
+void onChat(lv_event_t *e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i >= 0 && i < kMaxRows)
+        tui_open_chat_with(rowNode[i]);
+}
+
+void onMap(lv_event_t *e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= kMaxRows)
+        return;
+    int32_t la = 0, lo = 0;
+    if (tdeck_node_position(rowNode[i], &la, &lo))
+        tui_show_node_on_map(rowNode[i], la, lo);
+}
+
+// One action button: a flat tile with either a symbol glyph or a drawn star.
+lv_obj_t *actionBtn(lv_obj_t *parent, int x, int w, const char *sym, uint32_t fg, lv_event_cb_t cb, int idx)
+{
+    lv_obj_t *b = lv_obj_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, 38);
+    lv_obj_set_pos(b, x, 44);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(b, 6, LV_PART_MAIN);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    if (cb)
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    if (sym) {
+        lv_obj_t *l = lv_label_create(b);
+        lv_label_set_text(l, sym);
+        lv_obj_set_style_text_color(l, lv_color_hex(fg), LV_PART_MAIN);
+        lv_obj_center(l);
+    }
+    return b;
+}
+
 void addRow(lv_obj_t *parent, uint32_t num, int idx)
 {
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 44);
+    // Twice the old height (Jake): the top half names the node, the bottom half carries three
+    // full-width action buttons — far better touch targets than icons squeezed onto one line.
+    lv_obj_set_size(row, lv_pct(100), 88);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
@@ -124,7 +195,7 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     lv_label_set_text(name, tdeck_node_name(num));
     lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(name, 200);
+    lv_obj_set_width(name, 290);
     lv_obj_align(name, LV_ALIGN_TOP_LEFT, 8, 4);
 
     char age[12], dist[24], batt[12], detail[72];
@@ -145,19 +216,21 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     lv_obj_set_style_text_color(sub, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(sub, LV_ALIGN_BOTTOM_LEFT, 8, -4);
 
-    // The star gets its own 44px tap target at the right edge, so it can never be
-    // mistaken for a tap on the row itself.
-    lv_obj_t *star = lv_obj_create(row);
-    lv_obj_remove_style_all(star);
-    lv_obj_set_size(star, 44, 44);
-    lv_obj_align(star, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_add_flag(star, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(star, onStar, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
-    lv_obj_t *sl = lv_label_create(star);
+    // Three actions along the bottom: message, show on map, favourite.
+    const int bw = 96;
+    actionBtn(row, 4, bw, LV_SYMBOL_ENVELOPE, 0x0a84ff, onChat, idx);
+
+    // The map button is only live for a node that has actually reported a position — a dead button
+    // is clearer than one that looks alive and does nothing.
+    int32_t la = 0, lo = 0;
+    const bool hasPos = tdeck_node_position(num, &la, &lo);
+    actionBtn(row, 8 + bw, bw, LV_SYMBOL_GPS, hasPos ? 0x5ac8fa : 0x48484a, hasPos ? onMap : nullptr, idx);
+
+    // Star: yellow and thick when favourited, a thin grey outline when not.
+    lv_obj_t *fav = actionBtn(row, 12 + 2 * bw, bw, nullptr, 0, onStar, idx);
     const bool on = tdeck_node_is_favorite(num);
-    lv_label_set_text(sl, on ? LV_SYMBOL_OK : LV_SYMBOL_PLUS);
-    lv_obj_set_style_text_color(sl, lv_color_hex(on ? 0xffd60a : 0x5a5a5e), LV_PART_MAIN);
-    lv_obj_center(sl);
+    lv_obj_t *st = starIcon(fav, 24, on ? 0xffd60a : 0x6a6a70, on ? 4 : 2);
+    lv_obj_center(st);
 }
 
 void rebuild(void)

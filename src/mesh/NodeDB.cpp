@@ -1562,18 +1562,36 @@ void NodeDB::resetNodes(bool keepFavorites)
     if (!config.position.fixed_position)
         clearLocalPosition();
     NodeNum ourNum = getNodeNum();
+    const size_t oldCount = numMeshNodes;
     numMeshNodes = 1;
     if (keepFavorites) {
         LOG_INFO("Clearing node database - preserving favorites");
-        for (size_t i = 0; i < meshNodes->size(); i++) {
+        // ⚠️ The survivors have to be COMPACTED to the front of the array, not just blanked where
+        // they sat. getMeshNodeByIndex() asserts x < numMeshNodes and indexes meshNodes directly,
+        // so the live nodes are by definition the first numMeshNodes entries.
+        //
+        // This previously zeroed non-favourites in place and counted the survivors, which produced
+        // neither: a favourite at index 120 stayed in the array but sat far above the new count, so
+        // it was unreachable, while the blanked entries below the count showed as empty rows. It
+        // also counted index 0 twice — numMeshNodes started at 1 for us, then the loop's else branch
+        // counted us again.
+        size_t keep = 1; // index 0 is this device, and is never cleared
+        for (size_t i = 1; i < oldCount && i < meshNodes->size(); i++) {
             meshtastic_NodeInfoLite &node = meshNodes->at(i);
-            if (i > 0 && !nodeInfoLiteIsFavorite(&node)) {
-                eraseNodeSatellites(node.num);
-                node = meshtastic_NodeInfoLite();
+            if (!node.num)
+                continue;
+            if (nodeInfoLiteIsFavorite(&node)) {
+                if (keep != i)
+                    meshNodes->at(keep) = node;
+                keep++;
             } else {
-                numMeshNodes += 1;
+                eraseNodeSatellites(node.num);
             }
-        };
+        }
+        for (size_t i = keep; i < meshNodes->size(); i++)
+            meshNodes->at(i) = meshtastic_NodeInfoLite();
+        numMeshNodes = keep;
+        LOG_INFO("Node database reset: kept %u favorites (was %u nodes)", (unsigned)(keep - 1), (unsigned)oldCount);
     } else {
         LOG_INFO("Clearing node database - removing favorites");
         for (size_t i = 1; i < meshNodes->size(); i++) {
@@ -3147,10 +3165,46 @@ void NodeDB::updatePosition(uint32_t nodeId, const meshtastic_Position &p, RxSou
             // recorded based on the packet rxTime
             //
             // FIXME perhaps handle RX_SRC_USER separately?
-            LOG_INFO("updatePosition REMOTE node=0x%08x time=%u lat=%d lon=%d", nodeId, p.time, p.latitude_i, p.longitude_i);
+            // precision_bits is the whole question when the same node is heard on two channels:
+            // 32 (or 0, meaning pre-migration full precision) = exact; anything lower is deliberately
+            // scrambled to a grid cell by position_precision on that channel.
+            LOG_INFO("updatePosition REMOTE node=0x%08x time=%u lat=%d lon=%d prec=%u (had prec=%u)", nodeId, p.time,
+                     p.latitude_i, p.longitude_i, (unsigned)p.precision_bits, (unsigned)slot.precision_bits);
 
             // First, back up fields that we want to protect from overwrite
             uint32_t tmp_time = slot.time;
+
+            // ⭐ DON'T LET A COARSE POSITION CLOBBER A PRECISE ONE.
+            //
+            // Jake, 2026-09-09: "those nodes are a part of the howe group which share precise
+            // location, so it's going to their scrambled location from long fast."
+            //
+            // The same node is heard on two channels: his private channel, which shares full
+            // precision, and LongFast, where position_precision deliberately scrambles it to a
+            // coarse grid cell. There is only ONE position slot per node and this was last-write-
+            // wins, so whichever arrived most recently won — and the coarse LongFast beacons are
+            // far more frequent. The map then walked to a scrambled point.
+            //
+            // precision_bits says how good a fix is (higher = finer; 0 means "pre-migration data",
+            // which TypeConversions treats as full 32). So: refuse a DOWNGRADE while the precise fix
+            // is still fresh. After kPrecisionHoldSecs we accept the coarse one anyway, because by
+            // then the node may genuinely have moved and a stale exact point is worse than a current
+            // rough one. Time still updates either way — this only guards the coordinates.
+            constexpr uint32_t kPrecisionHoldSecs = 60 * 60;
+            const uint8_t oldPrec = slot.precision_bits == 0 ? 32 : slot.precision_bits;
+            const uint8_t newPrec = p.precision_bits == 0 ? 32 : p.precision_bits;
+            const bool hadFix = slot.latitude_i || slot.longitude_i;
+            const uint32_t nowSecs = getValidTime(RTCQualityFromNet);
+            const bool oldStillFresh = slot.time && nowSecs && (nowSecs - slot.time) < kPrecisionHoldSecs;
+            if (hadFix && oldStillFresh && newPrec < oldPrec) {
+                LOG_INFO("updatePosition node=0x%08x KEEPING precise fix (%u bits) over coarser %u bits", nodeId,
+                         (unsigned)oldPrec, (unsigned)newPrec);
+                if (p.time > slot.time)
+                    slot.time = p.time;
+                updateGUIforNode = info;
+                notifyObservers(true);
+                return;
+            }
 
             // Next, update atomically
             slot = TypeConversions::ConvertToPositionLite(p);

@@ -817,6 +817,17 @@ class TFTView_320x240 : public MeshtasticView
     static void ui_event_mapContrastSlider(lv_event_t *e);
     static void ui_event_mapNodeButton(lv_event_t *e);
     static void ui_event_chatNodeButton(lv_event_t *e);
+
+  public:
+    // Entry points for the Nodes/Favorites launcher apps (NodesApp.cpp), reached through the
+    // extern "C" shims in the .cpp. Static because instance() is private — a free function cannot
+    // get at it, but a static member can.
+    static void tuiOpenChatWith(uint32_t nodeNum);
+    static void tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
+
+  private:
+    void openChatWithNode(uint32_t nodeNum);
+    void showNodeOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
     static void ui_event_positionButton(lv_event_t *e);
 
     // animations
