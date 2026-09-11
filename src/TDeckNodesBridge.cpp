@@ -137,3 +137,80 @@ extern "C" void tdeck_node_set_favorite(uint32_t num, bool on)
     nodeDB->saveToDisk(SEGMENT_DEVICESTATE);
     LOG_INFO("[TUIFAV] 0x%08x %s", (unsigned)num, on ? "favourited" : "un-favourited");
 }
+
+// -----------------------------------------------------------------------------
+// Channels — for the launcher's Channels app.
+//
+// ⚠️ MESHTASTIC DOES NOT TRACK CHANNEL MEMBERSHIP. A node never advertises which
+// channels it is on, so "who is in this channel" is not a question the mesh can
+// answer. What the device DOES know is the channel it last heard each node's
+// NodeInfo on — NodeDB sets info->channel for exactly that reason ("the channel we
+// need to use to reach this node"). So the app lists who we have HEARD on a
+// channel, and says so in those words rather than implying a roster.
+// -----------------------------------------------------------------------------
+#include "mesh/Channels.h"
+
+extern "C" int tdeck_channel_count(void)
+{
+    return (int)channels.getNumChannels();
+}
+
+// Name as configured. The primary comes back as its modem preset name (e.g. "LongFast")
+// when it has no explicit name, which is what the phone app shows too.
+extern "C" const char *tdeck_channel_name(int idx)
+{
+    if (idx < 0 || idx >= (int)channels.getNumChannels())
+        return "";
+    return channels.getName((ChannelIndex)idx);
+}
+
+// 0 = disabled (don't show it), 1 = primary, 2 = secondary.
+extern "C" int tdeck_channel_role(int idx)
+{
+    if (idx < 0 || idx >= (int)channels.getNumChannels())
+        return 0;
+    return (int)channels.getByIndex((ChannelIndex)idx).role;
+}
+
+// position_precision for this channel: 32 = exact, lower = scrambled to a grid cell,
+// 0 = positions not shared. This is the number that decides whether the map shows a
+// node where it really is.
+extern "C" int tdeck_channel_precision(int idx)
+{
+    if (idx < 0 || idx >= (int)channels.getNumChannels())
+        return 0;
+    return (int)channels.getByIndex((ChannelIndex)idx).settings.module_settings.position_precision;
+}
+
+// Nodes last heard on this channel, ourselves excluded, most-recently-heard first.
+extern "C" int tdeck_channel_nodes(int chIdx, uint32_t *out, int maxN)
+{
+    if (!out || maxN <= 0 || !nodeDB)
+        return 0;
+    const uint32_t me = nodeDB->getNodeNum();
+    const size_t total = nodeDB->getNumMeshNodes();
+    int n = 0;
+    for (size_t i = 0; i < total && n < maxN; i++) {
+        meshtastic_NodeInfoLite *e = nodeDB->getMeshNodeByIndex(i);
+        if (!e || !e->num || e->num == me)
+            continue;
+        if ((int)e->channel != chIdx)
+            continue;
+        out[n++] = e->num;
+    }
+    for (int a = 1; a < n; a++) {
+        const uint32_t key = out[a];
+        meshtastic_NodeInfoLite *ke = nodeDB->getMeshNode(key);
+        const uint32_t kh = ke ? ke->last_heard : 0;
+        int b = a - 1;
+        while (b >= 0) {
+            meshtastic_NodeInfoLite *be = nodeDB->getMeshNode(out[b]);
+            if (!be || be->last_heard >= kh)
+                break;
+            out[b + 1] = out[b];
+            b--;
+        }
+        out[b + 1] = key;
+    }
+    return n;
+}

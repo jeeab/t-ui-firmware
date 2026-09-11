@@ -149,6 +149,8 @@ extern "C" void stopwatch_open(void);
 // left completely untouched — Jake wants future device-ui updates to merge cleanly.
 extern "C" void nodes_open(void);
 extern "C" void favorites_open(void);
+// Channels (ChannelsApp.cpp): what this device listens to, and who it has heard there.
+extern "C" void channels_open(void);
 // Notes module (NotesApp.cpp) — .txt notes on the SD card.
 extern "C" void notes_open(void);
 extern "C" void notes_open_file(const char *path); // Files app opens .txt files with this
@@ -619,6 +621,8 @@ static const LauncherApp kApps[] = {
     {"Nodes", &img_nodes_button_image, 0x5ac8fa, nullptr, nullptr, nullptr, &nodes_open},
     // Favorites = the same list filtered to the starred ones.
     {"Favorites", &img_nodes_button_image, 0xffd60a, nullptr, nullptr, nullptr, &favorites_open},
+    // Channels = the configured channels, and who we have heard on each.
+    {"Channels", &img_nodes_button_image, 0x30d158, nullptr, nullptr, nullptr, &channels_open},
 };
 
 // --- simple per-app icons, drawn from lv_obj primitives (no image assets needed) ---
@@ -744,6 +748,10 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icRing(ic, 23, 6, 12, color, 6);        // front head
     } else if (!strcmp(name, "Favorites")) { // five-pointed star outline
         icStar(ic, 8, 6, 30, color, 3);
+    } else if (!strcmp(name, "Channels")) { // three stacked "channel" bars, the top one active
+        icBox(ic, 8, 8, 30, 7, color, 3);
+        icBox(ic, 8, 19, 30, 7, 0x6a6a70, 3);
+        icBox(ic, 8, 30, 30, 7, 0x6a6a70, 3);
     } else if (!strcmp(name, "Files")) { // folder
         icBox(ic, 8, 7, 15, 5, color, 1);
         icBox(ic, 6, 11, 34, 24, color, 3);
