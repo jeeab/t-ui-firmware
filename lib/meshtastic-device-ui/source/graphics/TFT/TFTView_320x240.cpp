@@ -8426,8 +8426,12 @@ void TFTView_320x240::showLockGlance(void)
         // behind the knob, the knob simply travels along it.
         lv_obj_set_style_bg_opa(glance_slider, LV_OPA_TRANSP, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(glance_slider, lv_color_hex(0xf2f2f7), LV_PART_KNOB);
-        lv_obj_set_style_radius(glance_slider, 19, LV_PART_KNOB);
-        lv_obj_set_style_pad_all(glance_slider, 15, LV_PART_KNOB);
+        lv_obj_set_style_radius(glance_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+        // ⚠️ NOT pad_all 15. An LVGL slider knob is sized from the TRACK's height plus its
+        // own padding, so 15 on a 46px track gave a 76px knob - taller than the track it sits
+        // in, hanging off the left edge of the screen and covering the notification above it.
+        // Caught by rendering the screen on the PC (C:	dsim); it is invisible in a build log.
+        lv_obj_set_style_pad_all(glance_slider, -4, LV_PART_KNOB);
 
         glance_slide_label = lv_label_create(lockglance_screen);
         lv_label_set_text(glance_slide_label, "slide to unlock");
