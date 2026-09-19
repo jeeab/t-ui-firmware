@@ -48,6 +48,7 @@ extern "C" void notif_open(void);      // the Notifications page
 extern "C" int notif_count(void);      // how many are being held
 extern "C" void notif_clear(void);     // "clear" button, and whenever messages are read
 extern "C" bool notif_peek(int i, char *who, size_t whoN, char *text, size_t textN, uint32_t *ageSecs);
+extern "C" bool notif_unread_from(uint32_t nodeNum); // does this node have something unread?
 
 // --- MUI shims (TFTView_320x240.cpp) ---
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
@@ -430,6 +431,19 @@ extern "C" bool notif_peek(int i, char *who, size_t whoN, char *text, size_t tex
     if (ageSecs)
         *ageSecs = (lv_tick_get() - n.when) / 1000;
     return true;
+}
+
+// Jake: "fav app needs to show who sent somthing if unread". The Nodes and Favorites rows
+// ask this per node. Linear over at most 16 entries, called while building a list - far
+// cheaper than keeping a second index in step with the store.
+extern "C" bool notif_unread_from(uint32_t nodeNum)
+{
+    if (!store || !nodeNum)
+        return false;
+    for (int i = 0; i < count; i++)
+        if (!store[i].isChannel && store[i].from == nodeNum)
+            return true;
+    return false;
 }
 
 extern "C" void notif_open(void)

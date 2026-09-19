@@ -41,6 +41,8 @@ extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
 // --- MUI shims (TFTView_320x240.cpp) ---
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
 extern "C" void tui_show_node_on_map(uint32_t nodeNum, int32_t latI, int32_t lonI);
+// Notification centre: has this node sent something that has not been read yet?
+extern "C" bool notif_unread_from(uint32_t nodeNum);
 
 namespace
 {
@@ -263,12 +265,27 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Jake, 2026-09-18: "fav app needs to show who sent somthing if unread". A green dot
+    // against the name, and the row's detail line says so in words underneath - on a list
+    // this dense a dot alone is easy to miss.
+    const bool unread = notif_unread_from(num);
+
     lv_obj_t *name = lv_label_create(row);
     lv_label_set_text(name, tdeck_node_name(num));
     lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(name, 290);
-    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 8, 3);
+    lv_obj_set_width(name, unread ? 276 : 290);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, unread ? 20 : 8, 3);
+
+    if (unread) {
+        lv_obj_t *dot = lv_obj_create(row);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 9, 9);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 7, 8);
+    }
 
     char age[12], dist[24], batt[12], detail[72];
     ageText(tdeck_node_age_secs(num), age, sizeof(age));
@@ -291,8 +308,10 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     const char *battTxt = batt[0] ? batt : "no battery";
     snprintf(detail, sizeof(detail), "%s  ·  %s%s%s", distTxt, battTxt, age[0] ? "  ·  seen " : "", age);
     lv_obj_t *sub = lv_label_create(row);
-    lv_label_set_text(sub, detail);
-    lv_obj_set_style_text_color(sub, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    // An unread message is the most useful thing this line could be telling you, so it takes
+    // the line over entirely and turns green rather than being appended to the end.
+    lv_label_set_text(sub, unread ? "New message - tap the envelope to read" : detail);
+    lv_obj_set_style_text_color(sub, lv_color_hex(unread ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
     // TOP-aligned, not BOTTOM: bottom-aligning put this line straight under the buttons, which is
     // the text Jake saw being covered.
     lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 8, 24);

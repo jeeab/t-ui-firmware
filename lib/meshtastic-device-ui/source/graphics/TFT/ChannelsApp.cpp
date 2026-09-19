@@ -1,5 +1,10 @@
 // -----------------------------------------------------------------------------
-// T-UI Channels — what this device is listening to, and who it has heard there.
+// T-UI Conversations — the people you are talking to, and the channels you listen to.
+//
+// Started life as Channels. Jake, 2026-09-18: "channeks app needs to be renamed, include
+// covorsations too" / "should show all current conversations, not just channels". So the
+// list is now People first (anyone this device has exchanged a DIRECT message with, newest
+// first, with the last line of the conversation) and then Channels underneath, unchanged.
 //
 // Jake, 2026-09-10: "another cool app would be channels: So for me personally, it
 // would show, long fast, and Howe group. on the custom channels (not long fast),
@@ -24,6 +29,8 @@
 extern "C" void channels_open(void);
 
 // --- firmware bridge (src/TDeckNodesBridge.cpp) ---
+extern "C" int tdeck_dm_conversations(uint32_t *out, uint32_t *lastWhen, int maxN);
+extern "C" bool tdeck_dm_last_text(uint32_t nodeNum, char *out, int outN, bool *fromMe);
 extern "C" int tdeck_channel_count(void);
 extern "C" const char *tdeck_channel_name(int idx);
 extern "C" int tdeck_channel_role(int idx);
@@ -34,6 +41,8 @@ extern "C" uint32_t tdeck_node_age_secs(uint32_t num);
 
 // --- MUI shim (TFTView_320x240.cpp) ---
 extern "C" void tui_open_channel_chat(uint8_t ch);
+extern "C" void tui_open_chat_with(uint32_t nodeNum);
+extern "C" bool notif_unread_from(uint32_t nodeNum);
 
 namespace
 {
@@ -44,8 +53,16 @@ lv_obj_t *listCont = nullptr;
 lv_obj_t *titleLbl = nullptr;
 lv_obj_t *noteLbl = nullptr;
 lv_obj_t *prevScreen = nullptr;
-int viewChannel = -1; // -1 = the channel list; otherwise the members of that channel
+int viewChannel = -1; // -1 = the main list; otherwise the members of that channel
 uint32_t members[kMaxMembers];
+
+// Jake, 2026-09-18: "channeks app needs to be renamed, include covorsations too" and
+// "should show all current conversations, not just channels". So the app is Conversations
+// now, and the list is both: the channels this device listens to, and every person it has
+// actually exchanged a direct message with.
+const int kMaxConvos = 24;
+uint32_t convos[kMaxConvos];
+uint32_t convoWhen[kMaxConvos];
 
 void rebuild(void);
 
@@ -114,6 +131,12 @@ void onOpenChat(lv_event_t *e)
     lv_async_call([](void *p) { tui_open_channel_chat((uint8_t)(intptr_t)p); }, (void *)(intptr_t)ch);
 }
 
+void onOpenDm(lv_event_t *e)
+{
+    const uint32_t num = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    lv_async_call([](void *p) { tui_open_chat_with((uint32_t)(uintptr_t)p); }, (void *)(uintptr_t)num);
+}
+
 void onOpenMembers(lv_event_t *e)
 {
     viewChannel = (int)(intptr_t)lv_event_get_user_data(e);
@@ -128,8 +151,59 @@ void onBackToChannels(lv_event_t *)
 
 void buildChannelList(void)
 {
-    lv_label_set_text(titleLbl, "Channels");
+    lv_label_set_text(titleLbl, "Conversations");
     int shown = 0;
+
+    // ---- the people you are actually talking to, first: that is what you open this for ----
+    const int nConvo = tdeck_dm_conversations(convos, convoWhen, kMaxConvos);
+    if (nConvo > 0) {
+        lv_obj_t *hdr = lv_label_create(listCont);
+        lv_label_set_text(hdr, "People");
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
+    for (int i = 0; i < nConvo; i++) {
+        shown++;
+        lv_obj_t *row = makeRow(56);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, onOpenDm, LV_EVENT_CLICKED, (void *)(uintptr_t)convos[i]);
+
+        const bool unread = notif_unread_from(convos[i]);
+        if (unread) {
+            lv_obj_t *dot = lv_obj_create(row);
+            lv_obj_remove_style_all(dot);
+            lv_obj_set_size(dot, 9, 9);
+            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(dot, lv_color_hex(0x30d158), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 9, 11);
+        }
+        makeLabel(row, tdeck_node_name(convos[i]), 0xffffff, LV_ALIGN_TOP_LEFT, unread ? 24 : 10, 6);
+
+        // The last thing said, and who said it, so the row is worth reading at a glance.
+        char last[80];
+        bool mine = false;
+        if (tdeck_dm_last_text(convos[i], last, sizeof(last), &mine)) {
+            char line[96];
+            snprintf(line, sizeof(line), "%s%s", mine ? "You: " : "", last);
+            lv_obj_t *l = makeLabel(row, line, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
+            lv_obj_set_width(l, 240);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+            lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 10, -6); // re-align: setting a width moves it
+        } else {
+            makeLabel(row, "No messages yet", 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
+        }
+
+        char age[16];
+        ageText(tdeck_node_age_secs(convos[i]), age, sizeof(age));
+        if (age[0])
+            makeLabel(row, age, 0x8e8e93, LV_ALIGN_TOP_RIGHT, -10, 6);
+    }
+
+    if (nConvo > 0) {
+        lv_obj_t *hdr = lv_label_create(listCont);
+        lv_label_set_text(hdr, "Channels");
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
     for (int i = 0; i < tdeck_channel_count(); i++) {
         const int role = tdeck_channel_role(i);
         if (role == 0)
@@ -171,7 +245,7 @@ void buildChannelList(void)
         }
     }
     if (!shown)
-        lv_label_set_text(noteLbl, "No channels configured.");
+        lv_label_set_text(noteLbl, "No conversations yet.\nChannels appear here once configured,\nand people once you have messaged.");
     else
         lv_label_set_text(noteLbl, "");
 }
@@ -184,7 +258,7 @@ void buildMemberList(void)
     lv_obj_t *back = makeRow(36);
     lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(back, onBackToChannels, LV_EVENT_CLICKED, nullptr);
-    makeLabel(back, LV_SYMBOL_LEFT "  All channels", 0x0a84ff, LV_ALIGN_LEFT_MID, 10, 0);
+    makeLabel(back, LV_SYMBOL_LEFT "  All conversations", 0x0a84ff, LV_ALIGN_LEFT_MID, 10, 0);
 
     const int n = tdeck_channel_nodes(viewChannel, members, kMaxMembers);
     for (int i = 0; i < n; i++) {

@@ -631,8 +631,8 @@ static const LauncherApp kApps[] = {
     {"Nodes", &img_nodes_button_image, 0x5ac8fa, nullptr, nullptr, nullptr, &nodes_open},
     // Favorites = the same list filtered to the starred ones.
     {"Favorites", &img_nodes_button_image, 0xffd60a, nullptr, nullptr, nullptr, &favorites_open},
-    // Channels = the configured channels, and who we have heard on each.
-    {"Channels", &img_nodes_button_image, 0x30d158, nullptr, nullptr, nullptr, &channels_open},
+    // Conversations = who you are talking to, plus the channels you listen to.
+    {"Chats", &img_nodes_button_image, 0x30d158, nullptr, nullptr, nullptr, &channels_open},
     // Notifications = what has come in while you were elsewhere. Tapping the unread count in
     // the top bar opens the same page; this tile is how you get there when the count is zero.
     {"Alerts", &img_messages_button_image, 0xff453a, nullptr, nullptr, nullptr, &notif_open},
@@ -761,10 +761,11 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icRing(ic, 23, 6, 12, color, 6);        // front head
     } else if (!strcmp(name, "Favorites")) { // five-pointed star outline
         icStar(ic, 8, 6, 30, color, 3);
-    } else if (!strcmp(name, "Channels")) { // three stacked "channel" bars, the top one active
-        icBox(ic, 8, 8, 30, 7, color, 3);
-        icBox(ic, 8, 19, 30, 7, 0x6a6a70, 3);
-        icBox(ic, 8, 30, 30, 7, 0x6a6a70, 3);
+    } else if (!strcmp(name, "Chats")) { // two speech bubbles, the front one active
+        icBox(ic, 4, 4, 26, 18, 0x6a6a70, 6);  // back bubble
+        icBox(ic, 8, 20, 6, 5, 0x6a6a70, 1);   // its tail
+        icBox(ic, 14, 16, 26, 20, color, 6);   // front bubble
+        icBox(ic, 30, 34, 7, 6, color, 1);     // its tail
     } else if (!strcmp(name, "Alerts")) { // a bell: dome, rim, clapper
         icBox(ic, 13, 8, 20, 18, color, 8);           // dome
         icBox(ic, 21, 3, 4, 5, color, 2);             // the little loop on top

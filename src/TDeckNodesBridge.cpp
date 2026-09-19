@@ -231,6 +231,89 @@ extern "C" int tdeck_channel_precision(int idx)
 // this channel" actually means to someone using it. The nodeDB channel field is still folded in
 // afterwards, because it costs nothing and occasionally catches a node that has sent NodeInfo over
 // a secondary channel.
+// -----------------------------------------------------------------------------
+// Direct conversations, for the Conversations app.
+//
+// Jake, 2026-09-18: "channeks app needs to be renamed, include covorsations too",
+// then "should show all current conversations, not just channels".
+//
+// A "conversation" here is any node this device has exchanged a DIRECT message with,
+// either way round. MessageStore holds both sides (addFromPacket records our own sends
+// too), so one pass over it answers the question. Broadcast traffic is deliberately
+// skipped - that is what the channel rows above it are for.
+//
+// Ordered most recent first, which is the only order a conversation list ever wants.
+// -----------------------------------------------------------------------------
+extern "C" int tdeck_dm_conversations(uint32_t *out, uint32_t *lastWhen, int maxN)
+{
+    if (!out || maxN <= 0 || !nodeDB)
+        return 0;
+    const uint32_t me = nodeDB->getNodeNum();
+    int n = 0;
+
+    const auto &msgs = messageStore.getMessages();
+    for (auto it = msgs.rbegin(); it != msgs.rend() && n < maxN; ++it) {
+        if (it->type != MessageType::DM_TO_US && it->dest == 0xffffffff)
+            continue; // a broadcast: belongs to a channel row, not here
+
+        // The other end of the conversation is whichever of the two is not us. A message we
+        // SENT has sender == me and dest == them; one we received has it the other way about.
+        uint32_t other = 0;
+        if (it->sender == me)
+            other = it->dest;
+        else if (it->dest == me || it->type == MessageType::DM_TO_US)
+            other = it->sender;
+        else
+            continue; // neither end is us - not our conversation
+
+        if (!other || other == me || other == 0xffffffff)
+            continue;
+
+        bool seen = false;
+        for (int k = 0; k < n; k++)
+            if (out[k] == other) {
+                seen = true;
+                break;
+            }
+        if (seen)
+            continue; // already have this one, and we are walking newest-first
+
+        out[n] = other;
+        if (lastWhen)
+            lastWhen[n] = it->timestamp;
+        n++;
+    }
+    return n;
+}
+
+// The last thing said in a direct conversation, for the preview line. Returns false when
+// there is nothing to show rather than handing back an empty string, so the caller can tell
+// "no messages" from "a message that was empty".
+extern "C" bool tdeck_dm_last_text(uint32_t nodeNum, char *out, int outN, bool *fromMe)
+{
+    if (!out || outN <= 0 || !nodeDB)
+        return false;
+    out[0] = 0;
+    const uint32_t me = nodeDB->getNodeNum();
+    const auto &msgs = messageStore.getMessages();
+    for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
+        const bool mine = (it->sender == me);
+        const uint32_t other = mine ? it->dest : it->sender;
+        if (other != nodeNum)
+            continue;
+        if (!mine && it->type != MessageType::DM_TO_US && it->dest != me)
+            continue; // heard on a channel, not said to us
+        const char *t = MessageStore::getText(*it);
+        if (!t)
+            return false;
+        snprintf(out, (size_t)outN, "%s", t);
+        if (fromMe)
+            *fromMe = mine;
+        return true;
+    }
+    return false;
+}
+
 extern "C" int tdeck_channel_nodes(int chIdx, uint32_t *out, int maxN)
 {
     if (!out || maxN <= 0 || !nodeDB)
