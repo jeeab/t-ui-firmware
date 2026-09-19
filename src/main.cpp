@@ -1294,6 +1294,7 @@ extern "C" void tdeck_nodes_dump(void); // one-shot diagnostic, 45 s after boot
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
+#include <esp_heap_caps.h>
 extern "C" void tdeck_pop_service(void); // TDeckPop.cpp - starts the new-message pop off-thread
 extern "C" void tdeck_shot_service(void); // TDeckScreenshot.cpp - writes a pending screenshot
 extern "C" void tdeck_share_location_service(void); // TDeckShareLocation.cpp - one-shot position send

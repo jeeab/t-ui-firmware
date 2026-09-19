@@ -1226,25 +1226,6 @@ void TFTView_320x240::createLauncher(void)
     lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
     lv_label_set_text(launcher_mesh_off_label, meshEnabled ? "" : "mesh off");
     updateUnreadMessages(); // reflect any count that already accrued before the grid was built
-    // TEMPORARY DIAGNOSTIC (Jake reported overlapping text in Chats). Logs what
-    // tuiDmConversations() returns once, 25s after boot - late enough that messages have
-    // been restored from flash. Remove once the overlap is understood.
-    lv_timer_t *chatDump = lv_timer_create(
-        [](lv_timer_t *t) {
-            lv_timer_delete(t);
-            uint32_t list[24];
-            const int n = TFTView_320x240::tuiDmConversations(list, 24);
-            ILOG_INFO("[CHATDBG] boot dump: %d conversations", n);
-            for (int i = 0; i < n; i++) {
-                char last[80];
-                const bool got = TFTView_320x240::tuiDmLastText(list[i], last, sizeof(last));
-                ILOG_INFO("[CHATDBG]  %d: node=0x%08x name='%s' last=%s", i, (unsigned)list[i],
-                          tdeck_node_name(list[i]), got ? last : "(none)");
-            }
-        },
-        25000, NULL);
-    (void)chatDump; // the callback deletes it; no repeat_count (that deletes it too)
-
     notif_init();           // build the notification card NOW, on the UI task — a message can
                             // arrive on the mesh task at any moment and must not create objects
 
@@ -13508,6 +13489,43 @@ void TFTView_320x240::addNode(uint32_t nodeNum, uint8_t ch, const char *userShor
 
     ILOG_DEBUG("addNode(%d): num=0x%08x, lastseen=%d, name=%s(%s), role=%d", nodeCount, nodeNum, lastHeard, userLong, userShort,
                role);
+    // ⛔ CHURN LIMIT - this is the bug that has been crashing the device.
+    //
+    // Captured on 2026-09-19 with a twice-a-second heap ticker:
+    //     addNode(60): num=0x0a58b148 ...   removing oldest node 0x2c50dd53
+    //     addNode(60): num=0x2c50dd53 ...   removing oldest node 0x0a58b148
+    //     addNode(60): num=0x0a58b148 ...   removing oldest node 0x2c50dd53
+    // Two nodes evicting each other as fast as packets arrived, each cycle building and
+    // tearing down a whole LVGL node panel. Free INTERNAL heap fell to 664 BYTES, and the
+    // all-time low for a boot has been measured at 216. That is exactly where this
+    // device's crash log sits (ram_low=1k / 2k, restart=CRASH).
+    //
+    // It happens whenever the view is full and an evicted node comes straight back on its
+    // next packet, which on a busy mesh is constant. The cap itself is not the problem -
+    // the unbounded rebuilding is. So: allow the list to turn over, but never more than a
+    // few times a second. Past that, the newcomer is simply not shown until things settle.
+    // A node missing from MUI's list for a few seconds is invisible; a device that reboots
+    // is not.
+    {
+        static uint32_t churnWindowMs = 0;
+        static uint8_t churnCount = 0;
+        const uint32_t nowMs = lv_tick_get();
+        if (nowMs - churnWindowMs > 1000) {
+            churnWindowMs = nowMs;
+            churnCount = 0;
+        }
+        if (nodeCount >= MAX_NUM_NODES_VIEW) {
+            if (churnCount >= 4) {
+                static uint32_t lastMoan = 0;
+                if (nowMs - lastMoan > 10000) { // do not flood the log with this
+                    lastMoan = nowMs;
+                    ILOG_WARN("node list full and churning; not adding 0x%08x for now", (unsigned)nodeNum);
+                }
+                return;
+            }
+            churnCount++;
+        }
+    }
     while (nodeCount >= MAX_NUM_NODES_VIEW) {
         purgeNode(nodeNum);
     }
