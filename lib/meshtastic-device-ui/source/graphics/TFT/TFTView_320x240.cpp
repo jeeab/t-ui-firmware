@@ -10973,6 +10973,107 @@ extern "C" void tui_request_position(uint32_t nodeNum)
     TFTView_320x240::tuiRequestPosition(nodeNum);
 }
 
+// -----------------------------------------------------------------------------
+// The real list of conversations, for the Conversations app.
+//
+// ⛔ MY FIRST VERSION OF THIS WAS WRONG and Jake caught it the morning after:
+// "chats app still doesnt show the actuall conversations i have with individual nodes,
+// just the channels."
+//
+// It scanned MessageStore. MessageStore keeps MESSAGE_HISTORY_LIMIT messages - TWENTY,
+// for every channel and every person put together. On a mesh as busy as Jake's, those
+// twenty slots are filled with LongFast broadcast traffic within minutes, so every direct
+// message had been evicted long before anything asked. The scan was correct and the source
+// was useless.
+//
+// MUI already keeps the thing I actually wanted. `messages` is one container per node you
+// have a conversation with, and `chats` is the list panel built from it - both survive a
+// reboot, because notifyMessagesRestored() rebuilds them from flash. The chat panel is also
+// ordered newest-first (addChat does lv_obj_move_to_index(chatBtn, 0)), so walking its
+// children in order gives true conversation recency rather than "when did the radio last
+// hear from them", which is a different question.
+//
+// Lesson worth keeping: when a list comes out empty, check that the SOURCE holds what you
+// think it holds before checking the filter.
+// -----------------------------------------------------------------------------
+int TFTView_320x240::tuiDmConversations(uint32_t *out, int maxN)
+{
+    TFTView_320x240 *self = instance();
+    if (!self || !out || maxN <= 0)
+        return 0;
+    int n = 0;
+
+    // Preferred: the chat panel, in its own order (most recent conversation first).
+    if (objects.chats_panel) {
+        const uint32_t cnt = lv_obj_get_child_cnt(objects.chats_panel);
+        for (uint32_t i = 0; i < cnt && n < maxN; i++) {
+            const lv_obj_t *btn = lv_obj_get_child(objects.chats_panel, i);
+            for (const auto &kv : self->chats) {
+                if (kv.second != btn)
+                    continue;
+                // Keys below c_max_channels are channel indices, not node numbers - those
+                // are the channel rows, which this app lists separately.
+                if (kv.first >= c_max_channels)
+                    out[n++] = kv.first;
+                break;
+            }
+        }
+    }
+
+    // Fallback: the containers themselves. Covers the case where a conversation exists but
+    // its chat row has not been built (restore ordering, or a purged node).
+    if (n == 0) {
+        for (const auto &kv : self->messages) {
+            if (n >= maxN)
+                break;
+            if (kv.first && kv.second)
+                out[n++] = kv.first;
+        }
+    }
+    return n;
+}
+
+// The last thing said in a conversation, read straight off the last bubble in its container.
+// Structure, from newMessage(nodeNum, container, ch, msg): container -> hiddenPanel -> label.
+// The text carries MUI's own timestamp prefix, which is worth keeping in a preview.
+bool TFTView_320x240::tuiDmLastText(uint32_t nodeNum, char *out, int outN)
+{
+    if (!out || outN <= 0)
+        return false;
+    out[0] = 0;
+    TFTView_320x240 *self = instance();
+    if (!self)
+        return false;
+    auto it = self->messages.find(nodeNum);
+    if (it == self->messages.end() || !it->second)
+        return false;
+    lv_obj_t *container = it->second;
+    const uint32_t cnt = lv_obj_get_child_cnt(container);
+    if (cnt == 0)
+        return false;
+    lv_obj_t *panel = lv_obj_get_child(container, cnt - 1);
+    if (!panel || lv_obj_get_child_cnt(panel) == 0)
+        return false;
+    lv_obj_t *label = lv_obj_get_child(panel, 0);
+    if (!label || !lv_obj_check_type(label, &lv_label_class))
+        return false;
+    const char *txt = lv_label_get_text(label);
+    if (!txt || !*txt)
+        return false;
+    snprintf(out, (size_t)outN, "%s", txt);
+    return true;
+}
+
+extern "C" int tui_dm_conversations(uint32_t *out, int maxN)
+{
+    return TFTView_320x240::tuiDmConversations(out, maxN);
+}
+
+extern "C" bool tui_dm_last_text(uint32_t nodeNum, char *out, int outN)
+{
+    return TFTView_320x240::tuiDmLastText(nodeNum, out, outN);
+}
+
 // Tapping a channel in the Channels app opens that channel's group conversation.
 void TFTView_320x240::openChannelChat(uint8_t ch)
 {

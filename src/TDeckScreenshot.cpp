@@ -13,28 +13,50 @@
 // EXACTLY what is displayed, overlays and pop-ups included, which a per-screen snapshot
 // would miss.
 //
-// HOW IT WRITES. Not from the flush callback. That runs on the "tft" task, mid-refresh,
-// and tftSetup.cpp holds the SPI LOCK across that whole task - so pushing 230 KB at the SD
-// card from there would hold the bus the radio is waiting for, which is the documented
-// reboot cause here. The callback only fills the buffer and sets a flag; tdeck_shot_service()
-// on the MAIN loop, outside that lock, does the writing.
+// HOW IT WRITES. Not from the flush callback. That runs on the "tft" task, mid-refresh, and
+// tftSetup.cpp holds the SPI LOCK across that whole task, so doing anything slow there holds
+// the bus the radio is waiting for. The callback only fills the buffer and sets a flag;
+// tdeck_shot_service() on the MAIN loop does the writing.
 //
-// Files land in /shots as shot001.bmp upward. 24-bit BMP: bigger than it needs to be,
-// but every computer and phone opens it with no thought, which is the whole point.
+// WHERE IT WRITES - Jake, 2026-09-19: "could we have the screenshot save to the internal
+// memory instead so i dont need to plug int he card everytime?"
+//
+// So: INTERNAL FLASH (LittleFS / FSCom), not the SD card. Two happy consequences beyond the
+// obvious one. It works with no card in the device at all. And internal flash is NOT on the
+// shared SPI bus that the display, the card and the radio fight over - it has its own flash
+// controller - so this no longer needs spiLock and can never stall the radio.
+//
+// The partition is 0x360000 (3.5 MB), shared with Meshtastic's own /prefs (config plus a node
+// database that runs to six figures of bytes with 248 nodes). A 24-bit 320x240 BMP is 230 KB,
+// so this keeps the newest kKeep and deletes the rest, and refuses outright if free space
+// looks tight. Losing somebody's node database to make room for a screenshot would be a
+// genuinely bad trade.
+//
+// Getting them off: `esptool read_flash 0xc90000 0x360000 fs.bin`, then read the image with
+// littlefs-python (already installed in the penv). No Wi-Fi, no card, no new protocol.
+//
+// 24-bit BMP is bigger than it needs to be, but every computer and phone opens it without
+// thinking, which is the whole point of a screenshot you intend to send to somebody.
 // -----------------------------------------------------------------------------
 #include "configuration.h"
 #include <Arduino.h> // millis()
 #include <cstdio>
 #include <cstring>
 
-#if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
-#include "SPILock.h"
-#include "graphics/common/SdCard.h"
+#if !defined(ARCH_PORTDUINO)
+#include "FSCommon.h" // FSCom = LittleFS on internal flash
 #include <esp_heap_caps.h>
-#define SHOT_HAVE_SD 1
+#define SHOT_HAVE_FS 1
 #else
-#define SHOT_HAVE_SD 0
+#define SHOT_HAVE_FS 0
 #endif
+
+// Keep this many. Four 230 KB screenshots is under a megabyte of a 3.5 MB partition, which
+// leaves plenty for the node database, and four is more than any bug report needs.
+static const int kKeep = 4;
+// Refuse below this much free space, so a screenshot can never be the thing that stops
+// Meshtastic saving its nodes.
+static const uint32_t kMinFreeBytes = 600u * 1024u;
 
 static const int kShotW = 320;
 static const int kShotH = 240;
@@ -66,7 +88,7 @@ extern "C" bool tdeck_shot_failed(void)
 // risking an allocation failure at the moment somebody is trying to capture a bug.
 extern "C" void tdeck_shot_begin(void)
 {
-#if SHOT_HAVE_SD
+#if SHOT_HAVE_FS
     if (s_capturing || s_ready)
         return;
     if (!s_buf) {
@@ -90,7 +112,7 @@ extern "C" void tdeck_shot_begin(void)
 // panels widens them, and LVGL is entitled to flush an area larger than it was asked to.
 extern "C" void tdeck_shot_capture_area(int x1, int y1, int x2, int y2, const uint16_t *px)
 {
-#if SHOT_HAVE_SD
+#if SHOT_HAVE_FS
     if (!s_capturing || !s_buf || !px)
         return;
     const int aw = x2 - x1 + 1;
@@ -117,7 +139,7 @@ extern "C" void tdeck_shot_frame_done(void)
     }
 }
 
-#if SHOT_HAVE_SD
+#if SHOT_HAVE_FS
 static void put32(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)(v & 0xff);
@@ -132,7 +154,7 @@ static bool writeBmp(const char *path)
     const int pad = (4 - (rowBytes % 4)) % 4; // BMP rows are padded to 4 bytes
     const uint32_t dataLen = (uint32_t)(rowBytes + pad) * kShotH;
 
-    FsFile f = SDFs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    File f = FSCom.open(path, FILE_O_WRITE);
     if (!f)
         return false;
 
@@ -184,10 +206,53 @@ static bool writeBmp(const char *path)
 }
 #endif
 
+#if SHOT_HAVE_FS
+// Keep /shots down to kKeep files. Numbers only ever go up, so the lowest-numbered file is
+// the oldest - no directory timestamps needed, which LittleFS does not give us anyway.
+static void pruneShots(void)
+{
+    int present[1000];
+    int count = 0;
+    File dir = FSCom.open("/shots", FILE_O_READ);
+    if (!dir)
+        return;
+    for (File e = dir.openNextFile(); e && count < 1000; e = dir.openNextFile()) {
+        const char *nm = e.name();
+        int idx = 0;
+        // e.name() is sometimes the bare name and sometimes the full path, depending on the
+        // core version. Take whatever follows the last slash and parse that.
+        const char *slash = strrchr(nm, '/');
+        if (slash)
+            nm = slash + 1;
+        if (sscanf(nm, "shot%d.bmp", &idx) == 1)
+            present[count++] = idx;
+        e.close();
+    }
+    dir.close();
+    if (count <= kKeep)
+        return;
+    // Simple selection: repeatedly remove the smallest index until we are at the cap.
+    for (int gone = 0; gone < count - kKeep; gone++) {
+        int lo = -1, at = -1;
+        for (int i = 0; i < count; i++)
+            if (present[i] >= 0 && (lo < 0 || present[i] < lo)) {
+                lo = present[i];
+                at = i;
+            }
+        if (at < 0)
+            break;
+        present[at] = -1;
+        char p[32];
+        snprintf(p, sizeof(p), "/shots/shot%03d.bmp", lo);
+        FSCom.remove(p);
+    }
+}
+#endif
+
 // Main loop. Writes the pending shot, if there is one.
 extern "C" void tdeck_shot_service(void)
 {
-#if SHOT_HAVE_SD
+#if SHOT_HAVE_FS
     // Watchdog. The capture completes when a whole frame has been flushed past; if for any
     // reason one never is, s_capturing would stay set and every later screenshot would be
     // refused by the guard in tdeck_shot_begin(). Two seconds is many frames.
@@ -200,27 +265,26 @@ extern "C" void tdeck_shot_service(void)
         return;
     s_ready = false;
 
-    // ⚠️ THE SPI LOCK IS NOT OPTIONAL HERE. The display, the SD card and the radio share one
-    // bus, and the "tft" task holds this lock across every refresh. This runs on the MAIN loop,
-    // a different task, so touching the card without the lock means two tasks driving the same
-    // SPI peripheral at once - and SDFs is a single shared SdFat instance with one internal
-    // block cache, so it would corrupt the card's bookkeeping, not merely garble a picture.
-    //
-    // It is held for the WHOLE write rather than released between chunks. That is a hold of
-    // roughly 200ms for 230KB, which is long - but it happens only when somebody deliberately
-    // asked for a screenshot, it is bounded, and it is nothing like the 24-second stalls in the
-    // diagnostics. Releasing it mid-write would let another task use the same shared SdFat
-    // cache underneath an open file handle, which is a worse trade.
-    concurrency::LockGuard g(spiLock);
+    // No spiLock here, deliberately: internal flash has its own controller and is not on the
+    // bus the display, the card and the radio share. That is a real advantage of moving off
+    // the SD card, not an oversight.
+    FSCom.mkdir("/shots");
+    pruneShots();
 
-    SDFs.mkdir("/shots");
+    const uint32_t total = FSCom.totalBytes();
+    const uint32_t used = FSCom.usedBytes();
+    if (total > used && (total - used) < kMinFreeBytes) {
+        // Say so rather than half-writing a file and leaving the filesystem full.
+        snprintf(s_lastPath, sizeof(s_lastPath), "%s", "");
+        s_failed = true;
+        return;
+    }
+
     char path[32];
-    // Find the first free number rather than keeping a counter: the card outlives any
-    // counter we could hold in RAM, and overwriting somebody's evidence would be rude.
     int n = 1;
     for (; n < 1000; n++) {
         snprintf(path, sizeof(path), "/shots/shot%03d.bmp", n);
-        if (!SDFs.exists(path))
+        if (!FSCom.exists(path))
             break;
     }
     if (n >= 1000) {
@@ -231,6 +295,7 @@ extern "C" void tdeck_shot_service(void)
         snprintf(s_lastPath, sizeof(s_lastPath), "%s", path);
         s_failed = false;
     } else {
+        FSCom.remove(path); // never leave a truncated file behind
         s_failed = true;
     }
 #endif

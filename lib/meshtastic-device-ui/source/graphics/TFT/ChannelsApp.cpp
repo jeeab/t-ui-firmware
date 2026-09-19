@@ -29,8 +29,6 @@
 extern "C" void channels_open(void);
 
 // --- firmware bridge (src/TDeckNodesBridge.cpp) ---
-extern "C" int tdeck_dm_conversations(uint32_t *out, uint32_t *lastWhen, int maxN);
-extern "C" bool tdeck_dm_last_text(uint32_t nodeNum, char *out, int outN, bool *fromMe);
 extern "C" int tdeck_channel_count(void);
 extern "C" const char *tdeck_channel_name(int idx);
 extern "C" int tdeck_channel_role(int idx);
@@ -42,6 +40,10 @@ extern "C" uint32_t tdeck_node_age_secs(uint32_t num);
 // --- MUI shim (TFTView_320x240.cpp) ---
 extern "C" void tui_open_channel_chat(uint8_t ch);
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
+// The conversation list comes from MUI's own chat panel, NOT from MessageStore - that only
+// holds 20 messages in total and a busy channel evicts every DM within minutes.
+extern "C" int tui_dm_conversations(uint32_t *out, int maxN);
+extern "C" bool tui_dm_last_text(uint32_t nodeNum, char *out, int outN);
 extern "C" bool notif_unread_from(uint32_t nodeNum);
 extern "C" void emoji_to_text(const char *in, char *out, size_t outN);
 
@@ -63,7 +65,6 @@ uint32_t members[kMaxMembers];
 // actually exchanged a direct message with.
 const int kMaxConvos = 24;
 uint32_t convos[kMaxConvos];
-uint32_t convoWhen[kMaxConvos];
 
 void rebuild(void);
 
@@ -156,7 +157,7 @@ void buildChannelList(void)
     int shown = 0;
 
     // ---- the people you are actually talking to, first: that is what you open this for ----
-    const int nConvo = tdeck_dm_conversations(convos, convoWhen, kMaxConvos);
+    const int nConvo = tui_dm_conversations(convos, kMaxConvos);
     if (nConvo > 0) {
         lv_obj_t *hdr = lv_label_create(listCont);
         lv_label_set_text(hdr, "People");
@@ -182,13 +183,10 @@ void buildChannelList(void)
 
         // The last thing said, and who said it, so the row is worth reading at a glance.
         char last[80];
-        bool mine = false;
-        if (tdeck_dm_last_text(convos[i], last, sizeof(last), &mine)) {
+        if (tui_dm_last_text(convos[i], last, sizeof(last))) {
             char shown[80];
             emoji_to_text(last, shown, sizeof(shown)); // same reason as the message bubbles
-            char line[96];
-            snprintf(line, sizeof(line), "%s%s", mine ? "You: " : "", shown);
-            lv_obj_t *l = makeLabel(row, line, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
+            lv_obj_t *l = makeLabel(row, shown, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
             lv_obj_set_width(l, 240);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
             lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 10, -6); // re-align: setting a width moves it
