@@ -237,10 +237,21 @@ extern "C" int tdeck_channel_precision(int idx)
 // Jake, 2026-09-18: "channeks app needs to be renamed, include covorsations too",
 // then "should show all current conversations, not just channels".
 //
-// A "conversation" here is any node this device has exchanged a DIRECT message with,
-// either way round. MessageStore holds both sides (addFromPacket records our own sends
-// too), so one pass over it answers the question. Broadcast traffic is deliberately
-// skipped - that is what the channel rows above it are for.
+// A "conversation" here is any node this device has exchanged a DIRECT message with, either
+// way round, so one pass over MessageStore answers it.
+//
+// VERIFIED, because the whole feature rests on it: our own sent messages ARE stored.
+// MeshService::handleToRadio() calls messageStore.addFromPacket() for outgoing text, and the
+// T-Deck's own UI reaches that path like any phone would - PacketAPI derives from PhoneAPI,
+// so device-ui sends land in handleToRadio exactly as a phone app's would. That is what makes
+// the "You: ..." preview possible.
+//
+// ⚠️ ONE LIMIT, deliberate and worth knowing: that call is guarded by
+// `p.to != NODENUM_BROADCAST && p.to != 0` - DM ONLY. Our own CHANNEL messages are never
+// stored, so a channel row can never preview something we said. Fine here (this function is
+// about people), and fine for tdeck_channel_nodes(), which excludes us anyway.
+//
+// Broadcast traffic is skipped - that is what the channel rows are for.
 //
 // Ordered most recent first, which is the only order a conversation list ever wants.
 // -----------------------------------------------------------------------------
