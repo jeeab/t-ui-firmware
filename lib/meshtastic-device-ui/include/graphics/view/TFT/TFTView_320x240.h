@@ -600,6 +600,7 @@ class TFTView_320x240 : public MeshtasticView
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
     void showLockGlance(void);               // the iPod-style glance: clock, who messaged, slide to unlock
     void updateLockGraceLabel(void);         // "Ask for PIN" button text, from the stored seconds
+    void startScreenshotCountdown(void);     // Settings: capture the screen in five seconds
     void refreshLockGlance(void);            // re-draw the glance's clock and notification list
     void lockGlanceUnlocked(void);           // slide completed: PIN pad, or straight in
     void startCalibrationFromLock(void);     // Alt+C from the pad: run touch calibration, then re-lock
@@ -611,6 +612,9 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *lock_digits_label = nullptr;
     lv_obj_t *lock_title_label = nullptr;
     lv_obj_t *lockpad_unread_label = nullptr; // top-left unread count, mirrors the launcher's
+    lv_obj_t *shot_btn = nullptr;             // Settings: "Screenshot" button
+    lv_obj_t *shot_btn_label = nullptr;       // its caption, which counts down
+    lv_obj_t *shot_hint_label = nullptr;      // and reports where the file went
     lv_obj_t *lock_grace_btn = nullptr;       // Settings: "Ask for PIN" cycling button
     lv_obj_t *lock_grace_label = nullptr;
     lv_obj_t *lockglance_screen = nullptr;    // shown on wake, before the PIN pad

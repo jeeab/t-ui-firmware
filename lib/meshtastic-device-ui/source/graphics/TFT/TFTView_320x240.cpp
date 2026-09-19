@@ -94,6 +94,11 @@ extern "C" void tdeck_lock_set_enabled(bool en);
 // How long after locking before the PIN is asked for again (TDeckLockGrace.cpp). 0 = always ask.
 extern "C" uint32_t tdeck_lock_grace_secs(void);
 extern "C" void tdeck_lock_set_grace_secs(uint32_t secs);
+// Screenshot (src/TDeckScreenshot.cpp): arm it, then ask what happened.
+extern "C" void tdeck_shot_begin(void);
+extern "C" bool tdeck_shot_capturing(void);
+extern "C" const char *tdeck_shot_last_path(void);
+extern "C" bool tdeck_shot_failed(void);
 // Keyboard backlight follows the screen (src/TDeckKeyboardLight.cpp). Persisted in NVS;
 // default OFF, so a device nobody has touched keeps its keys dark exactly as before.
 extern "C" bool tdeck_trackball_nav_enabled(void);
@@ -2395,7 +2400,7 @@ void TFTView_320x240::createSettingsScreen(void)
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 910);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 966);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2419,7 +2424,36 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 954);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1010);
+
+    // "Screenshot" - Jake, 2026-09-18: "debug: screen shot thar we can both trigger. saves
+    // to sd". Five seconds of countdown, so there is time to leave Settings and get to the
+    // thing worth capturing: a screenshot of the Screenshot button helps nobody. The shot is
+    // whatever is on the glass at the moment it fires, overlays included.
+    lv_obj_t *shotLbl = lv_label_create(settings_screen);
+    lv_label_set_text(shotLbl, "Screenshot");
+    lv_obj_set_style_text_color(shotLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 894);
+
+    shot_btn = lv_btn_create(settings_screen);
+    lv_obj_set_size(shot_btn, 116, 30);
+    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 890);
+    lv_obj_set_style_radius(shot_btn, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(shot_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+    shot_btn_label = lv_label_create(shot_btn);
+    lv_label_set_text(shot_btn_label, "In 5 seconds");
+    lv_obj_set_style_text_font(shot_btn_label, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(shot_btn_label);
+    lv_obj_add_event_cb(
+        shot_btn, [](lv_event_t *) { THIS->startScreenshotCountdown(); }, LV_EVENT_CLICKED, NULL);
+
+    shot_hint_label = lv_label_create(settings_screen);
+    lv_obj_set_width(shot_hint_label, 288);
+    lv_label_set_long_mode(shot_hint_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(shot_hint_label, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(shot_hint_label, "Tap, then go to the screen you want. Saved to /shots on the card.");
+    lv_obj_set_style_text_color(shot_hint_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 920);
 }
 
 /**
@@ -8180,6 +8214,66 @@ void TFTView_320x240::updateLockDisplay(void)
 // are deliberately NOT clickable - a tappable name would be a way round the lock.
 // -----------------------------------------------------------------------------
 // The "Ask for PIN" button's caption, in plain words rather than a number of seconds.
+// Five seconds, then grab whatever is on the glass.
+//
+// The countdown is the whole point: a screenshot taken the instant the button is pressed is
+// a picture of the Settings screen, which is never the thing anyone wants to show anybody.
+// Five seconds is enough to get back to the launcher and into the app that is misbehaving.
+void TFTView_320x240::startScreenshotCountdown(void)
+{
+    static lv_timer_t *countdown = nullptr;
+    static int left = 0;
+
+    left = 5;
+    if (shot_btn_label)
+        lv_label_set_text(shot_btn_label, "5...");
+    if (shot_hint_label)
+        lv_label_set_text(shot_hint_label, "Go to the screen you want to capture.");
+
+    if (!countdown) {
+        countdown = lv_timer_create(
+            [](lv_timer_t *t) {
+                left--;
+                if (left > 0) {
+                    // The caption only exists while Settings is built; the capture does not
+                    // depend on it, so a null label is not a reason to stop counting.
+                    if (THIS->shot_btn_label) {
+                        char b[8];
+                        snprintf(b, sizeof(b), "%d...", left);
+                        lv_label_set_text(THIS->shot_btn_label, b);
+                    }
+                    return;
+                }
+                lv_timer_pause(t);
+                tdeck_shot_begin();
+                // The frame is captured by the flush callback and written on the main loop, so
+                // the answer is not ready yet. Look again shortly and report what happened.
+                lv_timer_create(
+                    [](lv_timer_t *rt) {
+                        lv_timer_delete(rt);
+                        if (!THIS->shot_btn_label)
+                            return;
+                        lv_label_set_text(THIS->shot_btn_label, "In 5 seconds");
+                        if (!THIS->shot_hint_label)
+                            return;
+                        const char *p = tdeck_shot_last_path();
+                        if (tdeck_shot_failed() || !p || !p[0])
+                            lv_label_set_text(THIS->shot_hint_label,
+                                              "Could not save the screenshot. Is the card in?");
+                        else {
+                            static char msg[80];
+                            snprintf(msg, sizeof(msg), "Saved %s", p);
+                            lv_label_set_text(THIS->shot_hint_label, msg);
+                        }
+                    },
+                    1500, nullptr);
+            },
+            1000, nullptr);
+    }
+    lv_timer_reset(countdown);
+    lv_timer_resume(countdown);
+}
+
 void TFTView_320x240::updateLockGraceLabel(void)
 {
     if (!lock_grace_label)

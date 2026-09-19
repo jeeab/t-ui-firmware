@@ -31,6 +31,11 @@ constexpr uint32_t defaultGestureLimit = 10;   // x/y diff pixel until a swipe g
 constexpr uint32_t defaultScreenTimeout = 30 * 1000;
 constexpr uint32_t defaultBrightness = 153;
 
+// Screenshot hooks (src/TDeckScreenshot.cpp). Declared rather than included: this header is
+// pulled in by device-ui, which cannot see firmware headers.
+extern "C" void tdeck_shot_capture_area(int x1, int y1, int x2, int y2, const uint16_t *px);
+extern "C" void tdeck_shot_frame_done(void);
+
 template <class LGFX> class LGFXDriver : public TFTDriver<LGFX>
 {
   public:
@@ -168,8 +173,13 @@ template <class LGFX> void LGFXDriver<LGFX>::display_flush(lv_display_t *disp, c
 {
     uint32_t w = lv_area_get_width(area);
     uint32_t h = lv_area_get_height(area);
+    // Screenshot (src/TDeckScreenshot.cpp), taken BEFORE the byte swap below so what is
+    // captured is plain native RGB565. Costs a branch per flush when not capturing.
+    tdeck_shot_capture_area(area->x1, area->y1, area->x2, area->y2, (const uint16_t *)px_map);
     lv_draw_sw_rgb565_swap(px_map, w * h);
     lgfx->pushImage(area->x1, area->y1, w, h, (uint16_t *)px_map);
+    if (lv_display_flush_is_last(disp))
+        tdeck_shot_frame_done(); // a whole frame has now gone past: the buffer is complete
     lv_display_flush_ready(disp);
 }
 #else
