@@ -142,6 +142,12 @@ extern "C" void tdeck_ftp_service(void);
 extern "C" bool tdeck_ftp_running(void);
 // Snake game module (SnakeGame.cpp) — opened from its launcher tile.
 extern "C" void snake_open(void);
+// Notification centre (NotificationCenter.cpp): who messaged you, visible from any app.
+extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char *who, const char *text);
+extern "C" void notif_init(void);
+extern "C" void notif_open(void);
+extern "C" int notif_count(void);
+extern "C" void notif_clear(void);
 // Stopwatch module (StopwatchApp.cpp) — opened from its launcher tile.
 extern "C" void stopwatch_open(void);
 // Nodes + Favorites (NodesApp.cpp). Two launcher screens over one list, fed by the
@@ -623,6 +629,9 @@ static const LauncherApp kApps[] = {
     {"Favorites", &img_nodes_button_image, 0xffd60a, nullptr, nullptr, nullptr, &favorites_open},
     // Channels = the configured channels, and who we have heard on each.
     {"Channels", &img_nodes_button_image, 0x30d158, nullptr, nullptr, nullptr, &channels_open},
+    // Notifications = what has come in while you were elsewhere. Tapping the unread count in
+    // the top bar opens the same page; this tile is how you get there when the count is zero.
+    {"Alerts", &img_messages_button_image, 0xff453a, nullptr, nullptr, nullptr, &notif_open},
 };
 
 // --- simple per-app icons, drawn from lv_obj primitives (no image assets needed) ---
@@ -752,6 +761,11 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 8, 8, 30, 7, color, 3);
         icBox(ic, 8, 19, 30, 7, 0x6a6a70, 3);
         icBox(ic, 8, 30, 30, 7, 0x6a6a70, 3);
+    } else if (!strcmp(name, "Alerts")) { // a bell: dome, rim, clapper
+        icBox(ic, 13, 8, 20, 18, color, 8);           // dome
+        icBox(ic, 21, 3, 4, 5, color, 2);             // the little loop on top
+        icBox(ic, 9, 25, 28, 5, color, 2);            // rim
+        icBox(ic, 20, 31, 6, 5, color, LV_RADIUS_CIRCLE); // clapper
     } else if (!strcmp(name, "Files")) { // folder
         icBox(ic, 8, 7, 15, 5, color, 1);
         icBox(ic, 6, 11, 34, 24, color, 3);
@@ -1171,6 +1185,14 @@ void TFTView_320x240::createLauncher(void)
     lv_obj_set_style_text_font(launcher_unread_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_obj_align(launcher_unread_label, LV_ALIGN_TOP_LEFT, 8, 6);
     lv_label_set_text(launcher_unread_label, "");
+    // Jake: "then youd click the '1msg' it would take you to a notifications page". This is
+    // that "1msg". The hit area is grown well past the text, because a 12px label is a
+    // cruel tap target.
+    lv_obj_add_flag(launcher_unread_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(launcher_unread_label, 14);
+    lv_obj_add_event_cb(
+        launcher_unread_label, [](lv_event_t *) { lv_async_call([](void *) { notif_open(); }, nullptr); },
+        LV_EVENT_CLICKED, NULL);
 
     // The dot is gone, but going off-grid silently would be worse than the clutter was: when the
     // radio is switched OFF, say so in words. Blank — and therefore invisible — the rest
@@ -1181,6 +1203,8 @@ void TFTView_320x240::createLauncher(void)
     lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
     lv_label_set_text(launcher_mesh_off_label, meshEnabled ? "" : "mesh off");
     updateUnreadMessages(); // reflect any count that already accrued before the grid was built
+    notif_init();           // build the notification card NOW, on the UI task — a message can
+                            // arrive on the mesh task at any moment and must not create objects
 
     // battery percentage (top-right); fed by updateMetrics()->updateLauncherBattery().
     launcher_battery_label = lv_label_create(launcher_screen);
@@ -8350,6 +8374,7 @@ void TFTView_320x240::ui_set_active(lv_obj_t *b, lv_obj_t *p, lv_obj_t *tp)
                 }
             }
             unreadMessages = 0; // TODO: not all messages may be actually read
+            notif_clear();      // opening the messages IS reading them
             updateUnreadMessages();
         } else if (activePanel == objects.node_options_panel) {
             // we're moving away from node options panel, so save latest settings
@@ -14519,9 +14544,27 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
         if (!viewingThisChat) {
             unreadMessages++;
             updateUnreadMessages();
-            if ((!onMeshScreen || activePanel != objects.messages_panel) && db.uiConfig.alert_enabled &&
-                !db.channel[ch].settings.module_settings.is_muted) {
-                showMessagePopup(from, to, ch, lv_label_get_text(nodes[from]->LV_OBJ_IDX(node_lbl_idx)));
+            // nodes[from] again: operator[] INSERTS a null for a key MUI has purged, and the
+            // very next thing here dereferences it. Look it up once, safely, and share it.
+            auto fromIt = nodes.find(from);
+            lv_obj_t *fromPanel = (fromIt != nodes.end()) ? fromIt->second : nullptr;
+            const char *senderName = fromPanel ? lv_label_get_text(fromPanel->LV_OBJ_IDX(node_lbl_idx)) : nullptr;
+            const bool muted = db.channel[ch].settings.module_settings.is_muted;
+
+            if ((!onMeshScreen || activePanel != objects.messages_panel) && db.uiConfig.alert_enabled && !muted &&
+                senderName) {
+                showMessagePopup(from, to, ch, senderName);
+            }
+
+            // Jake, 2026-09-18: a message arriving while you are in ANY other app was
+            // invisible, because MUI's pop-up is a child of main_screen. The notification
+            // centre keeps who it was from and floats its own card over whatever is on
+            // screen. Muting a channel silences this too — a mute that only half works is
+            // worse than none.
+            if (db.uiConfig.alert_enabled && !muted) {
+                char body[56];
+                snprintf(body, sizeof(body), "%s", msg ? msg : "");
+                notif_add(from, ch, to == UINT32_MAX, senderName ? senderName : "Someone", body);
             }
             lv_obj_add_flag(container, LV_OBJ_FLAG_HIDDEN);
         }
@@ -14873,6 +14916,7 @@ void TFTView_320x240::showMessages(uint32_t nodeNum)
             break;
         }
         unreadMessages = 0; // TODO: not all messages may be actually read
+        notif_clear();      // opening the messages IS reading them
         updateUnreadMessages();
     } else {
         // TODO: log error
