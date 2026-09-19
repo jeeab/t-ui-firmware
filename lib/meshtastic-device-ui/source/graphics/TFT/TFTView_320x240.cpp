@@ -10721,6 +10721,49 @@ void TFTView_320x240::openChatWithNode(uint32_t nodeNum)
     lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }
 
+// Jake, 2026-09-18: "request locaton trace route etc on node in fav and list (right arrow on
+// each one?) opens sub menu with messagw, map, trace route etc."
+//
+// Trace route reuses MUI's OWN trace-route screen rather than reimplementing it: set the node
+// it works from, then call the two handlers the Meshtastic UI calls itself. currentPanel and
+// currentNode are static members of this class, which is what makes that possible without
+// touching device-ui internals from outside.
+void TFTView_320x240::tuiTraceRoute(uint32_t nodeNum)
+{
+    auto it = instance()->nodes.find(nodeNum);
+    if (it == instance()->nodes.end() || !it->second)
+        return; // no panel for this node: the trace-route screen has nothing to work from
+    currentPanel = it->second;
+    currentNode = nodeNum;
+    lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    ui_event_trace_route(NULL);       // build + show the panel, aimed at this node
+    ui_event_trace_route_start(NULL); // and set it going, so it is one tap not three
+}
+
+// Ask a node where it is. The answer arrives as an ordinary position packet and updates the
+// node everywhere - the map, the distance on its row - so there is nothing to show here beyond
+// confirming that the question went out.
+void TFTView_320x240::tuiRequestPosition(uint32_t nodeNum)
+{
+    TFTView_320x240 *self = instance();
+    auto it = self->nodes.find(nodeNum);
+    if (it == self->nodes.end() || !it->second)
+        return;
+    const uint8_t ch = (uint8_t)(unsigned long)it->second->user_data;
+    const uint32_t requestId = self->requests.addRequest(nodeNum, ResponseHandler::PositionRequest);
+    self->controller->requestPosition(nodeNum, ch, requestId);
+}
+
+extern "C" void tui_trace_route(uint32_t nodeNum)
+{
+    TFTView_320x240::tuiTraceRoute(nodeNum);
+}
+
+extern "C" void tui_request_position(uint32_t nodeNum)
+{
+    TFTView_320x240::tuiRequestPosition(nodeNum);
+}
+
 // Tapping a channel in the Channels app opens that channel's group conversation.
 void TFTView_320x240::openChannelChat(uint8_t ch)
 {

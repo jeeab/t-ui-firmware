@@ -43,6 +43,8 @@ extern "C" void tui_open_chat_with(uint32_t nodeNum);
 extern "C" void tui_show_node_on_map(uint32_t nodeNum, int32_t latI, int32_t lonI);
 // Notification centre: has this node sent something that has not been read yet?
 extern "C" bool notif_unread_from(uint32_t nodeNum);
+extern "C" void tui_trace_route(uint32_t nodeNum);
+extern "C" void tui_request_position(uint32_t nodeNum);
 
 namespace
 {
@@ -235,6 +237,107 @@ void onMap(lv_event_t *e)
         (void *)(intptr_t)i);
 }
 
+// -----------------------------------------------------------------------------
+// The "more" sheet. Jake, 2026-09-18: "request locaton trace route etc on node in fav and
+// list (right arrow on each one?) opens sub menu with messagw, map, trace route etc."
+//
+// A panel on lv_layer_top rather than a new screen: it is a menu about the row you are
+// looking at, and swapping the whole screen out and back loses your place in the list.
+// Everything it does is deferred with lv_async_call - several of these actions load a
+// different screen, which would tear down the button still dispatching the event.
+// -----------------------------------------------------------------------------
+lv_obj_t *sheet = nullptr;
+lv_obj_t *sheetTitle = nullptr;
+uint32_t sheetNode = 0;
+
+void closeSheet(void)
+{
+    if (sheet)
+        lv_obj_add_flag(sheet, LV_OBJ_FLAG_HIDDEN);
+}
+
+lv_obj_t *sheetBtn(lv_obj_t *parent, const char *txt, int y, uint32_t colour, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_set_size(b, 244, 34);
+    lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(colour), LV_PART_MAIN);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_center(l);
+    return b;
+}
+
+void buildSheet(void)
+{
+    sheet = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(sheet, 268, 228);
+    lv_obj_center(sheet);
+    lv_obj_set_style_bg_color(sheet, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_border_color(sheet, lv_color_hex(0x48484a), LV_PART_MAIN);
+    lv_obj_set_style_border_width(sheet, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(sheet, 12, LV_PART_MAIN);
+    lv_obj_clear_flag(sheet, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sheet, LV_OBJ_FLAG_HIDDEN);
+
+    sheetTitle = lv_label_create(sheet);
+    lv_obj_set_style_text_color(sheetTitle, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_width(sheetTitle, 236);
+    lv_label_set_long_mode(sheetTitle, LV_LABEL_LONG_DOT);
+    lv_obj_align(sheetTitle, LV_ALIGN_TOP_MID, 0, 2);
+
+    sheetBtn(sheet, "Message", 26, 0x0a84ff, [](lv_event_t *) {
+        const uint32_t n = sheetNode;
+        closeSheet();
+        lv_async_call([](void *p) { tui_open_chat_with((uint32_t)(uintptr_t)p); }, (void *)(uintptr_t)n);
+    });
+
+    sheetBtn(sheet, "Show on map", 64, 0x5ac8fa, [](lv_event_t *) {
+        const uint32_t n = sheetNode;
+        closeSheet();
+        lv_async_call(
+            [](void *p) {
+                const uint32_t num = (uint32_t)(uintptr_t)p;
+                int32_t la = 0, lo = 0;
+                if (tdeck_node_position(num, &la, &lo))
+                    tui_show_node_on_map(num, la, lo);
+            },
+            (void *)(uintptr_t)n);
+    });
+
+    sheetBtn(sheet, "Trace route", 102, 0xbf5af2, [](lv_event_t *) {
+        const uint32_t n = sheetNode;
+        closeSheet();
+        lv_async_call([](void *p) { tui_trace_route((uint32_t)(uintptr_t)p); }, (void *)(uintptr_t)n);
+    });
+
+    // This one sends a request and stays put: the answer comes back over the mesh whenever
+    // that node feels like replying, and lands on its row and the map by itself.
+    sheetBtn(sheet, "Request location", 140, 0x30d158, [](lv_event_t *) {
+        const uint32_t n = sheetNode;
+        tui_request_position(n);
+        if (sheetTitle)
+            lv_label_set_text(sheetTitle, "Asked - the reply lands on its own");
+    });
+
+    sheetBtn(sheet, "Close", 186, 0x48484a, [](lv_event_t *) { closeSheet(); });
+}
+
+void onMore(lv_event_t *e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= kMaxRows)
+        return;
+    if (!sheet)
+        buildSheet();
+    sheetNode = rowNode[i];
+    lv_label_set_text(sheetTitle, tdeck_node_name(sheetNode));
+    lv_obj_move_foreground(sheet);
+    lv_obj_clear_flag(sheet, LV_OBJ_FLAG_HIDDEN);
+}
+
 // One action button: a flat tile with either a symbol glyph or a drawn star.
 lv_obj_t *actionBtn(lv_obj_t *parent, int x, int w, lv_event_cb_t cb, int idx)
 {
@@ -316,8 +419,9 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     // the text Jake saw being covered.
     lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 8, 24);
 
-    // Three actions along the bottom: message, show on map, favourite.
-    const int bw = 96;
+    // Four actions along the bottom: message, show on map, favourite, and more. The first
+    // three keep wide targets because they are the everyday ones; "more" is a narrow chevron.
+    const int bw = 82;
     envelopeIcon(actionBtn(row, 4, bw, onChat, idx));
 
     // The map button is only live for a node that has actually reported a position — a dead button
@@ -331,6 +435,22 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     const bool on = tdeck_node_is_favorite(num);
     lv_obj_t *st = starIcon(fav, 24, on ? 0xffd60a : 0x6a6a70, on ? 4 : 2);
     lv_obj_center(st);
+
+    // The chevron Jake asked for: "right arrow on each one?". Drawn from two lines rather
+    // than a glyph - this build's label font has no verified symbol coverage, and a blank
+    // button is worse than no button.
+    lv_obj_t *more = actionBtn(row, 16 + 3 * bw, 44, onMore, idx);
+    {
+        static lv_point_precise_t up[] = {{0, 0}, {7, 7}};
+        static lv_point_precise_t dn[] = {{7, 7}, {0, 14}};
+        for (lv_point_precise_t *pts : {up, dn}) {
+            lv_obj_t *l = lv_line_create(more);
+            lv_line_set_points(l, pts, 2);
+            lv_obj_set_style_line_color(l, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+            lv_obj_set_style_line_width(l, 3, LV_PART_MAIN);
+            lv_obj_align(l, LV_ALIGN_CENTER, 0, 0);
+        }
+    }
 }
 
 void rebuild(void)
@@ -370,6 +490,11 @@ void rebuild(void)
 void buildScreen(void)
 {
     screen = lv_obj_create(NULL);
+    // The "more" sheet lives on lv_layer_top, which belongs to the display and not to this
+    // screen - so left open it would float over the launcher and everything else. Leaving
+    // the app closes it.
+    lv_obj_add_event_cb(
+        screen, [](lv_event_t *) { closeSheet(); }, LV_EVENT_SCREEN_UNLOADED, nullptr);
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 

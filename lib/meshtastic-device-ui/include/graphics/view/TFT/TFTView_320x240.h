@@ -838,6 +838,8 @@ class TFTView_320x240 : public MeshtasticView
     // extern "C" shims in the .cpp. Static because instance() is private — a free function cannot
     // get at it, but a static member can.
     static void tuiOpenChatWith(uint32_t nodeNum);
+    static void tuiTraceRoute(uint32_t nodeNum);     // MUI's own trace-route screen, aimed and started
+    static void tuiRequestPosition(uint32_t nodeNum); // ask a node where it is
     static void tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
     static void tuiOpenChannelChat(uint8_t ch);
 
