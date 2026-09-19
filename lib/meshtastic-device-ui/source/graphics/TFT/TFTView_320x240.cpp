@@ -8431,6 +8431,26 @@ void TFTView_320x240::showLockGlance(void)
         lv_obj_set_style_text_color(glance_slide_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_align(glance_slide_label, LV_ALIGN_BOTTOM_MID, 14, -22);
 
+        // ⚠️ A PLAIN BUTTON AS WELL AS THE SLIDER, DELIBERATELY. This screen now stands
+        // between Jake and his own device: if the slider misbehaves on real hardware, a gesture
+        // is not an acceptable only way in. A trackball double-click is the third way (see
+        // handleHomeGesture), but a visible button needs nothing explained and nothing working
+        // except a tap. It is also what he asked for first - "an 'unlock' button(or ball click)"
+        // - before he suggested the swipe.
+        lv_obj_t *unlockBtn = lv_btn_create(lockglance_screen);
+        lv_obj_set_size(unlockBtn, 74, 30);
+        lv_obj_align(unlockBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+        lv_obj_set_style_radius(unlockBtn, 8, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(unlockBtn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            unlockBtn,
+            [](lv_event_t *) { lv_async_call([](void *) { THIS->lockGlanceUnlocked(); }, nullptr); },
+            LV_EVENT_CLICKED, NULL);
+        lv_obj_t *ul = lv_label_create(unlockBtn);
+        lv_label_set_text(ul, "Unlock");
+        lv_obj_set_style_text_font(ul, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_center(ul);
+
         lv_obj_add_event_cb(
             glance_slider,
             [](lv_event_t *e) {
