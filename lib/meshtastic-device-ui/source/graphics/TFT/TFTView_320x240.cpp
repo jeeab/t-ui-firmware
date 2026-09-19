@@ -156,6 +156,12 @@ extern "C" bool tdeck_ftp_running(void);
 extern "C" void snake_open(void);
 // Notification centre (NotificationCenter.cpp): who messaged you, visible from any app.
 extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char *who, const char *text);
+#include <esp_heap_caps.h> // free-internal-heap readout for @@info
+
+extern "C" const char *tdeck_node_name(uint32_t num); // TDeckNodesBridge.cpp
+// Remote control over the USB cable (src/TDeckRemote.cpp).
+extern "C" int tdeck_remote_take(int *x, int *y);
+extern "C" void tdeck_remote_reply(const char *what);
 extern "C" void notif_init(void);
 // EmojiText.cpp: emoji have no glyph in this build and LV_USE_FONT_PLACEHOLDER is 0, so they
 // would draw as NOTHING. Turn them into short readable tags on the way to the screen.
@@ -1220,6 +1226,25 @@ void TFTView_320x240::createLauncher(void)
     lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
     lv_label_set_text(launcher_mesh_off_label, meshEnabled ? "" : "mesh off");
     updateUnreadMessages(); // reflect any count that already accrued before the grid was built
+    // TEMPORARY DIAGNOSTIC (Jake reported overlapping text in Chats). Logs what
+    // tuiDmConversations() returns once, 25s after boot - late enough that messages have
+    // been restored from flash. Remove once the overlap is understood.
+    lv_timer_t *chatDump = lv_timer_create(
+        [](lv_timer_t *t) {
+            lv_timer_delete(t);
+            uint32_t list[24];
+            const int n = TFTView_320x240::tuiDmConversations(list, 24);
+            ILOG_INFO("[CHATDBG] boot dump: %d conversations", n);
+            for (int i = 0; i < n; i++) {
+                char last[80];
+                const bool got = TFTView_320x240::tuiDmLastText(list[i], last, sizeof(last));
+                ILOG_INFO("[CHATDBG]  %d: node=0x%08x name='%s' last=%s", i, (unsigned)list[i],
+                          tdeck_node_name(list[i]), got ? last : "(none)");
+            }
+        },
+        25000, NULL);
+    (void)chatDump; // the callback deletes it; no repeat_count (that deletes it too)
+
     notif_init();           // build the notification card NOW, on the UI task — a message can
                             // arrive on the mesh task at any moment and must not create objects
 
@@ -1276,6 +1301,9 @@ void TFTView_320x240::createLauncher(void)
                 tdeck_back_request = false;
                 THIS->handleBackGesture();
             }
+
+            // Remote control over USB. Costs one volatile read per tick when idle.
+            THIS->remoteService();
             // The PIN pad had no timeout of its own: wake the device, don't type the code, and
             // it sat there lit until the battery ran down. The main screen timeout does not cover
             // it, because the pad counts as an active screen. Ten seconds without a touch and it
@@ -8320,6 +8348,31 @@ void TFTView_320x240::startScreenshotCountdown(void)
                     return;
                 }
                 lv_timer_pause(t);
+
+                // Jake, 2026-09-19: "Can the screen or something flash when the screencap is
+                // taken?" A white sheet over everything for ~90ms, on the top layer so it covers
+                // whatever app is showing. It is put up BEFORE the capture is armed and taken
+                // down after, and the capture itself waits for the next full frame - so the
+                // flash is what you see, not what gets saved.
+                {
+                    lv_obj_t *flash = lv_obj_create(lv_layer_top());
+                    lv_obj_remove_style_all(flash);
+                    lv_obj_set_size(flash, LV_PCT(100), LV_PCT(100));
+                    lv_obj_set_style_bg_color(flash, lv_color_hex(0xffffff), LV_PART_MAIN);
+                    lv_obj_set_style_bg_opa(flash, LV_OPA_COVER, LV_PART_MAIN);
+                    lv_obj_clear_flag(flash, LV_OBJ_FLAG_CLICKABLE);
+                    lv_obj_move_foreground(flash);
+                    lv_refr_now(NULL); // paint it NOW, before we start capturing
+                    lv_timer_t *off = lv_timer_create(
+                        [](lv_timer_t *ft) {
+                            lv_obj_t *f = (lv_obj_t *)lv_timer_get_user_data(ft);
+                            lv_timer_delete(ft);
+                            if (f && lv_obj_is_valid(f))
+                                lv_obj_delete(f);
+                        },
+                        90, flash);
+                    (void)off;
+                }
                 tdeck_shot_begin();
                 // LVGL only flushes what changed. On a screen that is just sitting there
                 // nothing changes, so without this the capture would wait for a redraw that
@@ -8376,6 +8429,100 @@ void TFTView_320x240::updateLockGraceLabel(void)
         break;
     default:
         lv_label_set_text(lock_grace_label, "Always");
+        break;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Remote control: the half that has to live on the UI task.
+//
+// Taps are injected through a SECOND LVGL pointer device rather than by poking the real
+// touch driver. LVGL is happy to have several input devices, so this adds one that is
+// idle except when a remote tap is pending - the touchscreen keeps working exactly as
+// before and there is no shared state to corrupt.
+//
+// The press is held for a few read cycles before releasing. LVGL only turns a press into
+// a CLICK once it has seen the pressed state, and a press+release inside a single read
+// would be missed.
+// -----------------------------------------------------------------------------
+static lv_indev_t *s_remoteIndev = nullptr;
+static int16_t s_remoteX = 0, s_remoteY = 0;
+static int s_remoteHold = 0; // >0 = pressed for this many more reads
+
+static void remoteIndevRead(lv_indev_t *, lv_indev_data_t *data)
+{
+    data->point.x = s_remoteX;
+    data->point.y = s_remoteY;
+    if (s_remoteHold > 0) {
+        s_remoteHold--;
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+void TFTView_320x240::remoteInit(void)
+{
+    if (s_remoteIndev)
+        return;
+    s_remoteIndev = lv_indev_create();
+    lv_indev_set_type(s_remoteIndev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(s_remoteIndev, remoteIndevRead);
+}
+
+// Called from the UI poll timer. Does nothing at all until a command arrives.
+void TFTView_320x240::remoteService(void)
+{
+    int x = 0, y = 0;
+    const int cmd = tdeck_remote_take(&x, &y);
+    if (!cmd)
+        return;
+    char buf[96];
+    switch (cmd) {
+    case 6: // ping
+        tdeck_remote_reply("pong");
+        break;
+    case 5: { // info
+        lv_obj_t *scr = lv_screen_active();
+        const char *name = "?";
+        if (scr == THIS->launcher_screen) name = "launcher";
+        else if (scr == objects.main_screen) name = "mesh";
+        else if (scr == THIS->lockglance_screen) name = "lock-glance";
+        else if (scr == THIS->lockpad_screen) name = "lock-pad";
+        else if (scr == THIS->settings_screen) name = "settings";
+        else if (scr == THIS->maps_screen) name = "maps";
+        // Free INTERNAL heap rides along: it is the number that predicts a crash on this
+        // device, and I want to see it before asking for a screenshot, not after.
+        snprintf(buf, sizeof(buf), "info screen=%s uptime=%lus lock=%d heap=%uk", name,
+                 (unsigned long)(lv_tick_get() / 1000), (int)THIS->lockState,
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+        tdeck_remote_reply(buf);
+        break;
+    }
+    case 4: // shot
+        tdeck_shot_begin();
+        if (lv_screen_active())
+            lv_obj_invalidate(lv_screen_active());
+        lv_obj_invalidate(lv_layer_top());
+        tdeck_remote_reply("shot armed");
+        break;
+    case 3: // back
+        THIS->handleBackGesture();
+        tdeck_remote_reply("back");
+        break;
+    case 2: // home
+        THIS->handleHomeGesture();
+        tdeck_remote_reply("home");
+        break;
+    case 1: // tap
+        THIS->remoteInit();
+        s_remoteX = (int16_t)x;
+        s_remoteY = (int16_t)y;
+        s_remoteHold = 3; // a few reads, so LVGL registers a press then a release
+        snprintf(buf, sizeof(buf), "tap %d %d", x, y);
+        tdeck_remote_reply(buf);
+        break;
+    default:
         break;
     }
 }

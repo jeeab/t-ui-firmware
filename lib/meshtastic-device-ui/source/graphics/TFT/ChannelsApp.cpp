@@ -23,6 +23,7 @@
 // touching none of MUI's internals.
 // -----------------------------------------------------------------------------
 #include "lvgl.h"
+#include "util/ILog.h"
 #include <Arduino.h>
 #include <cstdio>
 
@@ -163,9 +164,12 @@ void buildChannelList(void)
         lv_label_set_text(hdr, "People");
         lv_obj_set_style_text_color(hdr, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     }
+    ILOG_INFO("[CHATDBG] nConvo=%d", nConvo);
     for (int i = 0; i < nConvo; i++) {
         shown++;
         lv_obj_t *row = makeRow(56);
+        ILOG_INFO("[CHATDBG] row %d node=0x%08x name='%s' rowptr=%p", i, (unsigned)convos[i],
+                  tdeck_node_name(convos[i]), (void *)row);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, onOpenDm, LV_EVENT_CLICKED, (void *)(uintptr_t)convos[i]);
 
@@ -184,9 +188,9 @@ void buildChannelList(void)
         // The last thing said, and who said it, so the row is worth reading at a glance.
         char last[80];
         if (tui_dm_last_text(convos[i], last, sizeof(last))) {
-            char shown[80];
-            emoji_to_text(last, shown, sizeof(shown)); // same reason as the message bubbles
-            lv_obj_t *l = makeLabel(row, shown, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
+            char preview[80]; // not "shown": that shadowed the outer row counter of the same name
+            emoji_to_text(last, preview, sizeof(preview)); // same reason as the message bubbles
+            lv_obj_t *l = makeLabel(row, preview, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
             lv_obj_set_width(l, 240);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
             lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 10, -6); // re-align: setting a width moves it

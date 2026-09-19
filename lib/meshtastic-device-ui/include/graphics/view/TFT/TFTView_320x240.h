@@ -599,6 +599,8 @@ class TFTView_320x240 : public MeshtasticView
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
     void showLockGlance(void);               // the iPod-style glance: clock, who messaged, slide to unlock
+    void remoteInit(void);                   // second LVGL pointer device, for injected taps
+    void remoteService(void);                // run one pending remote command, UI task only
     void updateLockGraceLabel(void);         // "Ask for PIN" button text, from the stored seconds
     void startScreenshotCountdown(void);     // Settings: capture the screen in five seconds
     void sendLocationNow(void);              // Settings: broadcast my position once, now

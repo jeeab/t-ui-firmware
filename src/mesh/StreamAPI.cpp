@@ -5,6 +5,8 @@
 #include "concurrency/LockGuard.h"
 #include "configuration.h"
 
+extern "C" void tdeck_remote_feed(uint8_t c); // src/TDeckRemote.cpp
+
 #define START1 0x94
 #define START2 0xc3
 #define HEADER_LEN 4
@@ -134,11 +136,20 @@ int32_t StreamAPI::readStream()
             // console->printf("rxPtr %d ptr=%d c=0x%x\n", rxPtr, ptr, c);
 
             if (ptr == 0) { // looking for START1
-                if (c != START1)
-                    rxPtr = 0;     // failed to find framing
+                if (c != START1) {
+                    rxPtr = 0; // failed to find framing
+                    // T-UI remote control (src/TDeckRemote.cpp). Bytes the framing search
+                    // rejects are, by definition, not part of a protobuf frame - so a plain
+                    // text command channel can share this port with the Meshtastic API
+                    // without the two ever colliding. Four lines, and it keeps the remote
+                    // control off Wi-Fi (which would drop the phone's Bluetooth link).
+                    tdeck_remote_feed(c);
+                }
             } else if (ptr == 1) { // looking for START2
-                if (c != START2)
-                    rxPtr = 0;                             // failed to find framing
+                if (c != START2) {
+                    rxPtr = 0; // failed to find framing
+                    tdeck_remote_feed(c);
+                }
             } else if (ptr >= HEADER_LEN - 1) {            // we have at least read our 4 byte framing
                 uint32_t len = (rxBuf[2] << 8) + rxBuf[3]; // big endian 16 bit length follows framing
 

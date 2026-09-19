@@ -91,6 +91,19 @@ extern "C" void tdeck_shot_begin(void)
 #if SHOT_HAVE_FS
     if (s_capturing || s_ready)
         return;
+
+    // ⚠️ REFUSE WHEN INTERNAL RAM IS TIGHT. 2026-09-19: Jake turned Wi-Fi on, and a
+    // screenshot stream while Wi-Fi was negotiating took the device down -
+    // "last restart=CRASH | prev run low: fast=0k". The capture buffer itself is PSRAM,
+    // but Wi-Fi is a heavy user of INTERNAL heap and a screenshot is never worth a crash.
+    // Say no and say why instead.
+    const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (freeInternal < 24 * 1024) {
+        LOG_INFO("@@err internal heap only %u bytes free - refusing screenshot (Wi-Fi on?)",
+                 (unsigned)freeInternal);
+        s_failed = true;
+        return;
+    }
     if (!s_buf) {
         s_buf = (uint16_t *)heap_caps_malloc((size_t)kShotW * kShotH * 2, MALLOC_CAP_SPIRAM);
         if (!s_buf) {
@@ -249,10 +262,102 @@ static void pruneShots(void)
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Streaming a shot back over the USB command channel.
+//
+// The obvious way to fetch one was `esptool read_flash` + littlefs-python, and it works
+// - but esptool puts the chip into download mode to do it, which REBOOTS the device. It
+// also truncated a screenshot to 0 bytes by resetting mid-write. Rebooting Jake's device
+// every time I want to look at the screen is not acceptable.
+//
+// So: stream the PSRAM capture buffer straight out, run-length encoded and base64'd. UI
+// screens are mostly flat colour, so RLE takes 76,800 pixels down to a few thousand pairs
+// - a couple of seconds at 115200 instead of a minute, and nothing restarts.
+//
+// ⚠️ EMITTED IN SMALL SLICES FROM THE MAIN LOOP, never in one go. Printing 30KB in a
+// single call would block, and on the "tft" task it would hold the SPI lock the radio
+// needs. A few hundred pairs per loop iteration keeps every call short.
+// ---------------------------------------------------------------------------
+static bool s_streaming = false;
+static int s_streamAt = 0; // pixel index reached so far
+
+extern "C" void tdeck_shot_stream_begin(void)
+{
+#if SHOT_HAVE_FS
+    if (!s_buf) {
+        LOG_INFO("@@err no capture in memory - take a shot first");
+        return;
+    }
+    const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (freeInternal < 16 * 1024) {
+        LOG_INFO("@@err internal heap only %u bytes free - refusing to stream",
+                 (unsigned)freeInternal);
+        return;
+    }
+    s_streaming = true;
+    s_streamAt = 0;
+    LOG_INFO("@@img %d %d rle16", kShotW, kShotH);
+#endif
+}
+
+#if SHOT_HAVE_FS
+static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// One slice: encode runs until the output line is full, print it, return.
+static void streamSlice(void)
+{
+    const int total = kShotW * kShotH;
+    // ⚠️ SIZED TO FIT THE LOG LINE. RedirectablePrint has a static printBuf[160] and
+    // silently truncates past it - at 192 bytes the base64 came out 256 chars, arrived
+    // cut to 154, and the decoder choked on a half-finished base64 group. 96 bytes is
+    // 128 characters of base64 plus the "@@d " prefix: comfortably inside 160.
+    uint8_t raw[96]; // 4 bytes per run (count16, value16) -> up to 24 runs a line
+    int n = 0;
+    while (s_streamAt < total && n + 4 <= (int)sizeof(raw)) {
+        const uint16_t v = s_buf[s_streamAt];
+        int run = 1;
+        while (s_streamAt + run < total && s_buf[s_streamAt + run] == v && run < 65535)
+            run++;
+        raw[n++] = (uint8_t)(run & 0xff);
+        raw[n++] = (uint8_t)(run >> 8);
+        raw[n++] = (uint8_t)(v & 0xff);
+        raw[n++] = (uint8_t)(v >> 8);
+        s_streamAt += run;
+    }
+    if (n == 0) {
+        s_streaming = false;
+        LOG_INFO("@@imgend");
+        return;
+    }
+    char line[(sizeof(raw) / 3 + 2) * 4 + 8];
+    int o = 0;
+    for (int i = 0; i < n; i += 3) {
+        const uint32_t b0 = raw[i];
+        const uint32_t b1 = (i + 1 < n) ? raw[i + 1] : 0;
+        const uint32_t b2 = (i + 2 < n) ? raw[i + 2] : 0;
+        const uint32_t t = (b0 << 16) | (b1 << 8) | b2;
+        line[o++] = kB64[(t >> 18) & 63];
+        line[o++] = kB64[(t >> 12) & 63];
+        line[o++] = (i + 1 < n) ? kB64[(t >> 6) & 63] : '=';
+        line[o++] = (i + 2 < n) ? kB64[t & 63] : '=';
+    }
+    line[o] = 0;
+    LOG_INFO("@@d %s", line);
+    if (s_streamAt >= total) {
+        s_streaming = false;
+        LOG_INFO("@@imgend");
+    }
+}
+#endif
+
 // Main loop. Writes the pending shot, if there is one.
 extern "C" void tdeck_shot_service(void)
 {
 #if SHOT_HAVE_FS
+    if (s_streaming) {
+        streamSlice();
+        return; // one slice per loop iteration; never block
+    }
     // Watchdog. The capture completes when a whole frame has been flushed past; if for any
     // reason one never is, s_capturing would stay set and every later screenshot would be
     // refused by the guard in tdeck_shot_begin(). Two seconds is many frames.
