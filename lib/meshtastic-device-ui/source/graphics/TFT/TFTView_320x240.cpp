@@ -1292,7 +1292,7 @@ void TFTView_320x240::createLauncher(void)
                 uint32_t nowT = lv_tick_get();
                 if (nowT - lastGlance > 500) {
                     lastGlance = nowT;
-                    THIS->refreshLockGlance();
+                    THIS->refreshLockGlance(false);
                 }
             }
 
@@ -8453,11 +8453,15 @@ void TFTView_320x240::showLockGlance(void)
 
     lv_slider_set_value(glance_slider, 0, LV_ANIM_OFF);
     lv_obj_set_style_text_opa(glance_slide_label, LV_OPA_COVER, LV_PART_MAIN);
-    refreshLockGlance();
+    refreshLockGlance(true); // first draw: build the rows
     lv_screen_load_anim(lockglance_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }
 
-void TFTView_320x240::refreshLockGlance(void)
+// force = rebuild the notification rows too. Without it this only refreshes the clock, which
+// is all that needs doing most of the time: tearing down and recreating three rows twice a
+// second for a screen that is usually just sitting there is pure allocation churn on a device
+// whose internal heap has been measured under 2KB free.
+void TFTView_320x240::refreshLockGlance(bool force)
 {
     if (!lockglance_screen)
         return;
@@ -8482,6 +8486,14 @@ void TFTView_320x240::refreshLockGlance(void)
         lv_label_set_text(glance_clock_label, "T-Deck");
         lv_label_set_text(glance_date_label, "");
     }
+
+    // Rows only change when a message arrives (or the list is cleared), so track the count and
+    // leave them alone otherwise.
+    static int lastCount = -1;
+    const int nowCount = notif_count();
+    if (!force && nowCount == lastCount)
+        return;
+    lastCount = nowCount;
 
     lv_obj_clean(glance_list);
     char who[24], text[56];

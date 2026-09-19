@@ -602,7 +602,7 @@ class TFTView_320x240 : public MeshtasticView
     void updateLockGraceLabel(void);         // "Ask for PIN" button text, from the stored seconds
     void startScreenshotCountdown(void);     // Settings: capture the screen in five seconds
     void sendLocationNow(void);              // Settings: broadcast my position once, now
-    void refreshLockGlance(void);            // re-draw the glance's clock and notification list
+    void refreshLockGlance(bool force);      // clock always; rows only when they changed, or forced
     void lockGlanceUnlocked(void);           // slide completed: PIN pad, or straight in
     void startCalibrationFromLock(void);     // Alt+C from the pad: run touch calibration, then re-lock
     void submitLockPad(void);                // OK pressed on the pad
