@@ -97,8 +97,14 @@ extern "C" void tdeck_shot_begin(void)
     // "last restart=CRASH | prev run low: fast=0k". The capture buffer itself is PSRAM,
     // but Wi-Fi is a heavy user of INTERNAL heap and a screenshot is never worth a crash.
     // Say no and say why instead.
+    // 10KB, not 24KB. The first guess was calibrated against the Wi-Fi crash, but this
+    // device sits at ~15KB free INTERNAL in ordinary use once MUI has built panels for
+    // 179 nodes - so 24KB refused every screenshot on an otherwise healthy device. What a
+    // capture actually costs internally is almost nothing: the 150KB buffer is PSRAM, and
+    // the stream uses a 96-byte stack buffer and the shared print buffer. 10KB is the
+    // genuine near-death line, not a comfortable margin.
     const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (freeInternal < 24 * 1024) {
+    if (freeInternal < 10 * 1024) {
         LOG_INFO("@@err internal heap only %u bytes free - refusing screenshot (Wi-Fi on?)",
                  (unsigned)freeInternal);
         s_failed = true;
@@ -289,7 +295,7 @@ extern "C" void tdeck_shot_stream_begin(void)
         return;
     }
     const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (freeInternal < 16 * 1024) {
+    if (freeInternal < 8 * 1024) {
         LOG_INFO("@@err internal heap only %u bytes free - refusing to stream",
                  (unsigned)freeInternal);
         return;

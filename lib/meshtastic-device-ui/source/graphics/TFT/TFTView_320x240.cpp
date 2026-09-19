@@ -160,7 +160,7 @@ extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char 
 
 extern "C" const char *tdeck_node_name(uint32_t num); // TDeckNodesBridge.cpp
 // Remote control over the USB cable (src/TDeckRemote.cpp).
-extern "C" int tdeck_remote_take(int *x, int *y);
+extern "C" int tdeck_remote_take(int *x, int *y, int *x2, int *y2);
 extern "C" void tdeck_remote_reply(const char *what);
 extern "C" void notif_init(void);
 // EmojiText.cpp: emoji have no glyph in this build and LV_USE_FONT_PLACEHOLDER is 0, so they
@@ -8446,16 +8446,49 @@ void TFTView_320x240::updateLockGraceLabel(void)
 // would be missed.
 // -----------------------------------------------------------------------------
 static lv_indev_t *s_remoteIndev = nullptr;
+static lv_indev_t *s_remoteKeys = nullptr;
 static int16_t s_remoteX = 0, s_remoteY = 0;
 static int s_remoteHold = 0; // >0 = pressed for this many more reads
+// A swipe is the same pointer walked along a line: press at the start, move a step per
+// read, release at the end. LVGL's scroll/fling logic needs the intermediate points -
+// jumping straight from start to end reads as a tap at the far end, not a drag.
+static int16_t s_swipeFromX = 0, s_swipeFromY = 0, s_swipeToX = 0, s_swipeToY = 0;
+static int s_swipeStep = 0, s_swipeSteps = 0;
+static uint32_t s_remoteKey = 0;
 
 static void remoteIndevRead(lv_indev_t *, lv_indev_data_t *data)
 {
+    if (s_swipeSteps > 0) {
+        // Walk the line. The last step reports the end point still pressed; the read
+        // after that releases, which is what turns it into a drag rather than a flick.
+        const int i = s_swipeStep;
+        const int n = s_swipeSteps;
+        data->point.x = (lv_coord_t)(s_swipeFromX + (s_swipeToX - s_swipeFromX) * i / n);
+        data->point.y = (lv_coord_t)(s_swipeFromY + (s_swipeToY - s_swipeFromY) * i / n);
+        data->state = LV_INDEV_STATE_PRESSED;
+        if (++s_swipeStep > n) {
+            s_swipeSteps = 0;
+            s_remoteX = s_swipeToX;
+            s_remoteY = s_swipeToY;
+        }
+        return;
+    }
     data->point.x = s_remoteX;
     data->point.y = s_remoteY;
     if (s_remoteHold > 0) {
         s_remoteHold--;
         data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+static void remoteKeyRead(lv_indev_t *, lv_indev_data_t *data)
+{
+    if (s_remoteKey) {
+        data->key = s_remoteKey;
+        data->state = LV_INDEV_STATE_PRESSED;
+        s_remoteKey = 0;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
@@ -8468,15 +8501,25 @@ void TFTView_320x240::remoteInit(void)
     s_remoteIndev = lv_indev_create();
     lv_indev_set_type(s_remoteIndev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(s_remoteIndev, remoteIndevRead);
+    s_remoteKeys = lv_indev_create();
+    lv_indev_set_type(s_remoteKeys, LV_INDEV_TYPE_KEYPAD);
+    lv_indev_set_read_cb(s_remoteKeys, remoteKeyRead);
+    if (lv_group_get_default())
+        lv_indev_set_group(s_remoteKeys, lv_group_get_default());
 }
 
 // Called from the UI poll timer. Does nothing at all until a command arrives.
 void TFTView_320x240::remoteService(void)
 {
-    int x = 0, y = 0;
-    const int cmd = tdeck_remote_take(&x, &y);
+    int x = 0, y = 0, x2 = 0, y2 = 0;
+    const int cmd = tdeck_remote_take(&x, &y, &x2, &y2);
     if (!cmd)
         return;
+    // Anything arriving over the cable counts as somebody using the device. Without this
+    // the idle timeout fires between commands - driving it remotely meant watching it
+    // re-lock every few seconds, and screens captured after a command were often the lock
+    // screen rather than the thing just opened.
+    lv_display_trigger_activity(NULL);
     char buf[96];
     switch (cmd) {
     case 6: // ping
@@ -8513,6 +8556,23 @@ void TFTView_320x240::remoteService(void)
     case 2: // home
         THIS->handleHomeGesture();
         tdeck_remote_reply("home");
+        break;
+    case 8: // key
+        THIS->remoteInit();
+        s_remoteKey = (uint32_t)x;
+        snprintf(buf, sizeof(buf), "key %d", x);
+        tdeck_remote_reply(buf);
+        break;
+    case 7: // swipe
+        THIS->remoteInit();
+        s_swipeFromX = (int16_t)x;
+        s_swipeFromY = (int16_t)y;
+        s_swipeToX = (int16_t)x2;
+        s_swipeToY = (int16_t)y2;
+        s_swipeStep = 0;
+        s_swipeSteps = 12; // enough points that LVGL sees a drag, few enough to be quick
+        snprintf(buf, sizeof(buf), "swipe %d %d -> %d %d", x, y, x2, y2);
+        tdeck_remote_reply(buf);
         break;
     case 1: // tap
         THIS->remoteInit();

@@ -21,8 +21,11 @@
 // of the ordinary log chatter.
 //
 //   @@ping            - is anyone home
-//   @@info            - uptime, active screen
+//   @@info            - uptime, active screen, free internal heap
+//   @@mem             - full heap picture: free, largest block, all-time low
 //   @@tap <x> <y>     - touch the screen at that point
+//   @@swipe x1 y1 x2 y2 - drag, for paging the launcher and moving sliders
+//   @@key <code>      - inject an LVGL keycode (see lv_keys)
 //   @@home            - the Home gesture (trackball double-click)
 //   @@back            - the Back gesture
 //   @@shot            - take a screenshot to internal flash
@@ -37,6 +40,7 @@
 #include <Arduino.h>
 #include <cstdio>
 #include <cstring>
+#include <esp_heap_caps.h>
 
 static const int kMaxLine = 64;
 static char s_line[kMaxLine];
@@ -46,6 +50,7 @@ static bool s_armed = false; // saw '@' '@' at the start of a line
 // One pending command, parsed. The UI task picks it up.
 static volatile int s_cmd = 0; // 0 none, 1 tap, 2 home, 3 back, 4 shot, 5 info, 6 ping
 static volatile int s_x = 0, s_y = 0;
+static volatile int s_x2 = 0, s_y2 = 0; // swipe end point
 
 extern "C" void tdeck_shot_stream_begin(void); // src/TDeckScreenshot.cpp
 
@@ -62,6 +67,15 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 s_cmd = 6;
             } else if (!strncmp(s_line, "info", 4)) {
                 s_cmd = 5;
+            } else if (!strncmp(s_line, "mem", 3)) {
+                // Memory is answered straight here, not on the UI task: it reads heap
+                // counters only, and the UI task is the one under pressure.
+                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u",
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
             } else if (!strncmp(s_line, "shot", 4)) {
                 s_cmd = 4;
             } else if (!strncmp(s_line, "get", 3)) {
@@ -73,6 +87,22 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 s_cmd = 2;
             } else if (!strncmp(s_line, "back", 4)) {
                 s_cmd = 3;
+            } else if (!strncmp(s_line, "swipe", 5)) {
+                int x1 = -1, y1 = -1, x2 = -1, y2 = -1;
+                if (sscanf(s_line + 5, "%d %d %d %d", &x1, &y1, &x2, &y2) == 4) {
+                    s_x = x1; s_y = y1; s_x2 = x2; s_y2 = y2;
+                    s_cmd = 7;
+                } else {
+                    LOG_INFO("@@err swipe needs x1 y1 x2 y2");
+                }
+            } else if (!strncmp(s_line, "key", 3)) {
+                int k = -1;
+                if (sscanf(s_line + 3, "%d", &k) == 1 && k > 0) {
+                    s_x = k;
+                    s_cmd = 8;
+                } else {
+                    LOG_INFO("@@err key needs a keycode");
+                }
             } else if (!strncmp(s_line, "tap", 3)) {
                 int x = -1, y = -1;
                 if (sscanf(s_line + 3, "%d %d", &x, &y) == 2 && x >= 0 && x < 320 && y >= 0 && y < 240) {
@@ -108,7 +138,7 @@ extern "C" void tdeck_remote_feed(uint8_t c)
 
 // Called by the UI poll timer on the tft task. Returns the pending command (and clears
 // it), so that everything touching LVGL happens where LVGL lives.
-extern "C" int tdeck_remote_take(int *x, int *y)
+extern "C" int tdeck_remote_take(int *x, int *y, int *x2, int *y2)
 {
     const int c = s_cmd;
     if (!c)
@@ -117,6 +147,10 @@ extern "C" int tdeck_remote_take(int *x, int *y)
         *x = s_x;
     if (y)
         *y = s_y;
+    if (x2)
+        *x2 = s_x2;
+    if (y2)
+        *y2 = s_y2;
     s_cmd = 0;
     return c;
 }

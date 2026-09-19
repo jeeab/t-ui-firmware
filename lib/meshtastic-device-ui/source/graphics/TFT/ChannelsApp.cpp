@@ -67,6 +67,144 @@ uint32_t members[kMaxMembers];
 const int kMaxConvos = 24;
 uint32_t convos[kMaxConvos];
 
+
+// ---------------------------------------------------------------------------
+// The row. Jake, 2026-09-19: "make it look as professional and polished as possible...
+// welcome to change anything, even major stuff."
+//
+// The old row put a name, a preview and a timestamp all hard against the left edge of a
+// 56px box, which read as a wall of text - and it had an overlapping-label artefact that
+// I could never account for. This is the arrangement every phone messenger uses, because
+// it works: a round avatar anchors the row and gives the eye a column to scan, name and
+// time share the top line, the preview owns the second, and unread is a colour change
+// rather than another thing to read. Designed and checked in the PC renderer (C:\tdsim)
+// before it ever reached the device.
+//
+// Every label here is given its width BEFORE it is aligned - setting a width moves a
+// label, so aligning first and sizing second silently puts it somewhere else.
+// ---------------------------------------------------------------------------
+uint32_t avatarColour(uint32_t num)
+{
+    // Green is deliberately absent: it is the unread accent, and an avatar the same
+    // colour as "you have a new message" is a lie the eye has to unlearn every time.
+    static const uint32_t kPal[10] = {0x0a84ff, 0xbf5af2, 0xff9f0a, 0x5ac8fa, 0xff6482,
+                                      0x64d2ff, 0xffd60a, 0xff8a5b, 0xa78bfa, 0xf472b6};
+    // A real mix, not an xor-fold: node numbers differ mostly in their low bits, and
+    // folding them onto each other put two of Jake's nodes on the same colour.
+    uint32_t h = num * 2654435761u; // Knuth
+    h ^= h >> 15;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    return kPal[h % 10];
+}
+
+// Up to two initials: "Vip Phone-Nick2" -> "VP", "Nick" -> "N".
+void initialsOf(const char *name, char *out, size_t n)
+{
+    size_t o = 0;
+    bool atWordStart = true;
+    for (const char *p = name; *p && o + 1 < n && o < 2; p++) {
+        if (*p == ' ' || *p == '-' || *p == '_') {
+            atWordStart = true;
+            continue;
+        }
+        const bool alnum = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9');
+        if (atWordStart && alnum) {
+            out[o++] = (*p >= 'a' && *p <= 'z') ? (char)(*p - 32) : *p;
+            atWordStart = false;
+        }
+    }
+    if (o == 0 && name && name[0])
+        out[o++] = name[0];
+    out[o] = 0;
+}
+
+lv_obj_t *convoRow(uint32_t num, const char *name, const char *preview, const char *when, bool unread,
+                   bool isChannel)
+{
+    lv_obj_t *row = lv_obj_create(listCont);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 304, 60);
+    lv_obj_set_style_bg_color(row, lv_color_hex(unread ? 0x14241a : 0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *av = lv_obj_create(row);
+    lv_obj_remove_style_all(av);
+    lv_obj_set_size(av, 40, 40);
+    lv_obj_align(av, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_set_style_radius(av, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(av, lv_color_hex(isChannel ? 0x2c2c2e : avatarColour(num)), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(av, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(av, LV_OBJ_FLAG_SCROLLABLE);
+    if (isChannel) {
+        // A channel is a place, not a person: bars instead of initials.
+        lv_obj_set_style_border_color(av, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_set_style_border_width(av, 2, LV_PART_MAIN);
+        for (int k = 0; k < 3; k++) {
+            lv_obj_t *b = lv_obj_create(av);
+            lv_obj_remove_style_all(b);
+            lv_obj_set_size(b, 18, 3);
+            lv_obj_align(b, LV_ALIGN_CENTER, 0, -6 + k * 6);
+            lv_obj_set_style_radius(b, 2, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(b, lv_color_hex(k == 0 ? 0x30d158 : 0x6a6a70), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+        }
+    } else {
+        char ini[4];
+        initialsOf(name, ini, sizeof(ini));
+        lv_obj_t *l = lv_label_create(av);
+        lv_label_set_text(l, ini);
+        lv_obj_set_style_text_color(l, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_center(l);
+    }
+
+    lv_obj_t *tm = lv_label_create(row);
+    lv_label_set_text(tm, (when && when[0]) ? when : "");
+    lv_obj_set_style_text_color(tm, lv_color_hex(unread ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
+    lv_obj_set_style_text_font(tm, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(tm, LV_ALIGN_TOP_RIGHT, -12, 11);
+
+    lv_obj_t *nm = lv_label_create(row);
+    lv_obj_set_width(nm, 168);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_label_set_text(nm, (name && name[0]) ? name : "(unnamed)");
+    lv_obj_set_style_text_color(nm, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(nm, LV_ALIGN_TOP_LEFT, 60, 9);
+
+    lv_obj_t *pv = lv_label_create(row);
+    lv_obj_set_width(pv, 226);
+    lv_label_set_long_mode(pv, LV_LABEL_LONG_DOT);
+    lv_label_set_text(pv, (preview && preview[0]) ? preview : "No messages yet");
+    lv_obj_set_style_text_color(pv, lv_color_hex(unread ? 0xc7f5d2 : 0x8e8e93), LV_PART_MAIN);
+    lv_obj_set_style_text_font(pv, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(pv, LV_ALIGN_TOP_LEFT, 60, 32);
+
+    if (unread) {
+        lv_obj_t *dot = lv_obj_create(row);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 10, 10);
+        lv_obj_align(dot, LV_ALIGN_BOTTOM_RIGHT, -13, -11);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+    }
+    return row;
+}
+
+lv_obj_t *sectionHeader(const char *txt)
+{
+    lv_obj_t *l = lv_label_create(listCont);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(0x6a6a70), LV_PART_MAIN);
+    lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(l, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(l, 4, LV_PART_MAIN);
+    return l;
+}
+
 void rebuild(void);
 
 void ageText(uint32_t secs, char *out, size_t n)
@@ -157,98 +295,67 @@ void buildChannelList(void)
     lv_label_set_text(titleLbl, "Conversations");
     int shown = 0;
 
-    // ---- the people you are actually talking to, first: that is what you open this for ----
+    // People first: that is what this app is opened for.
     const int nConvo = tui_dm_conversations(convos, kMaxConvos);
-    if (nConvo > 0) {
-        lv_obj_t *hdr = lv_label_create(listCont);
-        lv_label_set_text(hdr, "People");
-        lv_obj_set_style_text_color(hdr, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    }
-    ILOG_INFO("[CHATDBG] nConvo=%d", nConvo);
+    if (nConvo > 0)
+        sectionHeader("PEOPLE");
     for (int i = 0; i < nConvo; i++) {
         shown++;
-        lv_obj_t *row = makeRow(56);
-        ILOG_INFO("[CHATDBG] row %d node=0x%08x name='%s' rowptr=%p", i, (unsigned)convos[i],
-                  tdeck_node_name(convos[i]), (void *)row);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, onOpenDm, LV_EVENT_CLICKED, (void *)(uintptr_t)convos[i]);
-
-        const bool unread = notif_unread_from(convos[i]);
-        if (unread) {
-            lv_obj_t *dot = lv_obj_create(row);
-            lv_obj_remove_style_all(dot);
-            lv_obj_set_size(dot, 9, 9);
-            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-            lv_obj_set_style_bg_color(dot, lv_color_hex(0x30d158), LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 9, 11);
-        }
-        makeLabel(row, tdeck_node_name(convos[i]), 0xffffff, LV_ALIGN_TOP_LEFT, unread ? 24 : 10, 6);
-
-        // The last thing said, and who said it, so the row is worth reading at a glance.
-        char last[80];
-        if (tui_dm_last_text(convos[i], last, sizeof(last))) {
-            char preview[80]; // not "shown": that shadowed the outer row counter of the same name
-            emoji_to_text(last, preview, sizeof(preview)); // same reason as the message bubbles
-            lv_obj_t *l = makeLabel(row, preview, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
-            lv_obj_set_width(l, 240);
-            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-            lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 10, -6); // re-align: setting a width moves it
-        } else {
-            makeLabel(row, "No messages yet", 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
-        }
+        char last[80], preview[80];
+        preview[0] = 0;
+        if (tui_dm_last_text(convos[i], last, sizeof(last)))
+            emoji_to_text(last, preview, sizeof(preview)); // emoji have no glyph in this build
 
         char age[16];
         ageText(tdeck_node_age_secs(convos[i]), age, sizeof(age));
-        if (age[0])
-            makeLabel(row, age, 0x8e8e93, LV_ALIGN_TOP_RIGHT, -10, 6);
+        // ageText gives "seen 4h"; the row has a dedicated time column, so drop the word.
+        const char *when = age;
+        if (!strncmp(age, "seen ", 5))
+            when = age + 5;
+
+        lv_obj_t *row = convoRow(convos[i], tdeck_node_name(convos[i]), preview, when,
+                                 notif_unread_from(convos[i]), false);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, onOpenDm, LV_EVENT_CLICKED, (void *)(uintptr_t)convos[i]);
     }
 
-    if (nConvo > 0) {
-        lv_obj_t *hdr = lv_label_create(listCont);
-        lv_label_set_text(hdr, "Channels");
-        lv_obj_set_style_text_color(hdr, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    }
+    if (nConvo > 0)
+        sectionHeader("CHANNELS");
     for (int i = 0; i < tdeck_channel_count(); i++) {
         const int role = tdeck_channel_role(i);
         if (role == 0)
             continue; // disabled slots are not channels
         shown++;
-        lv_obj_t *row = makeRow(56);
-        // The row itself opens the conversation. The people button is a child with its own handler,
-        // so it takes its own taps and does not fall through to this.
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, onOpenChat, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
-        const char *nm = tdeck_channel_name(i);
-        makeLabel(row, (nm && nm[0]) ? nm : "(unnamed)", 0xffffff, LV_ALIGN_TOP_LEFT, 10, 6);
-
-        // The precision is the interesting fact about a channel here: it is what decides
+        // The position precision is the interesting fact about a channel: it decides
         // whether the map can show people where they actually are.
         const int prec = tdeck_channel_precision(i);
         char sub[64];
-        if (role == 1)
-            snprintf(sub, sizeof(sub), "Primary  -  %s", prec >= 32 ? "exact positions" : (prec > 0 ? "approx positions" : "no positions"));
-        else
-            snprintf(sub, sizeof(sub), "Secondary  -  %s", prec >= 32 ? "exact positions" : (prec > 0 ? "approx positions" : "no positions"));
-        makeLabel(row, sub, 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
+        snprintf(sub, sizeof(sub), "%s  -  %s", role == 1 ? "Primary" : "Secondary",
+                 prec >= 32 ? "exact positions" : (prec > 0 ? "approx positions" : "no positions"));
 
-        // People button on the custom channels only, exactly as asked — the primary is
-        // everyone by definition, so a list there says nothing.
+        lv_obj_t *row = convoRow((uint32_t)i, tdeck_channel_name(i), sub, "", false, true);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, onOpenChat, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        // People button on the custom channels only - the primary is everyone by
+        // definition, so a list there says nothing. Sits between the time column and the
+        // right edge, where nothing else lives on a channel row.
         if (role != 1) {
             lv_obj_t *btn = lv_obj_create(row);
             lv_obj_remove_style_all(btn);
-            lv_obj_set_size(btn, 44, 44);
-            lv_obj_align(btn, LV_ALIGN_RIGHT_MID, -6, 0);
+            lv_obj_set_size(btn, 40, 40);
+            lv_obj_align(btn, LV_ALIGN_RIGHT_MID, -8, 0);
             lv_obj_set_style_bg_color(btn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
             lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_set_style_radius(btn, 6, LV_PART_MAIN);
+            lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
             lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(btn, onOpenMembers, LV_EVENT_CLICKED, (void *)(intptr_t)i);
             peopleIcon(btn);
         }
     }
+
     if (!shown)
         lv_label_set_text(noteLbl, "No conversations yet.\nChannels appear here once configured,\nand people once you have messaged.");
     else
@@ -327,10 +434,12 @@ void buildScreen(void)
 
     listCont = lv_obj_create(screen);
     lv_obj_remove_style_all(listCont);
-    lv_obj_set_size(listCont, 312, 198);
+    lv_obj_set_size(listCont, 320, 202);
     lv_obj_align(listCont, LV_ALIGN_TOP_MID, 0, 36);
     lv_obj_set_flex_flow(listCont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(listCont, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(listCont, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(listCont, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(listCont, 8, LV_PART_MAIN);
     lv_obj_set_scroll_dir(listCont, LV_DIR_VER);
 
     noteLbl = lv_label_create(screen);
