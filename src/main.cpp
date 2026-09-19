@@ -1296,6 +1296,7 @@ extern "C" void tdeck_nodes_dump(void); // one-shot diagnostic, 45 s after boot
 extern "C" void tdeck_sound_service(void);
 extern "C" void tdeck_pop_service(void); // TDeckPop.cpp - starts the new-message pop off-thread
 extern "C" void tdeck_shot_service(void); // TDeckScreenshot.cpp - writes a pending screenshot
+extern "C" void tdeck_share_location_service(void); // TDeckShareLocation.cpp - one-shot position send
 // T-Deck launcher 12/24-hour switch: apply + persist a pending clock-format change from this
 // (main) thread, for the same reason as the others. Defined in src/TDeckClockFormat.cpp.
 extern "C" void tdeck_clock_service(void);
@@ -1393,6 +1394,7 @@ void loop()
     tdeck_sound_service();
     tdeck_pop_service();
     tdeck_shot_service();
+    tdeck_share_location_service();
     tdeck_clock_service();
     tdeck_net_service();
 #ifdef NETDOOR_SELFTEST

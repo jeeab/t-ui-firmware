@@ -99,6 +99,10 @@ extern "C" void tdeck_shot_begin(void);
 extern "C" bool tdeck_shot_capturing(void);
 extern "C" const char *tdeck_shot_last_path(void);
 extern "C" bool tdeck_shot_failed(void);
+// One-shot position broadcast (src/TDeckShareLocation.cpp).
+extern "C" void tdeck_share_location_request(void);
+extern "C" uint8_t tdeck_share_location_state(void);
+extern "C" void tdeck_share_location_clear(void);
 // Keyboard backlight follows the screen (src/TDeckKeyboardLight.cpp). Persisted in NVS;
 // default OFF, so a device nobody has touched keeps its keys dark exactly as before.
 extern "C" bool tdeck_trackball_nav_enabled(void);
@@ -2400,7 +2404,7 @@ void TFTView_320x240::createSettingsScreen(void)
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 966);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 1030);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2424,7 +2428,39 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1010);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1074);
+
+    // "Send my location" - Jake, 2026-09-18: "manua share location and info button?"
+    //
+    // Meshtastic broadcasts your position on a timer, deliberately slow (slower still when
+    // you have not moved) because every broadcast is airtime everyone else sits through.
+    // That is right until somebody needs to know where you are NOW - which, hunting, is the
+    // moment that matters. One tap, one broadcast, no settings changed. The line underneath
+    // is the "info" half: it reports the position that actually went out.
+    lv_obj_t *shareNowLbl = lv_label_create(settings_screen);
+    lv_label_set_text(shareNowLbl, "Send my location");
+    lv_obj_set_style_text_color(shareNowLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 894);
+
+    lv_obj_t *shareNowBtn = lv_btn_create(settings_screen);
+    lv_obj_set_size(shareNowBtn, 116, 30);
+    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 890);
+    lv_obj_set_style_radius(shareNowBtn, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(shareNowBtn, lv_color_hex(0x30d158), LV_PART_MAIN);
+    lv_obj_t *shareNowBtnLbl = lv_label_create(shareNowBtn);
+    lv_label_set_text(shareNowBtnLbl, "Send now");
+    lv_obj_set_style_text_font(shareNowBtnLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(shareNowBtnLbl);
+    lv_obj_add_event_cb(
+        shareNowBtn, [](lv_event_t *) { THIS->sendLocationNow(); }, LV_EVENT_CLICKED, NULL);
+
+    share_now_hint = lv_label_create(settings_screen);
+    lv_obj_set_width(share_now_hint, 288);
+    lv_label_set_long_mode(share_now_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(share_now_hint, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_label_set_text(share_now_hint, "Broadcasts where you are right now, once.");
+    lv_obj_set_style_text_color(share_now_hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 920);
 
     // "Screenshot" - Jake, 2026-09-18: "debug: screen shot thar we can both trigger. saves
     // to sd". Five seconds of countdown, so there is time to leave Settings and get to the
@@ -2433,11 +2469,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shotLbl = lv_label_create(settings_screen);
     lv_label_set_text(shotLbl, "Screenshot");
     lv_obj_set_style_text_color(shotLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 894);
+    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 958);
 
     shot_btn = lv_btn_create(settings_screen);
     lv_obj_set_size(shot_btn, 116, 30);
-    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 890);
+    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 954);
     lv_obj_set_style_radius(shot_btn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shot_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
     shot_btn_label = lv_label_create(shot_btn);
@@ -2453,7 +2489,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(shot_hint_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(shot_hint_label, "Tap, then go to the screen you want. Saved to /shots on the card.");
     lv_obj_set_style_text_color(shot_hint_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 920);
+    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 984);
 }
 
 /**
@@ -8219,6 +8255,42 @@ void TFTView_320x240::updateLockDisplay(void)
 // The countdown is the whole point: a screenshot taken the instant the button is pressed is
 // a picture of the Settings screen, which is never the thing anyone wants to show anybody.
 // Five seconds is enough to get back to the launcher and into the app that is misbehaving.
+// One deliberate position broadcast, and then say what happened - including the coordinates,
+// so it is obvious whether the GPS had anything worth sending.
+void TFTView_320x240::sendLocationNow(void)
+{
+    if (!share_now_hint)
+        return;
+    tdeck_share_location_request();
+    lv_label_set_text(share_now_hint, "Sending...");
+    // The send happens on the main loop, not here: transmitting from the LVGL task is how
+    // the display's SPI lock ends up held while the radio wants it. Look back in a moment.
+    lv_timer_t *check = lv_timer_create(
+        [](lv_timer_t *t) {
+            lv_timer_delete(t);
+            if (!THIS->share_now_hint)
+                return;
+            const uint8_t st = tdeck_share_location_state();
+            if (st == 2) {
+                int32_t la = 0, lo = 0;
+                static char msg[96];
+                if (tdeck_gps_position(&la, &lo))
+                    snprintf(msg, sizeof(msg), "Sent - you are at %.5f, %.5f", la * 1e-7, lo * 1e-7);
+                else
+                    snprintf(msg, sizeof(msg), "Sent.");
+                lv_label_set_text(THIS->share_now_hint, msg);
+            } else if (st == 3) {
+                lv_label_set_text(THIS->share_now_hint,
+                                  "No position yet - the GPS needs a fix before there is anything to send.");
+            } else {
+                lv_label_set_text(THIS->share_now_hint, "Broadcasts where you are right now, once.");
+            }
+            tdeck_share_location_clear();
+        },
+        700, nullptr);
+    (void)check;
+}
+
 void TFTView_320x240::startScreenshotCountdown(void)
 {
     static lv_timer_t *countdown = nullptr;
