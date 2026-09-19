@@ -1158,28 +1158,28 @@ void TFTView_320x240::createLauncher(void)
         },
         1000, NULL);
 
-    // mesh on/off dot (reads meshEnabled; updated by setMeshEnabled()).
-    mesh_status_icon = lv_obj_create(launcher_screen);
-    lv_obj_remove_style_all(mesh_status_icon);
-    lv_obj_set_size(mesh_status_icon, 12, 12);
-    lv_obj_set_style_radius(mesh_status_icon, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(mesh_status_icon, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(mesh_status_icon, lv_color_hex(meshEnabled ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(mesh_status_icon, LV_ALIGN_TOP_LEFT, 8, 8);
-    lv_obj_clear_flag(mesh_status_icon, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *mstatus = lv_label_create(launcher_screen);
-    lv_label_set_text(mstatus, "mesh");
-    lv_obj_set_style_text_color(mstatus, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align_to(mstatus, mesh_status_icon, LV_ALIGN_OUT_RIGHT_MID, 5, 0);
-
-    // Unread-message count, sitting just right of "mesh". Green so a new message stands out; blank
-    // when there are none. Fed by updateUnreadMessages() (incremented on arrival, cleared to 0 the
-    // moment the messages are opened — so checking your messages clears this count).
+    // No "mesh" dot + label here any more (Jake, 2026-09-18: "header remove mesh with green
+    // dot"). The radio being on is the normal state, so a permanent green dot was just clutter
+    // in the one corner the notification count wants. mesh_status_icon stays null; setMeshEnabled
+    // null-guards it and now drives the warning label below instead.
+    //
+    // Unread-message count, top-left. Green so a new message stands out; blank when there are
+    // none. Fed by updateUnreadMessages() (incremented on arrival, cleared to 0 the moment the
+    // messages are opened — so checking your messages clears this count).
     launcher_unread_label = lv_label_create(launcher_screen);
     lv_obj_set_style_text_color(launcher_unread_label, lv_color_hex(0x30d158), LV_PART_MAIN);
     lv_obj_set_style_text_font(launcher_unread_label, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_align_to(launcher_unread_label, mesh_status_icon, LV_ALIGN_OUT_RIGHT_MID, 50, 0);
+    lv_obj_align(launcher_unread_label, LV_ALIGN_TOP_LEFT, 8, 6);
     lv_label_set_text(launcher_unread_label, "");
+
+    // The dot is gone, but going off-grid silently would be worse than the clutter was: when the
+    // radio is switched OFF, say so in words. Blank — and therefore invisible — the rest
+    // of the time, which is nearly always.
+    launcher_mesh_off_label = lv_label_create(launcher_screen);
+    lv_obj_set_style_text_color(launcher_mesh_off_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_set_style_text_font(launcher_mesh_off_label, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+    lv_label_set_text(launcher_mesh_off_label, meshEnabled ? "" : "mesh off");
     updateUnreadMessages(); // reflect any count that already accrued before the grid was built
 
     // battery percentage (top-right); fed by updateMetrics()->updateLauncherBattery().
@@ -1850,6 +1850,11 @@ void TFTView_320x240::setMeshEnabled(bool on)
 
     if (mesh_status_icon)
         lv_obj_set_style_bg_color(mesh_status_icon, lv_color_hex(on ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
+    if (launcher_mesh_off_label) {
+        lv_label_set_text(launcher_mesh_off_label, on ? "" : "mesh off");
+        if (launcher_unread_label) // keep it tucked against the unread count, whatever that reads
+            lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+    }
     if (mesh_switch) {
         if (on)
             lv_obj_add_state(mesh_switch, LV_STATE_CHECKED);
@@ -6207,7 +6212,7 @@ void TFTView_320x240::openPinsList(void)
         MapPin &p = *pp;
         lv_obj_t *row = lv_obj_create(list);
         lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, 302, 54); // taller than it was: the share line lives underneath
+        lv_obj_set_size(row, 302, 74); // share line, then the coordinates line, under the buttons
         lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
@@ -6345,6 +6350,40 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_set_width(st, 286);
         lv_label_set_long_mode(st, LV_LABEL_LONG_DOT);
         lv_obj_align(st, LV_ALIGN_LEFT_MID, 6, 0);
+
+        // Jake, 2026-09-18: "more info on pins. lat, long." Six decimal places is about 11 cm,
+        // which is more than a hand-dropped pin is worth but is the form every map and GPS
+        // expects, so it can be typed straight into anything else. How far away and which way
+        // rides along when there is a fix: on a hillside that is the number you actually want.
+        char coords[80];
+        snprintf(coords, sizeof(coords), "%.6f, %.6f", (double)p.lat, (double)p.lon);
+        int32_t ourLat, ourLon;
+        if (tdeck_gps_position(&ourLat, &ourLon)) {
+            const double a = ourLat * 1e-7 * M_PI / 180.0, b = ourLon * 1e-7 * M_PI / 180.0;
+            const double c = p.lat * M_PI / 180.0, d = p.lon * M_PI / 180.0;
+            const double dLat = c - a, dLon = d - b;
+            const double hv = sin(dLat / 2) * sin(dLat / 2) + cos(a) * cos(c) * sin(dLon / 2) * sin(dLon / 2);
+            const double m = 6371000.0 * 2 * atan2(sqrt(hv), sqrt(1 - hv));
+            const double yy = sin(dLon) * cos(c), xx = cos(a) * sin(c) - sin(a) * cos(c) * cos(dLon);
+            double brg = atan2(yy, xx) * 180.0 / M_PI;
+            if (brg < 0)
+                brg += 360.0;
+            static const char *kPts[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+            const char *pt = kPts[(int)((brg + 22.5) / 45.0) % 8];
+            char away[32];
+            if (m < 1609.34)
+                snprintf(away, sizeof(away), "   %d ft %s", (int)(m * 3.28084), pt);
+            else
+                snprintf(away, sizeof(away), "   %.1f mi %s", m / 1609.34, pt);
+            strncat(coords, away, sizeof(coords) - strlen(coords) - 1);
+        }
+        lv_obj_t *co = lv_label_create(row);
+        lv_label_set_text(co, coords);
+        lv_obj_set_style_text_font(co, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(co, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_width(co, 286);
+        lv_label_set_long_mode(co, LV_LABEL_LONG_DOT);
+        lv_obj_align(co, LV_ALIGN_TOP_LEFT, 10, 54);
     }
 
     // Deleting a shared pin still leaves us asking the mesh to drop their copies, and that has no
@@ -12475,12 +12514,19 @@ void TFTView_320x240::handleAddMessage(char *msg)
         ch = (uint8_t)channelOrNode;
         requestId = requests.addRequest(ch, ResponseHandler::TextMessageRequest, (void *)(long)ch, callback);
     } else {
-        ch = (uint8_t)(unsigned long)nodes[channelOrNode]->user_data;
+        // Same hazard as showMessages: never dereference a node panel we do not have. Dropping the
+        // message is bad; crashing with it half-typed is worse.
+        auto destIt = nodes.find(channelOrNode);
+        if (destIt == nodes.end() || !destIt->second) {
+            ILOG_WARN("handleAddMessage: no node panel for 0x%08x, not sending", (unsigned)channelOrNode);
+            return;
+        }
+        ch = (uint8_t)(unsigned long)destIt->second->user_data;
         to = channelOrNode;
-        usePkc = (unsigned long)nodes[to]->LV_OBJ_IDX(node_bat_idx)->user_data; // hasKey
+        usePkc = (unsigned long)destIt->second->LV_OBJ_IDX(node_bat_idx)->user_data; // hasKey
         requestId = requests.addRequest(to, ResponseHandler::TextMessageRequest, (void *)to, callback);
         // trial: hoplimit optimization for direct text messages
-        int8_t hopsAway = (signed long)nodes[to]->LV_OBJ_IDX(node_sig_idx)->user_data;
+        int8_t hopsAway = (signed long)destIt->second->LV_OBJ_IDX(node_sig_idx)->user_data;
         if (hopsAway < 0)
             hopsAway = db.config.lora.hop_limit;
         hopLimit = (hopsAway < db.config.lora.hop_limit ? hopsAway + 1 : hopsAway);
@@ -14791,6 +14837,16 @@ void TFTView_320x240::showMessages(uint8_t ch)
  */
 void TFTView_320x240::showMessages(uint32_t nodeNum)
 {
+    // ⚠️ The node panel has to exist BEFORE the conversation is opened. handleAddMessage reads
+    // the destination's channel and key straight off nodes[num], so a chat opened for a node MUI
+    // has no panel for would take the device down the moment a message was typed into it. That is
+    // reachable: MAX_NUM_NODES_VIEW caps the panels at 250 and purges the oldest, while the Nodes
+    // app lists everything NodeDB holds — so the two CAN disagree.
+    auto nodeIt = nodes.find(nodeNum);
+    if (nodeIt == nodes.end() || !nodeIt->second) {
+        ILOG_WARN("showMessages: no node panel for 0x%08x, refusing to open a chat", (unsigned)nodeNum);
+        return;
+    }
     lv_obj_add_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
     activeMsgContainer = messages[nodeNum];
     if (!activeMsgContainer) {
@@ -14798,7 +14854,7 @@ void TFTView_320x240::showMessages(uint32_t nodeNum)
     }
     activeMsgContainer->user_data = (void *)nodeNum;
     lv_obj_clear_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *p = nodes[nodeNum];
+    lv_obj_t *p = nodeIt->second;
     if (p) {
         lv_label_set_text(objects.top_messages_node_label, lv_label_get_text(p->LV_OBJ_IDX(node_lbl_idx)));
         ui_set_active(objects.messages_button, objects.messages_panel, objects.top_messages_panel);
@@ -15202,8 +15258,16 @@ void TFTView_320x240::updateUnreadMessages(void)
         snprintf(top, sizeof(top), unreadMessages == 1 ? "%lu msg" : "%lu msgs", (unsigned long)unreadMessages);
     else
         top[0] = '\0';
-    if (launcher_unread_label)
+    if (launcher_unread_label) {
         lv_label_set_text(launcher_unread_label, top);
+        // The "mesh off" warning sits immediately right of this count, so it has to move when the
+        // count's width changes ("" -> "3 msgs"). align_to is one-shot, so redo it here.
+        if (launcher_mesh_off_label) {
+            lv_obj_update_layout(launcher_unread_label);
+            lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID,
+                            unreadMessages > 0 ? 6 : 0, 0);
+        }
+    }
     if (lockpad_unread_label)
         lv_label_set_text(lockpad_unread_label, top);
 }

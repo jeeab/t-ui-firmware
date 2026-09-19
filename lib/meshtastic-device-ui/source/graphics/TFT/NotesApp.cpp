@@ -20,6 +20,7 @@
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
 #include "graphics/common/SdCard.h" // SdFat instance (SDFs) shared with maps/files
 #define NOTES_HAVE_SD 1
+#include <esp_heap_caps.h> // the note scratch buffer lives in PSRAM, not internal RAM
 #else
 #define NOTES_HAVE_SD 0
 #endif
@@ -35,8 +36,11 @@ const size_t kMaxNoteBytes = 4000;
 lv_obj_t *listScreen = nullptr;
 lv_obj_t *listPanel = nullptr; // scrollable column of note rows
 lv_obj_t *editScreen = nullptr;
-lv_obj_t *editArea = nullptr; // the textarea
-lv_obj_t *editHint = nullptr; // top-middle label ("type away" / "view only")
+lv_obj_t *editArea = nullptr;  // the textarea (body)
+lv_obj_t *titleArea = nullptr; // one-line editable title, top-middle (was a "type away" hint)
+lv_obj_t *editHint = nullptr;  // replaces the title box for view-only files
+lv_obj_t *confirmPanel = nullptr; // "Delete this note?" overlay
+lv_obj_t *focusTarget = nullptr;  // which box the keyboard is aimed at (title or body)
 lv_obj_t *deleteBtn = nullptr;
 lv_obj_t *prevScreen = nullptr;
 lv_timer_t *focusGuard = nullptr;
@@ -72,13 +76,19 @@ void scanNotes(void)
             if (n < 0)
                 n = 0;
             head[n] = 0;
+            // First line = the note's title. If it was left blank, fall through to the first
+            // line of the body so the row still says something useful.
+            char *line = head;
             for (char *c = head; *c; c++)
                 if (*c == '\r' || *c == '\n') {
+                    bool blank = (c == line);
                     *c = 0;
-                    break;
+                    if (!blank)
+                        break;
+                    line = c + 1; // skip the empty title and try the next line
                 }
             noteIds[noteCount] = id;
-            snprintf(notePreview[noteCount], sizeof(notePreview[0]), "%s", head[0] ? head : "(empty note)");
+            snprintf(notePreview[noteCount], sizeof(notePreview[0]), "%s", line[0] ? line : "(empty note)");
             noteCount++;
         }
         entry.close();
@@ -107,10 +117,14 @@ unsigned nextFreeId(void)
     return maxId + 1;
 }
 
-// pull curPath into the textarea; flags read-only if the file didn't fit whole
-void loadCurPathIntoEditor(void)
+// Scratch space for reading a note off the card. ONE buffer, shared by both loaders, and out
+// in PSRAM: at 4KB apiece these are far too big for internal RAM, which on this device has been
+// measured down to under 2KB free. Freed the moment the read is done.
+char *readNote(void)
 {
-    static char buf[kMaxNoteBytes + 1];
+    char *buf = (char *)heap_caps_malloc(kMaxNoteBytes + 1, MALLOC_CAP_SPIRAM);
+    if (!buf)
+        return nullptr;
     buf[0] = 0;
     curReadOnly = false;
     FsFile f = SDFs.open(curPath, O_RDONLY);
@@ -122,7 +136,40 @@ void loadCurPathIntoEditor(void)
         buf[n] = 0;
         f.close();
     }
-    lv_textarea_set_text(editArea, buf);
+    return buf;
+}
+
+// pull curPath into the title + body boxes
+void loadCurPathIntoEditor(void)
+{
+    char *buf = readNote();
+    if (!buf) {
+        lv_textarea_set_text(titleArea, "");
+        lv_textarea_set_text(editArea, "");
+        return;
+    }
+    // The first line IS the title — it always was, in the sense that the list preview shows it.
+    // Now it gets its own box at the top instead of sitting invisibly at the start of the body.
+    char *nl = strchr(buf, '\n');
+    if (nl) {
+        *nl = 0;
+        lv_textarea_set_text(titleArea, buf);
+        lv_textarea_set_text(editArea, nl + 1);
+    } else {
+        lv_textarea_set_text(titleArea, buf);
+        lv_textarea_set_text(editArea, "");
+    }
+    heap_caps_free(buf);
+}
+
+// Files app: the whole file goes in the body. Splitting a first line off an arbitrary .txt
+// would silently move a line of somebody's file into a title box it can't even see.
+void loadFileIntoEditor(void)
+{
+    char *buf = readNote();
+    lv_textarea_set_text(editArea, buf ? buf : "");
+    if (buf)
+        heap_caps_free(buf);
 }
 
 void saveCurrentNote(void)
@@ -130,14 +177,28 @@ void saveCurrentNote(void)
     if (curReadOnly)
         return; // never write a truncated copy over the original
     const char *text = lv_textarea_get_text(editArea);
-    if (curIsNew && (!text || !*text))
+    const char *title = titleArea ? lv_textarea_get_text(titleArea) : "";
+    if (!text)
+        text = "";
+    if (!title)
+        title = "";
+    if (curIsNew && !*text && !*title)
         return; // never-typed-in new note: don't create a file
     if (!curFromFiles)
         SDFs.mkdir("/notes");
     FsFile f = SDFs.open(curPath, O_WRONLY | O_CREAT | O_TRUNC);
     if (!f)
         return;
-    f.print(text ? text : "");
+    if (curFromFiles) { // not a note: write back exactly what is in the body, nothing prepended
+        f.print(text);
+        f.close();
+        return;
+    }
+    // Title goes back as the first line, which is exactly where it came from — so the file
+    // stays a plain .txt anyone can read, and the list preview keeps working unchanged.
+    f.print(title);
+    f.print("\n");
+    f.print(text);
     f.close();
 }
 
@@ -149,7 +210,13 @@ void deleteCurrentNote(void)
 #else
 void scanNotes(void) { noteCount = 0; }
 unsigned nextFreeId(void) { return 1; }
-void loadCurPathIntoEditor(void) { lv_textarea_set_text(editArea, ""); }
+void loadCurPathIntoEditor(void)
+{
+    lv_textarea_set_text(editArea, "");
+    if (titleArea)
+        lv_textarea_set_text(titleArea, "");
+}
+void loadFileIntoEditor(void) { lv_textarea_set_text(editArea, ""); }
 void saveCurrentNote(void) {}
 void deleteCurrentNote(void) {}
 #endif
@@ -171,6 +238,44 @@ lv_obj_t *barBtn(lv_obj_t *parent, const char *txt, int w, lv_align_t align, int
 
 void rebuildList(void);
 void openEditor(unsigned id, bool isNew);
+
+// "Delete this note?" — a child of editScreen, hidden until Delete is tapped. A child rather
+// than lv_layer_top on purpose: the layer is shared with the mesh pop-ups, and the launcher's
+// "am I typing?" test has been caught out by it before.
+void buildConfirmPanel(void)
+{
+    confirmPanel = lv_obj_create(editScreen);
+    lv_obj_set_size(confirmPanel, 250, 104);
+    lv_obj_center(confirmPanel);
+    lv_obj_set_style_bg_color(confirmPanel, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+    lv_obj_set_style_border_color(confirmPanel, lv_color_hex(0x636366), LV_PART_MAIN);
+    lv_obj_set_style_border_width(confirmPanel, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(confirmPanel, 12, LV_PART_MAIN);
+    lv_obj_clear_flag(confirmPanel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(confirmPanel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *q = lv_label_create(confirmPanel);
+    lv_label_set_text(q, "Delete this note?");
+    lv_obj_set_style_text_color(q, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(q, LV_ALIGN_TOP_MID, 0, 2);
+
+    lv_obj_t *sub = lv_label_create(confirmPanel);
+    lv_label_set_text(sub, "This cannot be undone.");
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *cancel = barBtn(confirmPanel, "Cancel", 92, LV_ALIGN_BOTTOM_LEFT, 0, 0x48484a,
+                              [](lv_event_t *) { lv_obj_add_flag(confirmPanel, LV_OBJ_FLAG_HIDDEN); });
+    lv_obj_t *del = barBtn(confirmPanel, "Delete", 92, LV_ALIGN_BOTTOM_RIGHT, 0, 0xff453a, [](lv_event_t *) {
+        lv_obj_add_flag(confirmPanel, LV_OBJ_FLAG_HIDDEN);
+        deleteCurrentNote();
+        rebuildList();
+        lv_screen_load_anim(listScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    });
+    // barBtn aligns with a +4 y-offset meant for a top bar; pull both back onto the panel floor.
+    lv_obj_set_y(cancel, -6);
+    lv_obj_set_y(del, -6);
+}
 
 void buildListScreen(void)
 {
@@ -257,17 +362,43 @@ void buildEditScreen(void)
         lv_screen_load_anim(listScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
     });
 
+    // The note's TITLE, editable, where the grey "type away" hint used to be. It is the first
+    // line of the file, so nothing about the on-card format changes and the list preview still
+    // shows exactly what this box shows.
+    titleArea = lv_textarea_create(editScreen);
+    lv_textarea_set_one_line(titleArea, true);
+    lv_obj_set_size(titleArea, 178, 26);
+    lv_obj_align(titleArea, LV_ALIGN_TOP_MID, 0, 3);
+    lv_obj_set_style_bg_color(titleArea, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_text_color(titleArea, lv_color_hex(0xffd60a), LV_PART_MAIN);
+    lv_obj_set_style_border_width(titleArea, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(titleArea, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(titleArea, 3, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(titleArea, lv_color_hex(0xffffff), LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(titleArea, LV_OPA_50, LV_PART_CURSOR);
+    lv_obj_set_style_anim_duration(titleArea, 0, LV_PART_CURSOR);
+    lv_textarea_set_max_length(titleArea, 40);
+    lv_textarea_set_placeholder_text(titleArea, "Title");
+    if (lv_group_get_default())
+        lv_group_add_obj(lv_group_get_default(), titleArea);
+    // Tapping a box aims the keyboard at it. Without this the focus guard below would drag
+    // focus straight back to the body and the title could never be typed into.
+    lv_obj_add_event_cb(
+        titleArea, [](lv_event_t *) { focusTarget = titleArea; }, LV_EVENT_CLICKED, NULL);
+
+    // Kept for view-only files, which have no editable title (see notes_open_file).
     editHint = lv_label_create(editScreen);
-    lv_label_set_text(editHint, "type away");
+    lv_label_set_text(editHint, "");
     lv_obj_set_style_text_color(editHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     lv_obj_align(editHint, LV_ALIGN_TOP_MID, 0, 9);
+    lv_obj_add_flag(editHint, LV_OBJ_FLAG_HIDDEN);
 
-    // only shown for notes opened from the list; Files has its own Trash button
-    deleteBtn = barBtn(editScreen, "Delete", 64, LV_ALIGN_TOP_RIGHT, -4, 0xff453a, [](lv_event_t *) {
-        deleteCurrentNote();
-        rebuildList();
-        lv_screen_load_anim(listScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
-    });
+    // only shown for notes opened from the list; Files has its own Trash button.
+    // Deleting is permanent, so it asks first (Jake, 2026-09-18).
+    deleteBtn = barBtn(editScreen, "Delete", 64, LV_ALIGN_TOP_RIGHT, -4, 0xff453a,
+                       [](lv_event_t *) { lv_obj_clear_flag(confirmPanel, LV_OBJ_FLAG_HIDDEN); });
+
+    buildConfirmPanel();
 
     editArea = lv_textarea_create(editScreen);
     lv_obj_set_pos(editArea, 0, 32);
@@ -288,13 +419,16 @@ void buildEditScreen(void)
     lv_textarea_set_placeholder_text(editArea, "Start typing on the keyboard...");
     if (lv_group_get_default())
         lv_group_add_obj(lv_group_get_default(), editArea);
+    lv_obj_add_event_cb(
+        editArea, [](lv_event_t *) { focusTarget = editArea; }, LV_EVENT_CLICKED, NULL);
 
     // keep the physical keyboard aimed at the textarea while the editor is up
     focusGuard = lv_timer_create(
         [](lv_timer_t *) {
             lv_group_t *g = lv_group_get_default();
-            if (g && lv_group_get_focused(g) != editArea)
-                lv_group_focus_obj(editArea);
+            lv_obj_t *want = focusTarget ? focusTarget : editArea;
+            if (g && lv_group_get_focused(g) != want)
+                lv_group_focus_obj(want);
         },
         300, NULL);
     lv_timer_pause(focusGuard);
@@ -304,7 +438,7 @@ void buildEditScreen(void)
         [](lv_event_t *) {
             lv_timer_resume(focusGuard);
             if (lv_group_get_default())
-                lv_group_focus_obj(editArea);
+                lv_group_focus_obj(focusTarget ? focusTarget : editArea);
         },
         LV_EVENT_SCREEN_LOADED, NULL);
     lv_obj_add_event_cb(
@@ -321,11 +455,18 @@ void openEditor(unsigned id, bool isNew)
     curReadOnly = false;
     notePath(curPath, sizeof(curPath), id);
     lv_obj_clear_flag(deleteBtn, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(editHint, "type away");
-    if (isNew)
+    lv_obj_add_flag(editHint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(titleArea, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(confirmPanel, LV_OBJ_FLAG_HIDDEN);
+    // A new note starts with the cursor in the title; an existing one in the body, where you are
+    // far more likely to be adding to it.
+    focusTarget = isNew ? titleArea : editArea;
+    if (isNew) {
+        lv_textarea_set_text(titleArea, "");
         lv_textarea_set_text(editArea, "");
-    else
+    } else {
         loadCurPathIntoEditor();
+    }
     lv_screen_load_anim(editScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }
 } // namespace
@@ -356,7 +497,13 @@ extern "C" void notes_open_file(const char *path)
     curFromFiles = true;
     filesReturnScreen = lv_screen_active();
     lv_obj_add_flag(deleteBtn, LV_OBJ_FLAG_HIDDEN);
-    loadCurPathIntoEditor();
+    lv_obj_add_flag(confirmPanel, LV_OBJ_FLAG_HIDDEN);
+    // A file from the Files app is not a note: its first line is just its first line, so hide the
+    // title box and load the whole thing into the body, exactly as before.
+    lv_obj_add_flag(titleArea, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(editHint, LV_OBJ_FLAG_HIDDEN);
+    focusTarget = editArea;
+    loadFileIntoEditor();
     lv_label_set_text(editHint, curReadOnly ? "view only (big file)" : "type away");
     lv_screen_load_anim(editScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 #else

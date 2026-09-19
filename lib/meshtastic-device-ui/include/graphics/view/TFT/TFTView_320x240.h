@@ -581,7 +581,8 @@ class TFTView_320x240 : public MeshtasticView
     // top-bar battery % (fed by updateMetrics for the own node) + paged 2x3 app grid
     lv_obj_t *launcher_battery_label = nullptr;
     lv_obj_t *launcher_mem_label = nullptr;  // diagnostic: free RAM + lowest-since-boot
-    lv_obj_t *launcher_unread_label = nullptr; // top-bar unread-message count, next to "mesh"
+    lv_obj_t *launcher_unread_label = nullptr;   // top-bar unread-message count (top-left)
+    lv_obj_t *launcher_mesh_off_label = nullptr; // "mesh off" warning; blank while the radio is on
     lv_obj_t *launcher_pager = nullptr;      // horizontal snap-scroll container of app pages
     lv_obj_t *launcher_dots = nullptr;       // page indicator dots (only if >1 page)
     int launcherBatPct = -1;                 // last known battery %, -1 = unknown yet
