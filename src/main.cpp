@@ -1294,6 +1294,7 @@ extern "C" void tdeck_nodes_dump(void); // one-shot diagnostic, 45 s after boot
 // T-Deck launcher Sound toggle: apply a pending buzzer_mode change + persist it from this
 // (main) thread. Defined in src/TDeckBeep.cpp.
 extern "C" void tdeck_sound_service(void);
+extern "C" void tdeck_pop_service(void); // TDeckPop.cpp - starts the new-message pop off-thread
 // T-Deck launcher 12/24-hour switch: apply + persist a pending clock-format change from this
 // (main) thread, for the same reason as the others. Defined in src/TDeckClockFormat.cpp.
 extern "C" void tdeck_clock_service(void);
@@ -1389,6 +1390,7 @@ void loop()
     tdeck_nodes_service();
     tdeck_nodes_dump();
     tdeck_sound_service();
+    tdeck_pop_service();
     tdeck_clock_service();
     tdeck_net_service();
 #ifdef NETDOOR_SELFTEST

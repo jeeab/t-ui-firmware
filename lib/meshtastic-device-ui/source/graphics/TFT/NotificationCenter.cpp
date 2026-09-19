@@ -53,6 +53,7 @@ extern "C" bool notif_peek(int i, char *who, size_t whoN, char *text, size_t tex
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
 extern "C" void tui_open_channel_chat(uint8_t ch);
 extern "C" bool tdeck_lockscreen_active(void);
+extern "C" void tdeck_pop_request(void); // TDeckPop.cpp - the pop. Safe from any task.
 
 namespace
 {
@@ -369,6 +370,11 @@ extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char 
     n.when = lv_tick_get();
     snprintf(n.who, sizeof(n.who), "%s", who ? who : "");
     snprintf(n.text, sizeof(n.text), "%s", text ? text : "");
+
+    // The sound plays wherever you are, locked or not - being locked is exactly when
+    // you most need telling. Only a request; the main loop starts it, so the mesh task
+    // never waits on the speaker.
+    tdeck_pop_request();
 
     // A lock screen shows this store itself, and floating a card over the PIN pad would
     // both cover the keys and leak the message to whoever picked the device up.

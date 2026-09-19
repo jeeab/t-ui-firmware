@@ -591,12 +591,17 @@ class TFTView_320x240 : public MeshtasticView
 
     // ---- trackball double-click gesture: Home / lock / wake+unlock ----
     // From an app -> Home. On Home -> lock (black + PIN). Asleep -> wake. Locked -> PIN pad.
-    enum TDeckLockState { LOCK_NONE, LOCK_DARK, LOCK_ENTRY };
+    // GLANCE sits between DARK and ENTRY: lit, showing what came in, but still locked.
+    enum TDeckLockState { LOCK_NONE, LOCK_DARK, LOCK_GLANCE, LOCK_ENTRY };
     TDeckLockState lockState = LOCK_NONE;
     void handleHomeGesture(void);            // runs on every trackball double-click
     void handleBackGesture(void);            // runs on the "erase" key when nothing is being typed
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
+    void showLockGlance(void);               // the iPod-style glance: clock, who messaged, slide to unlock
+    void updateLockGraceLabel(void);         // "Ask for PIN" button text, from the stored seconds
+    void refreshLockGlance(void);            // re-draw the glance's clock and notification list
+    void lockGlanceUnlocked(void);           // slide completed: PIN pad, or straight in
     void startCalibrationFromLock(void);     // Alt+C from the pad: run touch calibration, then re-lock
     void submitLockPad(void);                // OK pressed on the pad
     void updateLockDisplay(void);            // refresh the masked digits label
@@ -606,6 +611,15 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *lock_digits_label = nullptr;
     lv_obj_t *lock_title_label = nullptr;
     lv_obj_t *lockpad_unread_label = nullptr; // top-left unread count, mirrors the launcher's
+    lv_obj_t *lock_grace_btn = nullptr;       // Settings: "Ask for PIN" cycling button
+    lv_obj_t *lock_grace_label = nullptr;
+    lv_obj_t *lockglance_screen = nullptr;    // shown on wake, before the PIN pad
+    lv_obj_t *glance_clock_label = nullptr;
+    lv_obj_t *glance_date_label = nullptr;
+    lv_obj_t *glance_list = nullptr;          // the notification rows
+    lv_obj_t *glance_slider = nullptr;        // slide to unlock
+    lv_obj_t *glance_slide_label = nullptr;   // "slide to unlock", hidden while dragging
+    uint32_t lockedAtMs = 0;                  // when the device was locked, for the PIN grace period
     char lockDigits[9] = {};                 // digits typed on the pad (max 8)
     uint8_t lockLen = 0;
     bool lockSetMode = false;                // true = pad is choosing a NEW pin

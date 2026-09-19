@@ -9,6 +9,7 @@
 #ifdef HAS_I2S
 #include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorRTTTL.h>
+#include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
 #include <ESP8266SAM.h>
 
@@ -67,6 +68,29 @@ class AudioThread : public concurrency::OSThread
             audioOut->SetGain(g);
     }
 
+    // Fire-and-forget WAV from flash, for the new-message pop (src/pop_wav.h).
+    //
+    // Deliberately NOT like beginRttl + the caller spinning on isPlaying(): that blocks
+    // whoever called it, and the one thread that must never block here is the radio.
+    // Stalls of RadioIf waiting on a lock are exactly what has been rebooting this
+    // device. So this only STARTS playback; runOnce() below pumps it to the end and
+    // tidies up, and nobody waits.
+    void beginWav(const void *data, uint32_t len)
+    {
+        if (i2sWav != nullptr) // a pop already sounding: let it finish rather than stutter
+            return;
+#ifdef T_LORA_PAGER
+        io.digitalWrite(EXPANDS_AMP_EN, HIGH);
+#endif
+        setCPUFast(true);
+        wavFile = std::unique_ptr<AudioFileSourcePROGMEM>(new AudioFileSourcePROGMEM(data, len));
+        i2sWav = std::unique_ptr<AudioGeneratorWAV>(new AudioGeneratorWAV());
+        if (!i2sWav->begin(wavFile.get(), audioOut.get()))
+            endWav();
+    }
+
+    bool wavPlaying() const { return i2sWav != nullptr; }
+
     void readAloud(const char *text)
     {
         if (i2sRtttl != nullptr) {
@@ -93,6 +117,18 @@ class AudioThread : public concurrency::OSThread
         // if (i2sRtttl != nullptr && i2sRtttl->isRunning()) {
         //     i2sRtttl->loop();
         // }
+
+        // Pump a pop that beginWav() started. The I2S buffer needs feeding far more
+        // often than every 100 ms or the sound breaks up, so while one is playing this
+        // thread asks to be run again almost immediately, and only then goes back to
+        // idling. canSleep stays false meanwhile so the board does not doze mid-pop.
+        if (i2sWav != nullptr) {
+            if (i2sWav->isRunning() && i2sWav->loop()) {
+                canSleep = false;
+                return 2;
+            }
+            endWav();
+        }
         return AUDIO_THREAD_INTERVAL_MS;
     }
 
@@ -104,7 +140,22 @@ class AudioThread : public concurrency::OSThread
         audioOut->SetGain(0.2);
     };
 
+    void endWav()
+    {
+        if (i2sWav != nullptr) {
+            i2sWav->stop();
+            i2sWav = nullptr;
+        }
+        wavFile = nullptr;
+        setCPUFast(false);
+#ifdef T_LORA_PAGER
+        io.digitalWrite(EXPANDS_AMP_EN, LOW);
+#endif
+    }
+
     std::unique_ptr<AudioGeneratorRTTTL> i2sRtttl = nullptr;
+    std::unique_ptr<AudioGeneratorWAV> i2sWav = nullptr;
+    std::unique_ptr<AudioFileSourcePROGMEM> wavFile = nullptr;
     std::unique_ptr<AudioOutputI2S> audioOut = nullptr;
 
     std::unique_ptr<AudioFileSourcePROGMEM> rtttlFile = nullptr;
