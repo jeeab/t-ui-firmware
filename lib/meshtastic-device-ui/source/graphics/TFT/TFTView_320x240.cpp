@@ -8318,6 +8318,14 @@ void TFTView_320x240::startScreenshotCountdown(void)
                 }
                 lv_timer_pause(t);
                 tdeck_shot_begin();
+                // LVGL only flushes what changed. On a screen that is just sitting there
+                // nothing changes, so without this the capture would wait for a redraw that
+                // never comes and quietly wedge. Invalidating the active screen forces a
+                // full frame - which is also the only way to get a COMPLETE picture rather
+                // than whichever corner happened to be dirty.
+                if (lv_screen_active())
+                    lv_obj_invalidate(lv_screen_active());
+                lv_obj_invalidate(lv_layer_top());
                 // The frame is captured by the flush callback and written on the main loop, so
                 // the answer is not ready yet. Look again shortly and report what happened.
                 lv_timer_create(

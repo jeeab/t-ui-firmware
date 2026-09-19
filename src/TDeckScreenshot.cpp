@@ -23,6 +23,7 @@
 // but every computer and phone opens it with no thought, which is the whole point.
 // -----------------------------------------------------------------------------
 #include "configuration.h"
+#include <Arduino.h> // millis()
 #include <cstdio>
 #include <cstring>
 
@@ -40,6 +41,7 @@ static const int kShotH = 240;
 
 static uint16_t *s_buf = nullptr;      // kShotW * kShotH RGB565, PSRAM
 static volatile bool s_capturing = false;
+static uint32_t s_armedAtMs = 0; // for the watchdog below
 static volatile bool s_ready = false;  // buffer full, waiting to be written
 static volatile bool s_failed = false; // could not allocate, or could not write
 static char s_lastPath[32] = {0};
@@ -76,6 +78,7 @@ extern "C" void tdeck_shot_begin(void)
     }
     memset(s_buf, 0, (size_t)kShotW * kShotH * 2);
     s_failed = false;
+    s_armedAtMs = millis();
     s_capturing = true;
 #endif
 }
@@ -185,6 +188,14 @@ static bool writeBmp(const char *path)
 extern "C" void tdeck_shot_service(void)
 {
 #if SHOT_HAVE_SD
+    // Watchdog. The capture completes when a whole frame has been flushed past; if for any
+    // reason one never is, s_capturing would stay set and every later screenshot would be
+    // refused by the guard in tdeck_shot_begin(). Two seconds is many frames.
+    if (s_capturing && (millis() - s_armedAtMs) > 2000) {
+        s_capturing = false;
+        s_failed = true;
+        return;
+    }
     if (!s_ready)
         return;
     s_ready = false;
