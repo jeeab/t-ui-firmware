@@ -349,12 +349,22 @@ void rebuild(void)
 
 // ---------------------------------------------------------------- public doors
 
-// ⚠️ CALLED FROM THE MESH TASK, NOT THE UI TASK. ViewController::runOnce -> packetReceived ->
-// newMessage runs on the radio side; a decoded backtrace proved exactly that when the trackball
-// work reordered an LVGL list from here and crashed 44 seconds after every boot. So this function
-// only ever TOUCHES objects that already exist (flags, label text) and hands anything that would
-// CREATE or DESTROY one to lv_async_call, which runs it on the UI task. notif_init() builds the
-// pop-up ahead of time for the same reason.
+// ⚠️ WHICH TASK THIS RUNS ON, because it is easy to get wrong and I did at first.
+//
+// It is the "tft" task - the SAME one that runs LVGL. tftSetup.cpp creates exactly one:
+//     while (true) { spiLock->lock(); deviceScreen->task_handler(); spiLock->unlock(); ... }
+// and MeshtasticView::task_handler() calls DeviceGUI::task_handler() (lv_timer_handler) and
+// then controller->runOnce() (which drains the packet queue -> packetReceived -> newMessage)
+// one after the other. The radio task only hands packets to a queue; it never calls in here.
+//
+// So calling LVGL from this function is safe. Two other things are NOT:
+//
+//  1. THE SPI LOCK IS HELD for the whole of task_handler(). Anything slow here - playing a
+//     sound to completion, writing to the SD card - holds the bus the radio needs, and that
+//     is the documented cause of the RadioIf stalls that reboot this device. Hence
+//     tdeck_pop_request(), which only sets a flag for the main loop.
+//  2. DESTROYING A WIDGET INSIDE ITS OWN EVENT HANDLER still hangs LVGL, task or no task.
+//     That is why the rebuilds below go through lv_async_call.
 extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char *who, const char *text)
 {
     if (!ensureStore())
@@ -372,9 +382,9 @@ extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char 
     snprintf(n.who, sizeof(n.who), "%s", who ? who : "");
     snprintf(n.text, sizeof(n.text), "%s", text ? text : "");
 
-    // The sound plays wherever you are, locked or not - being locked is exactly when
-    // you most need telling. Only a request; the main loop starts it, so the mesh task
-    // never waits on the speaker.
+    // The sound plays wherever you are, locked or not - being locked is exactly when you
+    // most need telling. Only a REQUEST: the main loop starts it. Playing it here would hold
+    // the SPI lock (see above) for the length of the sound, with the radio waiting.
     tdeck_pop_request();
 
     // A lock screen shows this store itself, and floating a card over the PIN pad would
@@ -382,11 +392,14 @@ extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char 
     if (!tdeck_lockscreen_active())
         showPopup(n);
 
-    // Rebuilding the page means deleting and creating rows: UI task only.
+    // Rebuilding the page deletes and recreates rows. Deferred not for thread reasons but
+    // because notif_clear() shares this path with onRowTap(), which is a row's own handler.
     if (screen && lv_screen_active() == screen)
         lv_async_call([](void *) { if (screen && lv_screen_active() == screen) rebuild(); }, nullptr);
 }
 
+// Called from createLauncher(). Builds the pop-up up front so that the first notification
+// does not have to, which keeps notif_add() short - see the note on the SPI lock above.
 extern "C" void notif_init(void)
 {
     ensureStore();
@@ -410,9 +423,9 @@ extern "C" void notif_clear(void)
     //      would destroy the row whose click handler is running. LVGL then walks freed
     //      memory and HANGS rather than panicking; that exact mistake once cost 250 nodes
     //      and every favourite, because the freeze landed mid-way through a flash write.
-    //   2. the "messages have been read" call sites run on the MESH task, and creating or
-    //      destroying widgets off the UI task is what crashed the trackball work.
-    // lv_async_call answers both: it runs on the UI task, after this handler has returned.
+    //   2. it is also called straight from message handling, mid-refresh, with the SPI lock
+    //      held - the wrong moment to be tearing a list down and rebuilding it.
+    // lv_async_call answers both: it runs after the current handler has returned.
     if (screen && lv_screen_active() == screen)
         lv_async_call([](void *) { if (screen && lv_screen_active() == screen) rebuild(); }, nullptr);
 }

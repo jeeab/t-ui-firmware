@@ -5,16 +5,21 @@
 // The sound itself is synthesised, not Facebook's file; see tools/make_pop.py.
 //
 // THREADING, which is the whole reason this is a file and not two lines:
-// a message arrives on the MESH task, and that task must never block. Stalls of
-// RadioIf waiting on a lock are what have been rebooting this device - the on-device
-// diagnostics recorded ten of them at about 24 seconds each. The existing tone path
-// (buzz.cpp playTonesRTTTL) spins on `while (audioThread->isPlaying()) delay(10)`,
-// so calling it from there would be actively harmful.
+//
+// A new message is handled on the "tft" task, and tftSetup.cpp holds the SPI LOCK across the
+// whole of that task's work: lock -> deviceScreen->task_handler() -> unlock. The display, the
+// SD card and the LoRa radio share one SPI bus, so anything slow done under that lock is time
+// the radio spends waiting. The device's own diagnostics recorded ten stalls of about 24
+// seconds each with thread=RadioIf waiting on lock=tft, and those stalls are what reboot it.
+//
+// The existing tone path (buzz.cpp playTonesRTTTL) spins on
+// `while (audioThread->isPlaying()) delay(10)`, so calling it from there would hold the bus
+// for the length of the sound. Actively harmful.
 //
 // So: notif_add() (or anyone else) calls tdeck_pop_request(), which only sets a flag.
-// tdeck_pop_service() runs on the main loop, starts the WAV, and returns immediately;
-// AudioThread::runOnce() pumps it to the end. Nothing waits for the sound.
-// Same deferred-service shape as TDeckBeep / TDeckGpsBridge / TDeckClockFormat.
+// tdeck_pop_service() runs on the MAIN loop - a different task, not holding that lock -
+// starts the WAV and returns immediately; AudioThread::runOnce() pumps it to the end.
+// Nothing waits for the sound. Same deferred-service shape as TDeckBeep / TDeckGpsBridge.
 // -----------------------------------------------------------------------------
 #include "main.h"
 #include "mesh/NodeDB.h" // config.device.buzzer_mode

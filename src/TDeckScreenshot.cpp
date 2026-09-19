@@ -13,10 +13,11 @@
 // EXACTLY what is displayed, overlays and pop-ups included, which a per-screen snapshot
 // would miss.
 //
-// HOW IT WRITES. Not from the flush callback. That runs on the LVGL task mid-refresh,
-// and pushing 230 KB at the SD card from there is the SPI contention problem in its
-// purest form. The callback only fills the buffer and sets a flag; tdeck_shot_service()
-// on the main loop does the writing.
+// HOW IT WRITES. Not from the flush callback. That runs on the "tft" task, mid-refresh,
+// and tftSetup.cpp holds the SPI LOCK across that whole task - so pushing 230 KB at the SD
+// card from there would hold the bus the radio is waiting for, which is the documented
+// reboot cause here. The callback only fills the buffer and sets a flag; tdeck_shot_service()
+// on the MAIN loop, outside that lock, does the writing.
 //
 // Files land in /shots as shot001.bmp upward. 24-bit BMP: bigger than it needs to be,
 // but every computer and phone opens it with no thought, which is the whole point.
@@ -26,6 +27,7 @@
 #include <cstring>
 
 #if HAS_SDCARD && !HAS_SD_MMC && !ARCH_PORTDUINO
+#include "SPILock.h"
 #include "graphics/common/SdCard.h"
 #include <esp_heap_caps.h>
 #define SHOT_HAVE_SD 1
@@ -37,7 +39,6 @@ static const int kShotW = 320;
 static const int kShotH = 240;
 
 static uint16_t *s_buf = nullptr;      // kShotW * kShotH RGB565, PSRAM
-static volatile bool s_arming = false; // waiting for the countdown to finish
 static volatile bool s_capturing = false;
 static volatile bool s_ready = false;  // buffer full, waiting to be written
 static volatile bool s_failed = false; // could not allocate, or could not write
@@ -187,6 +188,19 @@ extern "C" void tdeck_shot_service(void)
     if (!s_ready)
         return;
     s_ready = false;
+
+    // ⚠️ THE SPI LOCK IS NOT OPTIONAL HERE. The display, the SD card and the radio share one
+    // bus, and the "tft" task holds this lock across every refresh. This runs on the MAIN loop,
+    // a different task, so touching the card without the lock means two tasks driving the same
+    // SPI peripheral at once - and SDFs is a single shared SdFat instance with one internal
+    // block cache, so it would corrupt the card's bookkeeping, not merely garble a picture.
+    //
+    // It is held for the WHOLE write rather than released between chunks. That is a hold of
+    // roughly 200ms for 230KB, which is long - but it happens only when somebody deliberately
+    // asked for a screenshot, it is bounded, and it is nothing like the 24-second stalls in the
+    // diagnostics. Releasing it mid-write would let another task use the same shared SdFat
+    // cache underneath an open file handle, which is a worse trade.
+    concurrency::LockGuard g(spiLock);
 
     SDFs.mkdir("/shots");
     char path[32];
