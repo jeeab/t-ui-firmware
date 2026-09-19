@@ -157,6 +157,9 @@ extern "C" void snake_open(void);
 // Notification centre (NotificationCenter.cpp): who messaged you, visible from any app.
 extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char *who, const char *text);
 extern "C" void notif_init(void);
+// EmojiText.cpp: emoji have no glyph in this build and LV_USE_FONT_PLACEHOLDER is 0, so they
+// would draw as NOTHING. Turn them into short readable tags on the way to the screen.
+extern "C" void emoji_to_text(const char *in, char *out, size_t outN);
 extern "C" void notif_open(void);
 extern "C" int notif_count(void);
 extern "C" void notif_clear(void);
@@ -15055,6 +15058,15 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
     ILOG_DEBUG("newMessage: from:0x%08x, to:0x%08x, ch:%d, time:%d", from, to, ch, msgTime);
     int pos = 0;
     char buf[284]; // 237 + 4 + 40 + 2 + 1
+
+    // Emoji first. Nothing in this build has a glyph for them and LV_USE_FONT_PLACEHOLDER is
+    // 0, so "on my way 👍" would render as "on my way " and look like it lost its
+    // ending. emoji_to_text turns each one into a short tag that the font we have can draw.
+    // Display only - what gets SENT is never touched, so a phone at the far end still shows a
+    // real emoji. 238 is what is left of buf after the longest name + timestamp prefix.
+    char shown[238];
+    emoji_to_text(msg, shown, sizeof(shown));
+    msg = shown;
     lv_obj_t *container = nullptr;
     if (to == UINT32_MAX) { // message for group, prepend short name to msg
         if (nodes.find(from) == nodes.end()) {
@@ -15079,7 +15091,8 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
     }
 
     pos += timestamp(&buf[pos], msgTime, !restore);
-    sprintf(&buf[pos], "%s", msg);
+    // snprintf, not sprintf: the buffer is fixed and the tail is attacker-supplied text.
+    snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%s", msg);
 
     // place message into container
     newMessage(from, container, ch, buf);

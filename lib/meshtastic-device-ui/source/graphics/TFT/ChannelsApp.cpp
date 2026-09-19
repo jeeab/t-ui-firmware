@@ -43,6 +43,7 @@ extern "C" uint32_t tdeck_node_age_secs(uint32_t num);
 extern "C" void tui_open_channel_chat(uint8_t ch);
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
 extern "C" bool notif_unread_from(uint32_t nodeNum);
+extern "C" void emoji_to_text(const char *in, char *out, size_t outN);
 
 namespace
 {
@@ -183,8 +184,10 @@ void buildChannelList(void)
         char last[80];
         bool mine = false;
         if (tdeck_dm_last_text(convos[i], last, sizeof(last), &mine)) {
+            char shown[80];
+            emoji_to_text(last, shown, sizeof(shown)); // same reason as the message bubbles
             char line[96];
-            snprintf(line, sizeof(line), "%s%s", mine ? "You: " : "", last);
+            snprintf(line, sizeof(line), "%s%s", mine ? "You: " : "", shown);
             lv_obj_t *l = makeLabel(row, line, unread ? 0x30d158 : 0x8e8e93, LV_ALIGN_BOTTOM_LEFT, 10, -6);
             lv_obj_set_width(l, 240);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
