@@ -88,7 +88,10 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 // measurement. The tft task gets 16KB (TFT_TASK_STACK_SIZE).
                 TaskHandle_t tftT = xTaskGetHandle("tft");
                 TaskHandle_t loopT = xTaskGetHandle("loopTask");
-                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u | stack tft=%u loop=%u | pktq=%u peak=%u cap=%u itemsz=%u",
+                // The freeze watcher (TDeckMemInfo.cpp). Reported so its being alive is a
+                // fact rather than an assumption - a watchdog nobody checks is worse than none.
+                TaskHandle_t swT = xTaskGetHandle("stallwatch");
+                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u | stack tft=%u loop=%u sw=%u | pktq=%u peak=%u cap=%u itemsz=%u",
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
@@ -96,6 +99,7 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
                          tftT ? (unsigned)(uxTaskGetStackHighWaterMark(tftT) * sizeof(StackType_t)) : 0u,
                          loopT ? (unsigned)(uxTaskGetStackHighWaterMark(loopT) * sizeof(StackType_t)) : 0u,
+                         swT ? (unsigned)(uxTaskGetStackHighWaterMark(swT) * sizeof(StackType_t)) : 0u,
                          (unsigned)tdeck_pktq_depth(), (unsigned)tdeck_pktq_peak(), (unsigned)tdeck_pktq_cap(),
                          (unsigned)tdeck_pktq_itemsz());
             } else if (!strncmp(s_line, "shot", 4)) {

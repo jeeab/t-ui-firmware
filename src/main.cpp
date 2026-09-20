@@ -1384,12 +1384,14 @@ extern "C" void tdeck_channel_import_service(void);
 // iterating, the UI task records how long + which OSThread it's stuck in, so the 90s
 // app-watchdog "FROZE (task)" reboots finally say WHERE the loop froze.
 extern "C" void tdeck_loop_heartbeat(void);
+extern "C" void tdeck_stallwatch_start(void); // TDeckMemInfo.cpp - names whichever task freezes
 
 void loop()
 {
     runASAP = false;
 
     tdeck_loop_heartbeat();
+    tdeck_stallwatch_start(); // once; returns immediately after that
     tdeck_mesh_switch_service();
     tdeck_gps_control_service();
     tdeck_nodes_service();

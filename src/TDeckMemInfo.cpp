@@ -75,11 +75,109 @@ static char s_prevStallThread[24] = {0};
 static volatile void *s_loopTask = nullptr; // the main loop's task handle (for eTaskGetState)
 static char s_prevStallLock[40] = {0};      // spiLock holder + loop state at stall time
 
+// The UI task's own heartbeat, so the watcher below can tell WHICH side stopped. Set from
+// tdeck_diag_tick(), which the UI runs once a second.
+static volatile uint32_t s_lastUiMs = 0;
+static volatile void *s_uiTask = nullptr;
+
+
+// Record a stall, from whichever side stopped. NVS only: internal flash has its own
+// controller, so this still works while SD and the radio are wedged on the SPI bus - which is
+// exactly the situation being recorded.
+static void recordStall(const char *who, uint32_t stuckMs)
+{
+    char lockInfo[40];
+    char loopState = '?', uiState = '?';
+    if (s_loopTask) {
+        switch (eTaskGetState((TaskHandle_t)s_loopTask)) {
+        case eRunning: loopState = 'R'; break;   // executing = spinning, not lock-blocked
+        case eReady:   loopState = 'r'; break;
+        case eBlocked: loopState = 'B'; break;   // waiting on a lock or queue
+        case eSuspended: loopState = 'S'; break;
+        default: break;
+        }
+    }
+    if (s_uiTask) {
+        switch (eTaskGetState((TaskHandle_t)s_uiTask)) {
+        case eRunning: uiState = 'R'; break;
+        case eReady:   uiState = 'r'; break;
+        case eBlocked: uiState = 'B'; break;
+        case eSuspended: uiState = 'S'; break;
+        default: break;
+        }
+    }
+    void *ow = spiLock ? (void *)spiLock->owner : nullptr;
+    if (ow) {
+        const uint32_t heldMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - spiLock->lockedAtMs;
+        snprintf(lockInfo, sizeof(lockInfo), "%s %lus loop=%c ui=%c", pcTaskGetName((TaskHandle_t)ow),
+                 (unsigned long)(heldMs / 1000), loopState, uiState);
+    } else {
+        snprintf(lockInfo, sizeof(lockInfo), "free loop=%c ui=%c", loopState, uiState);
+    }
+    Preferences p;
+    if (p.begin("tdeckdiag", false)) {
+        p.putULong("stlms", stuckMs);
+        p.putString("stlth", who);
+        p.putString("stlck", lockInfo);
+        p.end();
+    }
+    LOG_WARN("STALL: %s stuck %lums  spilock=[%s]", who, (unsigned long)stuckMs, lockInfo);
+}
+
+// ⛔ ITS OWN TASK, AND A HIGHER PRIORITY, ON PURPOSE. The previous detector lived on the UI
+// task and could only see the main loop stall. When both wedge on spiLock together - which is
+// what the 26 unexplained "FROZE (task)" entries in /diaglog.txt are - the watcher went down
+// with them and the reboot recorded nothing at all. This one shares nothing with either.
+static void stallWatchTask(void *)
+{
+    uint32_t writtenLoop = 0, writtenUi = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        const uint32_t now = millis();
+        const uint32_t lastLoop = s_lastLoopMs, lastUi = s_lastUiMs;
+
+        if (lastLoop) {
+            const uint32_t stuck = now - lastLoop;
+            if (stuck > 15000 && stuck > writtenLoop + 15000) {
+                writtenLoop = stuck;
+                recordStall("loop", stuck);
+            } else if (stuck < 5000) {
+                writtenLoop = 0; // it recovered
+            }
+        }
+        if (lastUi) {
+            const uint32_t stuck = now - lastUi;
+            if (stuck > 15000 && stuck > writtenUi + 15000) {
+                writtenUi = stuck;
+                // The UI stalling is the case that was invisible before; say so plainly.
+                recordStall("ui(tft)", stuck);
+            } else if (stuck < 5000) {
+                writtenUi = 0;
+            }
+        }
+    }
+}
+
+extern "C" void tdeck_stallwatch_start(void)
+{
+    static bool started = false;
+    if (started)
+        return;
+    started = true;
+    // Priority 5: above the tft task and the main loop (both 1), so it still runs when they
+    // are stuck. 3KB is ample - it calls snprintf and Preferences and nothing else.
+    xTaskCreatePinnedToCore(stallWatchTask, "stallwatch", 3072, nullptr, 5, nullptr, 0);
+    LOG_INFO("stall watch armed");
+}
+
 extern "C" void tdeck_loop_heartbeat(void)
 {
     if (!s_loopTask)
         s_loopTask = (void *)xTaskGetCurrentTaskHandle();
     s_lastLoopMs = millis();
+    // ⚠️ Only the OLD in-UI detector's record is cleared here. The watcher task keeps its own
+    // "already written" state, because a stall it recorded may have been the UI side, which
+    // this heartbeat says nothing about.
     if (s_stallWrittenForMs) { // loop recovered: the stall didn't kill us — clear the record
         s_stallWrittenForMs = 0;
         Preferences p;
@@ -165,6 +263,12 @@ extern "C" void tdeck_diag_boot(void)
 // hammering the flash on every tick.
 extern "C" void tdeck_diag_tick(void)
 {
+    // The UI's heartbeat. Cheap, and it is what lets the watcher name the UI task rather than
+    // just reporting that something somewhere stopped.
+    if (!s_uiTask)
+        s_uiTask = (void *)xTaskGetCurrentTaskHandle();
+    s_lastUiMs = millis();
+
     if (!s_diagInit)
         return;
     uint32_t ps = ESP.getFreePsram();
