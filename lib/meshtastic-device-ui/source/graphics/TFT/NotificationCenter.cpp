@@ -27,6 +27,7 @@
 // -----------------------------------------------------------------------------
 #include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar
 #include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
+#include "graphics/view/TFT/UnreadCounts.h" // unread_clear_all
 #include "lvgl.h"
 #include <cstdio>
 #include <cstring>
@@ -61,6 +62,10 @@ extern "C" bool tdeck_lockscreen_active(void);
 // Is the PIN/swipe still owed? This page can now be opened FROM the lock screen (the
 // "Notifications" button in its top-left corner), so it has to know.
 extern "C" bool tdeck_device_locked(void);
+// "Clear" says it clears everything, so it clears the per-conversation counts too.
+// unread_clear_all has C++ linkage, so it comes in by header rather than being re-declared
+// extern "C" here - which is what the linker objected to.
+extern "C" void tui_unread_recount(void); // push the new total into the top bar
 extern "C" void tdeck_pop_request(void); // TDeckPop.cpp - the pop. Safe from any task.
 
 namespace
@@ -296,8 +301,14 @@ void buildScreen(void)
     lv_obj_set_style_text_color(title, lv_color_hex(0x30d158), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    barBtn(screen, "Clear", 62, LV_ALIGN_TOP_RIGHT, -4, 0x8a2a24,
-           [](lv_event_t *) { notif_clear(); }); // schedules its own rebuild, deferred
+    barBtn(screen, "Clear", 62, LV_ALIGN_TOP_RIGHT, -4, 0x8a2a24, [](lv_event_t *) {
+        // Everything means everything: the list AND every conversation's unread count.
+        // Leaving badges standing after you have explicitly said you are done would be the
+        // same kind of half-truth the single global counter used to tell.
+        unread_clear_all();
+        tui_unread_recount();
+        notif_clear(); // schedules its own rebuild, deferred
+    });
 
     listCont = lv_obj_create(screen);
     lv_obj_remove_style_all(listCont);

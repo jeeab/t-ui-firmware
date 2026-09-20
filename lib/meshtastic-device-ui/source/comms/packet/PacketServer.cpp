@@ -1,29 +1,30 @@
 #include "comms/PacketServer.h"
 #include "util/SharedQueue.h"
+#include "configuration.h" // LOG_INFO
 #include <assert.h>
+#include <esp_heap_caps.h>
 
-// ⛔ THIS NUMBER IS A MEMORY BUDGET, NOT A PACKET COUNT. It was 300.
+// ⛔ THIS QUEUE IS BOUNDED BY FREE MEMORY, NOT BY A PACKET COUNT.
 //
-// Every entry is a whole meshtastic_FromRadio on the heap - measured at 768 bytes, plus the
-// DataPacket wrapper, two allocation headers and a deque node, so call it ~810 bytes each.
-// 300 of those is 240KB on a device whose free INTERNAL heap at boot is about 86KB. The cap
-// could therefore never fire: the heap ran out first, every single time.
+// Every entry is a whole meshtastic_FromRadio on the heap - measured at 768 bytes, ~810 with
+// the wrapper and allocator overhead. Upstream's limit of 300 therefore stood for 240KB on a
+// device with about 86KB of free internal heap: it could never fire, the heap ran out first,
+// and every boot spent its first minute a few hundred bytes from nothing. Traced 2026-09-19:
+//     49s   free=2,004  largest=436   queue 145 deep
+//     50s   Wi-Fi drops, "Reason 204" - the handshake could not allocate
 //
-// What that looked like, traced from a cold boot on 2026-09-19 (@@mem reports pktq/peak now):
-//     39s   free=50,904  largest=31,732   queue 41 deep
-//     49s   free= 2,004  largest=   436   queue 145 deep   <-- 145 x 768 = 111KB asked for
-//     50s   Wi-Fi drops: "Reason 204" (handshake timeout) - it could not allocate
-//     57s   free=71,004  largest=31,732   queue drained to 0, everything recovers
-// The device spent the first minute of every boot one allocation away from a crash, and that
-// is the window Get Apps and Wi-Fi both fail in.
+// ⚠️ A FIXED SMALL COUNT IS NOT THE ANSWER EITHER, AND THE FIRST ATTEMPT AT THIS WAS WRONG.
+// Capping at 32 held the memory fine, but it applied backpressure even with 80KB free - and
+// packets then piled up in Meshtastic's own toPhoneQueue, which does NOT block when it fills.
+// It discards. Measured after that change: 9 "ToPhone queue is full, drop packet" in three
+// minutes. The earlier commit claimed "backpressure, not dropping"; that claim was false.
 //
-// WHY LOWERING IT LOSES NOTHING. PacketAPI::sendPacket() checks available() BEFORE it calls
-// getFromRadio(), so a full queue means the packet is never taken off the radio's own queue -
-// it waits there and arrives a moment later. This is backpressure, not dropping.
-//
-// 32 x ~810 = ~26KB, which leaves the largest free block up around 31KB where the Wi-Fi
-// handshake is happy. Raise it only with a measurement to justify it.
-const uint32_t max_packet_queue_size = 32;
+// The real constraint is memory, so say memory. Below the floor we stop accepting, which is
+// the crash this exists to prevent. Above it we behave as upstream always did, so there is
+// no backpressure and nothing upstream overflows.
+const uint32_t max_packet_queue_size = 300;             // upstream's ceiling, unchanged
+const uint32_t kQueueHeapFloor = 40 * 1024;             // keep this much internal heap free
+const uint32_t kQueueHeapResume = 48 * 1024;            // ...and this much before accepting again
 
 SharedQueue *sharedQueue = nullptr;
 
@@ -65,7 +66,9 @@ Packet::PacketPtr PacketServer::receivePacket(void)
 bool PacketServer::sendPacket(Packet &&p)
 {
     assert(queue);
-    if (queue->serverQueueSize() >= max_packet_queue_size) {
+    // The same test available() applies. It is checked there BEFORE the packet is taken off
+    // the radio's queue, so reaching this is a race rather than the normal path.
+    if (!available()) {
         return false;
     }
     queue->serverSend(std::move(p));
@@ -84,5 +87,19 @@ bool PacketServer::hasData() const
 bool PacketServer::available() const
 {
     assert(queue);
-    return queue->serverQueueSize() < max_packet_queue_size;
+    if (queue->serverQueueSize() >= max_packet_queue_size)
+        return false;
+    // Hysteresis, so we do not sit on the floor flapping open and shut once per packet:
+    // stop at 40KB free, and do not start again until 48KB.
+    static bool holding = false;
+    const uint32_t freeNow = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (holding) {
+        if (freeNow >= kQueueHeapResume)
+            holding = false;
+    } else if (freeNow < kQueueHeapFloor) {
+        holding = true;
+        LOG_INFO("[PacketServer] holding the UI queue at %u deep, %u bytes free",
+                 (unsigned)queue->serverQueueSize(), (unsigned)freeNow);
+    }
+    return !holding;
 }

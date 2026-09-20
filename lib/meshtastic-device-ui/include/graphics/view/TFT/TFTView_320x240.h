@@ -881,6 +881,7 @@ class TFTView_320x240 : public MeshtasticView
     static void tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
     static void tuiOpenChannelChat(uint8_t ch);
     static bool tuiDeviceLocked(void); // is the PIN/swipe still owed?
+    static void tuiUnreadRecount(void); // re-sum the per-conversation counts
     static int tuiBatteryPct(void);        // for the status bar
     static bool tuiBatteryPlugged(void);
     static bool tuiClockText(char *out, int outN);

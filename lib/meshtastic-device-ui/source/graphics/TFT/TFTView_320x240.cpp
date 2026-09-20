@@ -185,6 +185,8 @@ extern "C" void notif_open(void);
 extern "C" int notif_count(void);
 extern "C" void notif_clear(void);
 extern "C" void notif_clear_one(uint32_t from, uint8_t ch, bool isChannel);
+// Redraw the Conversations list if it happens to be the screen you are looking at.
+extern "C" void channels_unread_changed(void);
 extern "C" bool notif_peek(int i, char *who, size_t whoN, char *text, size_t textN, uint32_t *ageSecs);
 // Stopwatch module (StopwatchApp.cpp) — opened from its launcher tile.
 extern "C" void stopwatch_open(void);
@@ -1111,6 +1113,18 @@ bool TFTView_320x240::tuiDeviceLocked(void)
 {
     return instance() && instance()->lockState != LOCK_NONE;
 }
+
+// Recompute the device-wide total from the per-conversation counts and repaint the top bar.
+// Static member, not a free function: unreadMessages and instance() are both private.
+void TFTView_320x240::tuiUnreadRecount(void)
+{
+    if (!instance())
+        return;
+    instance()->unreadMessages = unread_total();
+    instance()->updateUnreadMessages();
+}
+
+extern "C" void tui_unread_recount(void) { TFTView_320x240::tuiUnreadRecount(); }
 
 extern "C" bool tdeck_device_locked(void)
 {
@@ -16301,6 +16315,7 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
             unread_add(to == UINT32_MAX ? unreadKeyForChannel(ch) : from);
             unreadMessages = unread_total();
             updateUnreadMessages();
+            channels_unread_changed(); // if that list is up, its badges just went stale
             // nodes[from] again: operator[] INSERTS a null for a key MUI has purged, and the
             // very next thing here dereferences it. Look it up once, safely, and share it.
             auto fromIt = nodes.find(from);

@@ -31,6 +31,7 @@
 #include <cstdio>
 
 extern "C" void channels_open(void);
+extern "C" void channels_unread_changed(void);
 
 // --- firmware bridge (src/TDeckNodesBridge.cpp) ---
 extern "C" int tdeck_channel_count(void);
@@ -469,6 +470,26 @@ void buildScreen(void)
     lv_obj_add_flag(noteLbl, LV_OBJ_FLAG_HIDDEN);
 }
 } // namespace
+
+// A message arrived (or was read) while this list is on screen. Redraw it, so the counts on
+// the rows are true rather than whatever they were when you walked in.
+//
+// ⚠️ DEFERRED, and only from the top-level list. This is called straight from message
+// handling, mid-refresh, with the SPI lock held - and rebuild() starts by destroying every
+// row. lv_async_call runs it after the current handler has returned, which is the same rule
+// NotificationCenter documents at length. Drilled into a channel's member list, it does
+// nothing: yanking that out from under somebody is worse than a stale count.
+extern "C" void channels_unread_changed(void)
+{
+    if (!screen || lv_screen_active() != screen || viewChannel >= 0)
+        return;
+    lv_async_call(
+        [](void *) {
+            if (screen && lv_screen_active() == screen && viewChannel < 0)
+                rebuild();
+        },
+        nullptr);
+}
 
 extern "C" void channels_open(void)
 {
