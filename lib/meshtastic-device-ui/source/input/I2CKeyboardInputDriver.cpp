@@ -101,30 +101,31 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // Screen dark/locked: a key press WAKES the screen (a far more reliable wake than
             // the stiff trackball double-click) — but it must not type onto the hidden screen,
             // so we record the request and swallow the key below.
+            // The lock screen is being KEPT LIT. That is the pocket case, so a key must not
+            // wake it - only the one chosen key does, and anything else brightens the screen
+            // for three seconds so the time can be read in sunlight. Checked OUTSIDE the
+            // gate, because the lit lock screen deliberately leaves input switched on: it
+            // shows a slider, and the slider has to work.
+            if (tdeck_stayon_active()) {
+                const int uk = tdeck_lock_unlock_key();
+                // ALT+W'S BYTE IS NOT KNOWN YET - these combos come from the keyboard's own
+                // chip (Alt+C is 0x0C) and cannot be derived from the letter. Every key is
+                // logged here so the byte can be read off the cable once and hard-coded.
+                LOG_INFO("stayon key=0x%02x (%u)", (unsigned)data->key, (unsigned)data->key);
+                if (uk == 1 && data->key == ' ')
+                    tdeck_wake_request = true;
+                else
+                    tdeck_stayon_boost_request = true;
+                data->state = LV_INDEV_STATE_RELEASED;
+                data->key = 0;
+                break;
+            }
+            // Screen dark/locked: a key press WAKES it.
             if (tdeck_input_gated) {
-                // The lock screen is being KEPT LIT. That is a pocket, so a key must not wake
-                // it: only the one chosen key does, and everything else just brightens the
-                // screen for three seconds so the time can be read in sunlight.
-                if (tdeck_stayon_active()) {
-                    const int uk = tdeck_lock_unlock_key();
-                    // ⚠️ ALT+W'S BYTE IS NOT KNOWN YET. The keyboard's own chip generates
-                    // these combos (Alt+C is 0x0C) and it cannot be derived from the letter.
-                    // Every key seen here is logged so the byte can be read off the cable the
-                    // first time it is pressed, and then hard-coded. Until then Alt+W is
-                    // offered in Settings but behaves as "some other key", i.e. it brightens.
-                    LOG_INFO("stayon key=0x%02x (%u)", (unsigned)data->key, (unsigned)data->key);
-                    const bool isUnlock = (uk == 1 && data->key == ' ');
-                    if (isUnlock)
-                        tdeck_wake_request = true;
-                    else
-                        tdeck_stayon_boost_request = true;
-                    data->state = LV_INDEV_STATE_RELEASED;
-                    data->key = 0;
-                    break;
-                }
                 tdeck_wake_request = true;
                 break;
             }
+
             // The "erase" key doubles as Back — an alternative to the stiff trackball
             // double-click (requested by a web-installer user). Handled HERE, BEFORE the key is
             // handed to a Lua app or matched against a focused widget, so it works the same in

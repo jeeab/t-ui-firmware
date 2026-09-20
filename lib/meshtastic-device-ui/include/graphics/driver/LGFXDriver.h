@@ -133,10 +133,13 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
                 if (brightness > floor) {
                     lgfx->setBrightness(tdeck_hold_dark ? 0 : brightness - 1);
                 }
-                // Once it has settled - dark, or down at the floor - gate input. At the floor
-                // the keyboard driver decides what a key means: the unlock key gets you in,
-                // anything else just brightens it for a moment.
-                if (tdeck_hold_dark || lgfx->getBrightness() <= floor) {
+                // Gate input only when the screen is genuinely DARK. At a dim floor the lock
+                // screen is visible and says "slide to unlock", so touch and the trackball
+                // must keep working; the keyboard driver handles "no key wakes it" itself by
+                // asking tdeck_stayon_active(). Re-setting the flag here on every pass is
+                // what made clearing it elsewhere useless - it came straight back next tick,
+                // and the visible slider ignored every touch.
+                if (tdeck_hold_dark || (floor == 0 && lgfx->getBrightness() == 0)) {
                     tdeck_input_gated = true;
                     if (floor == 0)
                         tdeck_kbdlight_screen(false); // keys go dark with the screen

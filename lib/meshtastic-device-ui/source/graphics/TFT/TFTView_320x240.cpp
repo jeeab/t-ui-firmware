@@ -9025,7 +9025,13 @@ void TFTView_320x240::lockDevice(void)
         const int pct = tdeck_lock_dim_pct();
         tdeck_dim_floor = (uint8_t)(pct <= 0 ? 1 : (pct * 255) / 100);
         tdeck_hold_dark = false;
-        tdeck_input_gated = true; // still pocket-safe: the keyboard driver decides what a key means
+        // ⛔ NOT GATED, whatever the unlock key is. This screen shows a slider and a caption
+        // saying "slide to unlock", so the slide has to work - a visible control that ignores
+        // you is worse than no control. tdeck_input_gated is not a keyboard gate, it gates
+        // touch and the trackball too, and using it here made the lock screen unusable.
+        // "No key wakes it from a pocket" is the keyboard driver's job, and it does it by
+        // asking tdeck_stayon_active() rather than by having input switched off wholesale.
+        tdeck_input_gated = false;
         return;
     }
     stayOnSinceMs = 0;

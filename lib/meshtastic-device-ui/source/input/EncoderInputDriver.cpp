@@ -350,12 +350,13 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
             btnDownAt = millis();
             longFired = false;
         } else if (btnDown && !longFired && millis() - btnDownAt > 700) {
-            // ⚠️ Only when the cursor is OFF. With it on, a hold has to keep pressing whatever
-            // is being pointed at, or dragging a slider and scrolling a list are impossible.
-            // Double-click becomes Back instead, and repeated Backs still reach Home. The
-            // Settings hint says this out loud, because giving up the always-works gesture is
-            // a real trade and nobody should discover it by surprise.
-            if (!tdeck_trackball_nav_enabled())
+            // ⚠️ The cursor suspends this ONLY while the screen is awake. With the cursor on
+            // a hold has to keep pressing whatever is being pointed at, or dragging a slider
+            // and scrolling a list are impossible - but that reasoning stops dead when the
+            // screen is dark, because there is nothing to point at and this is the gesture
+            // that gets you back in. Dropping the exception while gated is what stops the
+            // device becoming unwakeable; it did, once, and that is why the test is here.
+            if (!tdeck_trackball_nav_enabled() || tdeck_input_gated)
                 tb_home_request = true; // held -> Home / lock / wake
             longFired = true;
         } else if (!btnDown && btnWasDown && !longFired) {
@@ -393,8 +394,12 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
                 // navigation is not actually running.
                 data->key = LV_KEY_ENTER;
                 data->state = LV_INDEV_STATE_PRESSED;
-            } else if (action == TB_ACTION_PRESSED && tdeck_trackball_nav_enabled()) {
-                // Cursor mode. Single click presses what the cursor is over; double click goes
+            } else if (action == TB_ACTION_PRESSED && tdeck_trackball_nav_enabled() &&
+                       !tdeck_input_gated) {
+                // Cursor mode, and only while awake. Asleep, a click belongs to the
+                // double-click-to-wake gesture in the branch below - the cursor is not on
+                // screen and cannot be the thing a click means.
+                // Single click presses what the cursor is over; double click goes
                 // Back. Telling them apart means waiting out the window before acting on a
                 // single one, so it is kept short - 320ms is long enough for a deliberate
                 // double and short enough that a single click still feels immediate.
