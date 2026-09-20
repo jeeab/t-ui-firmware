@@ -6335,6 +6335,16 @@ void TFTView_320x240::openPinsList(void)
     lv_obj_set_size(pins_search_ta, 304, 34);
     lv_obj_align(pins_search_ta, LV_ALIGN_TOP_MID, 0, 40);
     lv_obj_set_style_text_font(pins_search_ta, &ui_font_montserrat_12, LV_PART_MAIN);
+    // Dark, like everything else here. An unstyled lv_textarea is WHITE, which on this screen
+    // looks like a rendering fault rather than a place to type. Seen on the device, not in a
+    // build log.
+    lv_obj_set_style_bg_color(pins_search_ta, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_border_color(pins_search_ta, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_set_style_border_width(pins_search_ta, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(pins_search_ta, 8, LV_PART_MAIN);
+    lv_obj_set_style_text_color(pins_search_ta, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_style_text_color(pins_search_ta, lv_color_hex(0x6a6a70), LV_PART_TEXTAREA_PLACEHOLDER);
+    lv_obj_set_style_bg_color(pins_search_ta, lv_color_hex(0x0a84ff), LV_PART_CURSOR);
     lv_obj_add_event_cb(
         pins_search_ta,
         [](lv_event_t *) {
@@ -11906,6 +11916,15 @@ bool TFTView_320x240::tuiDmLastText(uint32_t nodeNum, char *out, int outN)
     const char *txt = lv_label_get_text(label);
     if (!txt || !*txt)
         return false;
+    // ⚠️ THE LABEL IS "timestamp\nmessage", NOT THE MESSAGE. addMessage() builds one label
+    // holding both (see timestamp(), which ends its format with a newline), so copying the
+    // label verbatim gave every row in the Conversations list a preview reading
+    // "26/09/17 18:51..." - the message itself fell off the end of the ellipsis. Seen on the
+    // device on 2026-09-19; it looks entirely correct in the source. Skip past the newline.
+    // A message with no timestamp (the clock had no fix) has no newline, and is used whole.
+    const char *nl = strchr(txt, '\n');
+    if (nl && nl[1])
+        txt = nl + 1;
     snprintf(out, (size_t)outN, "%s", txt);
     return true;
 }

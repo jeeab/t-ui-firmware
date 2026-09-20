@@ -103,7 +103,10 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 while (*a == ' ')
                     a++;
                 int which = -1;
-                if (!strncmp(a, "lock", 4))          which = 1;  // Settings > Lock screen
+                // ⚠️ "lockpad" BEFORE "lock", or the shorter prefix swallows it - which it
+                // did, and the sweep captured Lock settings twice instead of the keypad.
+                if (!strncmp(a, "lockpad", 7))       which = 12; // the PIN keypad itself
+                else if (!strncmp(a, "lock", 4))     which = 1;  // Settings > Lock screen
                 else if (!strncmp(a, "settings", 8)) which = 2;
                 else if (!strncmp(a, "chats", 5))    which = 3;
                 else if (!strncmp(a, "nodes", 5))    which = 4;
@@ -114,7 +117,6 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 else if (!strncmp(a, "maps", 4))     which = 9;
                 else if (!strncmp(a, "pins", 4))     which = 10; // the pins list, i.e. the search
                 else if (!strncmp(a, "getapps", 7))  which = 11;
-                else if (!strncmp(a, "lockpad", 7))  which = 12; // the PIN keypad itself
                 if (which > 0) {
                     s_x = which;
                     s_cmd = 9;
