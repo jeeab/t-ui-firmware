@@ -9008,6 +9008,55 @@ void TFTView_320x240::remoteService(void)
         tdeck_remote_reply(buf);
         break;
     }
+    case 10: { // dump the tail of /diaglog.txt
+        // PSRAM, and only the tail: the file grows for the life of the card and the whole of
+        // it is neither wanted nor affordable.
+        const int kTail = 2048;
+        char *tail = (char *)heap_caps_malloc(kTail + 1, MALLOC_CAP_SPIRAM);
+        if (!tail) {
+            tdeck_remote_reply("diag no memory");
+            break;
+        }
+        int n = 0;
+        FsFile f = SDFs.open("/diaglog.txt", O_RDONLY);
+        if (f) {
+            const uint32_t sz = f.fileSize();
+            if (sz > (uint32_t)kTail)
+                f.seekSet(sz - kTail);
+            n = f.read((uint8_t *)tail, kTail);
+            f.close();
+        }
+        if (n <= 0) {
+            heap_caps_free(tail);
+            tdeck_remote_reply("diag empty or no card");
+            break;
+        }
+        tail[n] = 0;
+        // Skip the first partial line when we seeked into the middle of one.
+        char *p = tail;
+        if (n == kTail) {
+            char *nl = strchr(tail, '\n');
+            if (nl)
+                p = nl + 1;
+        }
+        int lines = 0;
+        while (*p) {
+            char *nl = strchr(p, '\n');
+            if (nl)
+                *nl = 0;
+            if (*p) {
+                LOG_INFO("@@dg %s", p);
+                lines++;
+            }
+            if (!nl)
+                break;
+            p = nl + 1;
+        }
+        heap_caps_free(tail);
+        snprintf(buf, sizeof(buf), "diagend %d", lines);
+        tdeck_remote_reply(buf);
+        break;
+    }
     case 8: // key
         THIS->remoteInit();
         s_remoteKey = (uint32_t)x;

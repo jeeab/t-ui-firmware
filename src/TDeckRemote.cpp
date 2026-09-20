@@ -133,6 +133,10 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 } else {
                     LOG_INFO("@@err open: lock|settings|chats|nodes|alerts|notes|glance|favorites|maps|pins|getapps|lockpad");
                 }
+            } else if (!strncmp(s_line, "diag", 4)) {
+                // The tail of /diaglog.txt. Read on the UI task, where SDFs lives and the SPI
+                // lock is already held - the same rule as every other card read here.
+                s_cmd = 10;
             } else if (!strncmp(s_line, "home", 4)) {
                 s_cmd = 2;
             } else if (!strncmp(s_line, "back", 4)) {
