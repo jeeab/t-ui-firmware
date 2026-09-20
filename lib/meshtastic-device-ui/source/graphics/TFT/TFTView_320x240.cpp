@@ -2668,7 +2668,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_align(tbLbl, LV_ALIGN_TOP_LEFT, 16, 966);
 
     lv_obj_t *tbSw = lv_switch_create(settings_screen);
-    lv_obj_align(tbSw, LV_ALIGN_TOP_RIGHT, -16, 940);
+    lv_obj_align(tbSw, LV_ALIGN_TOP_RIGHT, -16, 960); // 6px above its label, like every other row
     if (tdeck_trackball_nav_enabled())
         lv_obj_add_state(tbSw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(
@@ -2703,7 +2703,7 @@ void TFTView_320x240::createSettingsScreen(void)
         lv_obj_add_event_cb(
             b,
             [](lv_event_t *) {
-                tdeck_trackball_set_speed((tdeck_trackball_speed() + 1) % 3);
+                tdeck_trackball_set_speed((tdeck_trackball_speed() + 1) % 5);
                 THIS->updateTrackballRows();
             },
             LV_EVENT_CLICKED, NULL);
@@ -2990,8 +2990,10 @@ void TFTView_320x240::updateTrackballRows(void)
     if (settings_tb_speed_label) {
         switch (tdeck_trackball_speed()) {
         case 0:  lv_label_set_text(settings_tb_speed_label, "Slow"); break;
-        case 2:  lv_label_set_text(settings_tb_speed_label, "Fast"); break;
-        default: lv_label_set_text(settings_tb_speed_label, "Normal"); break;
+        case 1:  lv_label_set_text(settings_tb_speed_label, "Normal"); break;
+        case 3:  lv_label_set_text(settings_tb_speed_label, "Faster"); break;
+        case 4:  lv_label_set_text(settings_tb_speed_label, "Max"); break;
+        default: lv_label_set_text(settings_tb_speed_label, "Fast"); break;
         }
     }
     if (settings_tb_style_label)
@@ -2999,14 +3001,19 @@ void TFTView_320x240::updateTrackballRows(void)
     if (settings_tb_hint) {
         // The two rows above are hidden when the cursor is off, and this layout is absolute -
         // so without this the hint sat marooned 80px below the switch with nothing between.
-        lv_obj_align(settings_tb_hint, LV_ALIGN_TOP_LEFT, 16, on ? 1048 : 976);
+        // ⚠️ Must clear the style row, which ends at 1074. This literal was 1048, written
+        // before the section-spacing pass moved these rows down - so every refresh put the
+        // hint straight on top of "Cursor style". That is the overlap Jake saw.
+        lv_obj_align(settings_tb_hint, LV_ALIGN_TOP_LEFT, 16, on ? 1076 : 1006);
+        // The hold gesture is no longer traded away: at 1.5s it cannot be confused with a
+        // click, so it works with the cursor on as well. Both modes read the same.
         lv_label_set_text(settings_tb_hint,
-                          on ? "Roll to move the arrow, click to press what it is on, double-click "
-                               "for Back.\n\nHOLDING the ball no longer goes Home while the cursor "
-                               "is on - a hold has to keep pressing what you are pointing at. Use "
-                               "double-click for Back, or the Home tile."
-                             : "Off: rolling does nothing and everything is chosen by touch. "
-                               "Double-click or hold the ball for Home.");
+                          on ? "Roll to move the arrow, click to press what it is on.\n"
+                               "Hold the ball 1.5s for Back. Double-click for Home, or to lock "
+                               "from Home."
+                             : "Off: rolling does nothing and everything is chosen by touch.\n"
+                               "Hold the ball 1.5s for Back. Double-click for Home, or to lock "
+                               "from Home.");
     }
 }
 
@@ -9459,6 +9466,14 @@ void TFTView_320x240::remoteService(void)
         }
         heap_caps_free(tail);
         snprintf(buf, sizeof(buf), "diagend %d", lines);
+        tdeck_remote_reply(buf);
+        break;
+    }
+    case 11: { // scroll the active screen to an absolute y
+        lv_obj_t *scr = lv_screen_active();
+        if (scr)
+            lv_obj_scroll_to_y(scr, x, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "scroll %d", x);
         tdeck_remote_reply(buf);
         break;
     }

@@ -137,6 +137,17 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 } else {
                     LOG_INFO("@@err open: lock|settings|chats|nodes|alerts|notes|glance|favorites|maps|pins|getapps|lockpad");
                 }
+            } else if (!strncmp(s_line, "scroll", 6)) {
+                // Scroll the active screen to an absolute y. Walking a swipe down a
+                // 1,400-pixel Settings page took dozens of commands and usually landed
+                // somewhere random - which cost more time today than writing this.
+                int y = 0;
+                if (sscanf(s_line + 6, "%d", &y) == 1) {
+                    s_x = y;
+                    s_cmd = 11;
+                } else {
+                    LOG_INFO("@@err scroll needs a y");
+                }
             } else if (!strncmp(s_line, "batt", 4)) {
                 // The tail of /battlog.csv, same path as @@diag.
                 s_x = 1;

@@ -147,11 +147,13 @@ static void tbMove(int dx, int dy)
     const uint32_t gap = now - tbLastStepMs;
     tbLastStepMs = now;
     int step = (gap < 70) ? 16 : (gap < 160 ? 8 : 4);
-    switch (tdeck_trackball_speed()) {
-    case 0: step = (step + 1) / 2; break; // slow
-    case 2: step = step * 2; break;       // fast
-    default: break;                       // normal
-    }
+    // The multiplier, not a tweak: this ball emits very few events per flick, so a step has
+    // to cover real distance. What used to be the top speed is index 1 here.
+    static const int kMul[5] = {1, 2, 4, 8, 14};
+    int sp = tdeck_trackball_speed();
+    if (sp < 0 || sp > 4)
+        sp = 2;
+    step *= kMul[sp];
 
     int nx = tbX + dx * step, ny = tbY + dy * step;
     // ⚠️ Only the part of the roll that CANNOT move the cursor becomes scroll. Sitting at an
@@ -349,15 +351,18 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
         if (btnDown && !btnWasDown) {
             btnDownAt = millis();
             longFired = false;
-        } else if (btnDown && !longFired && millis() - btnDownAt > 700) {
-            // ⚠️ The cursor suspends this ONLY while the screen is awake. With the cursor on
-            // a hold has to keep pressing whatever is being pointed at, or dragging a slider
-            // and scrolling a list are impossible - but that reasoning stops dead when the
-            // screen is dark, because there is nothing to point at and this is the gesture
-            // that gets you back in. Dropping the exception while gated is what stops the
-            // device becoming unwakeable; it did, once, and that is why the test is here.
-            if (!tdeck_trackball_nav_enabled() || tdeck_input_gated)
-                tb_home_request = true; // held -> Home / lock / wake
+        } else if (btnDown && !longFired && millis() - btnDownAt > 1500) {
+            // HOLD = BACK, always, in every mode. Jake: "lets make hold to back work always.
+            // hold should be lets say 1.5 seconds of hold. something a click shouldnt mess
+            // with" - and at 1.5s it cannot be confused with a click, which is what lets it
+            // work with the cursor on as well. Nothing here ever holds a press down on what
+            // the cursor is over (the pointer emits a one-read tap), so there is no conflict.
+            //
+            // The one exception is a dark screen, where Back is useless: there, a hold wakes.
+            if (tdeck_input_gated)
+                tb_home_request = true; // asleep -> wake
+            else
+                tdeck_back_request = true; // awake -> Back
             longFired = true;
         } else if (!btnDown && btnWasDown && !longFired) {
             // A quick click. What it MEANS is decided in the block below: either a select, or
@@ -406,9 +411,11 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
                 tbCursorInit();
                 const uint32_t nowMs = millis();
                 if (lastClickMs && nowMs - lastClickMs < 320) {
-                    tdeck_back_request = true; // double -> Back
+                    // Double-click is Home - and on Home it locks the device, which is the
+                    // gesture Jake noticed had gone missing. Back moved to the hold.
+                    tb_home_request = true;
                     lastClickMs = 0;
-                    tbClickPendingAt = 0;      // and cancel the single that was waiting
+                    tbClickPendingAt = 0; // and cancel the single that was waiting
                 } else {
                     lastClickMs = nowMs;
                     tbClickPendingAt = nowMs;  // a tap, unless a second click arrives

@@ -87,7 +87,10 @@ extern "C" void tdeck_trackball_click_set_enabled(bool en)
 }
 
 // ---- cursor speed -----------------------------------------------------------
-// How far one roll step moves the cursor. 0 = slow, 1 = normal, 2 = fast. Jake asked for it
+// How far one roll step moves the cursor, 0-4. Jake, having used it: "im on fast mode and
+// it could be faster. like 6 times as fast" - this trackball emits very few events per
+// physical flick, so each one has to carry a lot of distance. The old top speed is now about
+// the middle of the range. Jake asked for it
 // in Settings because a trackball in a 3D-printed case rolls very differently from a bare one
 // - his is stiff, somebody else's is loose, and one hard-coded number cannot suit both.
 static int s_tbSpeed = -1;
@@ -97,20 +100,20 @@ extern "C" int tdeck_trackball_speed(void)
     if (s_tbSpeed < 0) {
         Preferences p;
         if (p.begin("tdecktb", true)) {
-            s_tbSpeed = (int)p.getUChar("spd", 1);
+            s_tbSpeed = (int)p.getUChar("spd", 2);
             p.end();
         } else {
-            s_tbSpeed = 1;
+            s_tbSpeed = 2;
         }
-        if (s_tbSpeed < 0 || s_tbSpeed > 2)
-            s_tbSpeed = 1;
+        if (s_tbSpeed < 0 || s_tbSpeed > 4)
+            s_tbSpeed = 2;
     }
     return s_tbSpeed;
 }
 
 extern "C" void tdeck_trackball_set_speed(int v)
 {
-    if (v < 0 || v > 2)
+    if (v < 0 || v > 4)
         return;
     s_tbSpeed = v;
     Preferences p;
