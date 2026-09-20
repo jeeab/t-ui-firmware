@@ -1871,8 +1871,15 @@ void AdminModule::sendWarningAndLog(const char *format, ...)
     sendWarning("%s", buf);
 }
 
+// Set once Bluetooth has actually been torn down. config.bluetooth.enabled is the SETTING;
+// this is the state. They stop agreeing the moment anything brings Wi-Fi up, because the two
+// radios cannot coexist here - and code that needs to know "is a phone able to be listening"
+// wants this one, not the setting. See PacketAPI::runOnce().
+bool bluetoothTornDown = false;
+
 void disableBluetooth()
 {
+    bluetoothTornDown = true;
 #if HAS_BLUETOOTH
 #ifdef ARCH_ESP32
     if (nimbleBluetooth)

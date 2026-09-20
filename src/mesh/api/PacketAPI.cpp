@@ -4,6 +4,7 @@
 #include "MeshService.h"
 #include "PowerFSM.h"
 #include "RadioInterface.h"
+#include "modules/AdminModule.h" // bluetoothTornDown
 #include "modules/NodeInfoModule.h"
 
 PacketAPI *packetAPI = nullptr;
@@ -31,7 +32,16 @@ int32_t PacketAPI::runOnce()
 {
     bool success = false;
 #ifndef ARCH_PORTDUINO
-    if (config.bluetooth.enabled) {
+    // ⚠️ "IS BLUETOOTH UP", NOT "IS BLUETOOTH CONFIGURED ON".
+    //
+    // This branch exists so that, with a phone attached over Bluetooth, the on-device UI stays
+    // out of the way in programming mode. But Wi-Fi and Bluetooth cannot share this radio:
+    // bringing Wi-Fi up calls disableBluetooth() and the stack is gone, while the setting stays
+    // exactly as it was. The device then spent the rest of its run believing a phone might be
+    // listening - feeding its own screen nothing, and letting toPhoneQueue fill up and discard.
+    // Measured before this change: 180 seconds, 0 packets delivered, 9 dropped, with our own
+    // queue empty the whole time.
+    if (config.bluetooth.enabled && !bluetoothTornDown) {
         if (!programmingMode) {
             // in programmingMode we don't send any packets to the client except this one notify
             programmingMode = true;
@@ -133,10 +143,25 @@ bool PacketAPI::notifyProgrammingMode(void)
 /**
  * return true if we got (once!) contact from our client and the server send queue is not full
  */
+// ⛔ A FULL QUEUE IS BACKPRESSURE, NOT A DISCONNECT. This used to return
+//       isConnected && server->available()
+// and PhoneAPI::checkConnectionTimeout() treats a false here as "Lost phone connection" and
+// calls close() - which stops the device sending ANYTHING to its own screen until the UI
+// talks first. So one momentary bit of backpressure permanently starved the display, and
+// Meshtastic's toPhoneQueue then filled up and discarded real packets.
+//
+// Measured on the device: 180 seconds, 0 packets delivered to the UI, 9 dropped, with our own
+// queue reading 0 the whole time - because the session had already been closed.
+//
+// The two questions were tangled together. available() answers "can I take another packet
+// right now", which is transient and says nothing about whether the client exists. The client
+// here is the screen: it cannot walk away like a phone can, and it is marked present the
+// moment it sends anything. Runaway growth is bounded by the heap floor in
+// PacketServer::available(), which is the right place for that.
 bool PacketAPI::checkIsConnected()
 {
     isConnected |= server->hasData();
-    return isConnected && server->available();
+    return isConnected;
 }
 
 #endif

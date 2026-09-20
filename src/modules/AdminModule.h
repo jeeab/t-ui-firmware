@@ -100,3 +100,6 @@ static constexpr const char *publicChannelPrecisionMessage =
 extern AdminModule *adminModule;
 
 void disableBluetooth();
+// True once disableBluetooth() has run. The SETTING (config.bluetooth.enabled) can stay on
+// while the stack is gone, which is what happens whenever Wi-Fi is brought up.
+extern bool bluetoothTornDown;
