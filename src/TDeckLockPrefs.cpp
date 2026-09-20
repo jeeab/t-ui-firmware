@@ -177,3 +177,92 @@ extern "C" void tdeck_lastpos_set(int32_t lat, int32_t lon)
         p.end();
     }
 }
+
+// ---- keeping the lock screen lit --------------------------------------------
+// How long the glance stays visible after locking, in minutes. 0 = off (goes dark as it
+// always has), 255 = always. The whole cost of this is backlight, which is why the dim level
+// below matters far more than any of the rest of it.
+static int s_stayOn = -1;
+// How bright, 0-100%. Default 15: readable indoors, a small fraction of full power.
+static int s_dimPct = -1;
+// What unlocks it: 0 = slide only (as now), 1 = spacebar, 2 = Alt+W.
+// ⚠️ Spacebar is a big key in the middle of the board, which is exactly what a trouser
+// pocket presses - that is why jejeronimo asked for Alt+W. Both are offered; Alt+W is the
+// one to recommend.
+static int s_unlockKey = -1;
+
+static void loadStay(void)
+{
+    if (s_stayOn >= 0)
+        return;
+    Preferences p;
+    if (!p.begin("tdecklock", true)) {
+        s_stayOn = 0;
+        s_dimPct = 15;
+        s_unlockKey = 0;
+        return;
+    }
+    s_stayOn = (int)p.getUChar("stay", 0);
+    s_dimPct = (int)p.getUChar("dim", 15);
+    s_unlockKey = (int)p.getUChar("ukey", 0);
+    p.end();
+    if (s_dimPct < 0 || s_dimPct > 100)
+        s_dimPct = 15;
+    if (s_unlockKey < 0 || s_unlockKey > 2)
+        s_unlockKey = 0;
+}
+
+extern "C" int tdeck_lock_stayon_mins(void)
+{
+    loadStay();
+    return s_stayOn;
+}
+
+extern "C" void tdeck_lock_set_stayon_mins(int m)
+{
+    loadStay();
+    s_stayOn = m;
+    Preferences p;
+    if (p.begin("tdecklock", false)) {
+        p.putUChar("stay", (uint8_t)m);
+        p.end();
+    }
+}
+
+extern "C" int tdeck_lock_dim_pct(void)
+{
+    loadStay();
+    return s_dimPct;
+}
+
+extern "C" void tdeck_lock_set_dim_pct(int pct)
+{
+    if (pct < 0 || pct > 100)
+        return;
+    loadStay();
+    s_dimPct = pct;
+    Preferences p;
+    if (p.begin("tdecklock", false)) {
+        p.putUChar("dim", (uint8_t)pct);
+        p.end();
+    }
+}
+
+extern "C" int tdeck_lock_unlock_key(void)
+{
+    loadStay();
+    return s_unlockKey;
+}
+
+extern "C" void tdeck_lock_set_unlock_key(int k)
+{
+    if (k < 0 || k > 2)
+        return;
+    loadStay();
+    s_unlockKey = k;
+    Preferences p;
+    if (p.begin("tdecklock", false)) {
+        p.putUChar("ukey", (uint8_t)k);
+        p.end();
+    }
+}

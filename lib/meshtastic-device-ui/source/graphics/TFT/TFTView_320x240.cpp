@@ -108,6 +108,13 @@ extern "C" void tdeck_lock_set_mode(int mode);
 extern "C" int tdeck_lock_widget(void);
 extern "C" void tdeck_lock_set_widget(int w);
 extern "C" uint32_t tdeck_lock_wx_minutes(void);
+// Keeping the lock screen lit (jeeab/t-ui#8, reshaped - see lockDevice).
+extern "C" int tdeck_lock_stayon_mins(void);   // 0 off, 255 always, else minutes
+extern "C" int tdeck_lock_dim_pct(void);       // 0-100
+extern "C" int tdeck_lock_unlock_key(void);    // 0 slide only, 1 space, 2 Alt+W
+extern "C" void tdeck_lock_set_stayon_mins(int m);
+extern "C" void tdeck_lock_set_dim_pct(int pct);
+extern "C" void tdeck_lock_set_unlock_key(int k);
 extern "C" void tdeck_lock_set_wx_minutes(uint32_t mins);
 // Screenshot (src/TDeckScreenshot.cpp): arm it, then ask what happened.
 extern "C" void tdeck_shot_begin(void);
@@ -256,6 +263,11 @@ extern volatile int tb_nav_rows;
 //  tdeck_hold_dark   -> manual lock: LGFXDriver snaps the backlight to black and holds it.
 volatile bool tdeck_input_gated = false;
 volatile bool tdeck_hold_dark = false;
+// Keep the lock screen lit at this brightness rather than fading to black. 0 = off.
+volatile uint8_t tdeck_dim_floor = 0;
+// A key or the trackball was pressed while the lock screen is lit: brighten for three
+// seconds, do NOT unlock. Consumed by the UI poll.
+volatile bool tdeck_stayon_boost_request = false;
 
 // How long the PIN pad may sit untouched before the screen goes black again. Fixed rather
 // than a setting: it is a lock screen, and ten seconds is long enough to type a six-digit
@@ -1078,6 +1090,13 @@ bool buildTileIconFromFile(lv_obj_t *tile, const char *path)
 // pad - on a locked device.
 // Is the map the screen being looked at? The keyboard driver asks before it takes I and O,
 // so those keys are ordinary letters everywhere else.
+// Is the lock screen currently being kept lit? The input drivers ask, because a key means
+// something different here: anything but the chosen unlock key only brightens it.
+extern "C" bool tdeck_stayon_active(void)
+{
+    return TFTView_320x240::stayOnActive();
+}
+
 extern "C" bool tdeck_maps_active(void)
 {
     return TFTView_320x240::mapsScreenActive();
@@ -1129,6 +1148,12 @@ extern "C" bool tdeck_clock_text(char *out, int outN) { return TFTView_320x240::
 
 // Static, like every other shim here: instance() is private, so a free extern "C" function
 // cannot reach it but a static member can. This file has taught me that more than once.
+bool TFTView_320x240::stayOnActive(void)
+{
+    TFTView_320x240 *self = instance();
+    return self && self->stayOnSinceMs != 0;
+}
+
 bool TFTView_320x240::mapsScreenActive(void)
 {
     TFTView_320x240 *self = instance();
@@ -1455,9 +1480,18 @@ void TFTView_320x240::createLauncher(void)
             // goes back to black - the same state lockDevice() puts it in, so a double-click or a
             // key brings the pad straight back. Any partly-typed PIN is discarded on the way, which
             // is what you want anyway.
-            if ((THIS->lockState == LOCK_ENTRY || THIS->lockState == LOCK_GLANCE) &&
-                lv_display_get_inactive_time(NULL) > kLockPadIdleMs)
+            // The lock screen being KEPT lit is its own state; the idle timeout below must not
+            // treat it as "sitting there forgotten" and snap it black.
+            if (tdeck_stayon_boost_request) {
+                tdeck_stayon_boost_request = false;
+                THIS->stayOnBoost();
+            }
+            if (THIS->stayOnSinceMs) {
+                THIS->serviceStayOn();
+            } else if ((THIS->lockState == LOCK_ENTRY || THIS->lockState == LOCK_GLANCE) &&
+                       lv_display_get_inactive_time(NULL) > kLockPadIdleMs) {
                 THIS->lockDevice();
+            }
 
             // Keep the glance honest while it is up: its clock would otherwise be frozen at
             // whatever time it was built, and a message arriving would not appear. Cheap -
@@ -8745,6 +8779,11 @@ void TFTView_320x240::handleHomeGesture(void)
     if (tdeck_input_gated || tdeck_hold_dark || screenLocked) {
         tdeck_input_gated = false;
         tdeck_hold_dark = false; // stop forcing the backlight black
+        // Waking also ends "kept lit": the floor must go, or the backlight would be pinned at
+        // the dim level for the rest of the session.
+        stayOnSinceMs = 0;
+        stayOnBoostUntil = 0;
+        tdeck_dim_floor = 0;
         // Belt and braces: isScreenLocked() also holds the backlight at 0, and its own way out
         // (the blank-screen button) is unreachable on a backlit device. Clear it here so this
         // stays the ONE wake path no matter which code raised the flag.
@@ -8857,8 +8896,100 @@ void TFTView_320x240::handleBackGesture(void)
 }
 
 // Black out the screen and require the PIN to get back in.
+// Runs once every 60ms while the lock screen is being kept lit. Three jobs: expire the
+// window, run the three-second brightness boost, and drift the content.
+void TFTView_320x240::serviceStayOn(void)
+{
+    const uint32_t now = lv_tick_get();
+    const int stay = tdeck_lock_stayon_mins();
+
+    // Window expired -> go properly dark. 255 means never expire.
+    if (stay != 255 && stay > 0 && (now - stayOnSinceMs) > (uint32_t)stay * 60000UL) {
+        stayOnSinceMs = 0;
+        tdeck_dim_floor = 0;
+        tdeck_hold_dark = true;
+        lockState = LOCK_DARK;
+        return;
+    }
+
+    // jejeronimo's ask: "when a single press of the trackball or any key is pressed, the
+    // brightness should go to 100% for 3 seconds, without exiting sleep mode. This will allow
+    // you to read the time or battery status even in direct sunlight."
+    const int pct = tdeck_lock_dim_pct();
+    const uint8_t dim = (uint8_t)(pct <= 0 ? 1 : (pct * 255) / 100);
+    if (stayOnBoostUntil) {
+        if (now < stayOnBoostUntil) {
+            tdeck_dim_floor = 255;
+            setBrightness(255);
+        } else {
+            stayOnBoostUntil = 0;
+            tdeck_dim_floor = dim;
+            setBrightness(dim);
+        }
+    } else if (tdeck_dim_floor != dim) {
+        tdeck_dim_floor = dim; // the setting changed under us
+    }
+
+    // Drift. ⚠️ This is NOT protecting the panel: it is an IPS LCD, and burn-in is an OLED
+    // failure mode. LCDs show temporary image retention at worst and it fades on its own. The
+    // drift is here because a frozen screen looks broken and a slowly moving one looks alive,
+    // and because it costs one object move a minute. Said plainly so nobody later "fixes" a
+    // burn-in problem this device does not have.
+    if (now - stayOnDriftMs > 60000) {
+        stayOnDriftMs = now;
+        stayOnDriftIdx = (stayOnDriftIdx + 1) % 8;
+        static const int8_t kDx[8] = {0, 4, 6, 4, 0, -4, -6, -4};
+        static const int8_t kDy[8] = {-5, -3, 0, 3, 5, 3, 0, -3};
+        const int dx = kDx[stayOnDriftIdx], dy = kDy[stayOnDriftIdx];
+        for (lv_obj_t *o : {glance_clock_label, glance_date_label, glance_list}) {
+            if (!o)
+                continue;
+            lv_obj_set_style_translate_x(o, dx, LV_PART_MAIN);
+            lv_obj_set_style_translate_y(o, dy, LV_PART_MAIN);
+        }
+    }
+}
+
+// A key or the trackball was pressed while the lock screen is lit: brighten for three
+// seconds, do NOT unlock. Called from the poll when the driver raises the flag.
+void TFTView_320x240::stayOnBoost(void)
+{
+    if (!stayOnSinceMs)
+        return;
+    stayOnBoostUntil = lv_tick_get() + 3000;
+}
+
 void TFTView_320x240::lockDevice(void)
 {
+    // ⛔ THERE IS NO SEPARATE SCREENSAVER, AND THAT IS DELIBERATE.
+    // jeeab/t-ui#8 asked for one. Jake's call, and it is right: a screensaver and a lock
+    // screen both showing the clock, date and battery is one screen too many, and having to
+    // pass through both to get in is worse than either. The glance already IS the
+    // screensaver, so it simply learns to stay lit instead of fading to black.
+    //   "it just seems goofy to have the screensaver, then lock screen to open... make an
+    //    option for the lock screen to always stay on"
+    // Everything worth keeping from the original request survives: adjustable brightness, no
+    // key waking it by accident, and a press bringing it to full for three seconds WITHOUT
+    // unlocking, so the time is readable in direct sunlight.
+    const int stay = tdeck_lock_stayon_mins();
+    if (stay != 0 && tdeck_lock_mode() != 0) {
+        lockState = LOCK_GLANCE;
+        lockLen = 0;
+        lockDigits[0] = 0;
+        if (lockedAtMs == 0)
+            lockedAtMs = lv_tick_get();
+        stayOnSinceMs = lv_tick_get();
+        stayOnBoostUntil = 0;
+        showLockGlance();
+        // 0% would be indistinguishable from off, so the floor never goes below 1.
+        const int pct = tdeck_lock_dim_pct();
+        tdeck_dim_floor = (uint8_t)(pct <= 0 ? 1 : (pct * 255) / 100);
+        tdeck_hold_dark = false;
+        tdeck_input_gated = true; // still pocket-safe: the keyboard driver decides what a key means
+        return;
+    }
+    stayOnSinceMs = 0;
+    tdeck_dim_floor = 0;
     lockState = LOCK_DARK;
     // Only start the grace clock on a FRESH lock. The pad's own idle timeout calls this to
     // drop back to black, and letting that restart the clock would quietly extend the window
@@ -9339,6 +9470,26 @@ static const char *lockWidgetName(int w)
     }
 }
 
+static const char *stayOnName(int m)
+{
+    switch (m) {
+    case 0:   return "Off";
+    case 5:   return "5 min";
+    case 10:  return "10 min";
+    case 30:  return "30 min";
+    default:  return "Always";
+    }
+}
+
+static const char *unlockKeyName(int k)
+{
+    switch (k) {
+    case 1:  return "Spacebar";
+    case 2:  return "Alt + W";
+    default: return "Slide only";
+    }
+}
+
 static const char *wxPeriodName(uint32_t m)
 {
     switch (m) {
@@ -9371,8 +9522,22 @@ void TFTView_320x240::updateLockPageLabels(void)
     // device with no PIN is a question the user should never have to answer.
     const bool pinMode = (tdeck_lock_mode() == 2);
     const bool weather = (tdeck_lock_widget() == 1);
+    const bool staying = (tdeck_lock_stayon_mins() != 0);
+    if (lockpage_stay_label)
+        lv_label_set_text(lockpage_stay_label, stayOnName(tdeck_lock_stayon_mins()));
+    if (lockpage_dim_label) {
+        char b[8];
+        snprintf(b, sizeof(b), "%d%%", tdeck_lock_dim_pct());
+        lv_label_set_text(lockpage_dim_label, b);
+    }
+    if (lockpage_unlock_label)
+        lv_label_set_text(lockpage_unlock_label, unlockKeyName(tdeck_lock_unlock_key()));
     for (auto &pair : std::initializer_list<std::pair<lv_obj_t *, bool>>{
-             {lockpage_pin_row, pinMode}, {lockpage_grace_row, pinMode}, {lockpage_wx_row, weather}}) {
+             {lockpage_pin_row, pinMode},
+             {lockpage_grace_row, pinMode},
+             {lockpage_wx_row, weather},
+             {lockpage_dim_row, staying},
+             {lockpage_unlock_row, staying}}) {
         if (!pair.first)
             continue;
         if (pair.second)
@@ -9477,7 +9642,39 @@ void TFTView_320x240::openLockSettings(void)
                                           tdeck_lock_set_wx_minutes(kMins[(at + 1) % 5]);
                                           THIS->updateLockPageLabels();
                                       });
-        y += 46;
+        y += 48;
+
+        // ---- keeping the lock screen lit (jeeab/t-ui#8, reshaped) --------------------------
+        // There is no separate screensaver: this IS the screensaver. See lockDevice().
+        lockPageRow(lockpage_screen, "Keep screen on", y, "Off", &lockpage_stay_label, [](lv_event_t *) {
+            static const int kSteps[] = {0, 5, 10, 30, 255};
+            const int cur = tdeck_lock_stayon_mins();
+            int at = 0;
+            for (int i = 0; i < 5; i++)
+                if (kSteps[i] == cur)
+                    at = i;
+            tdeck_lock_set_stayon_mins(kSteps[(at + 1) % 5]);
+            THIS->updateLockPageLabels();
+        });
+        y += 42;
+        lockpage_dim_row = lockPageRow(lockpage_screen, "Dim level", y, "15%", &lockpage_dim_label,
+                                       [](lv_event_t *) {
+                                           static const int kPct[] = {5, 10, 15, 25, 40, 60};
+                                           const int cur = tdeck_lock_dim_pct();
+                                           int at = 2;
+                                           for (int i = 0; i < 6; i++)
+                                               if (kPct[i] == cur)
+                                                   at = i;
+                                           tdeck_lock_set_dim_pct(kPct[(at + 1) % 6]);
+                                           THIS->updateLockPageLabels();
+                                       });
+        y += 42;
+        lockpage_unlock_row = lockPageRow(lockpage_screen, "Unlock with", y, "Slide only",
+                                          &lockpage_unlock_label, [](lv_event_t *) {
+                                              tdeck_lock_set_unlock_key((tdeck_lock_unlock_key() + 1) % 3);
+                                              THIS->updateLockPageLabels();
+                                          });
+        y += 48;
 
         lv_obj_t *hint = lv_label_create(lockpage_screen);
         lv_obj_set_width(hint, 288);
@@ -9489,7 +9686,11 @@ void TFTView_320x240::openLockSettings(void)
                           "PIN: slide, then the keypad.\n\n"
                           "The widget fills the lock screen when nothing needs your attention. "
                           "Notifications take that space until you clear them.\n\n"
-                          "Weather keeps its last reading when it cannot reach the internet.");
+                          "Weather keeps its last reading when it cannot reach the internet.\n\n"
+                          "Keep screen on leaves this screen showing the time, dimmed, instead of "
+                          "going black. Any key or the trackball brightens it for 3 seconds "
+                          "without unlocking. Only the unlock key gets you in - Alt + W is much "
+                          "harder to press by accident in a pocket than the spacebar.");
         lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 16, y);
     }
     updateLockPageLabels();
@@ -9902,6 +10103,17 @@ void TFTView_320x240::refreshLockGlance(bool force)
 // The slider made it to the end.
 void TFTView_320x240::lockGlanceUnlocked(void)
 {
+    // Leaving: stop keeping it lit, and put the drifted content back where it belongs.
+    stayOnSinceMs = 0;
+    stayOnBoostUntil = 0;
+    tdeck_dim_floor = 0;
+    for (lv_obj_t *o : {glance_clock_label, glance_date_label, glance_list}) {
+        if (!o)
+            continue;
+        lv_obj_set_style_translate_x(o, 0, LV_PART_MAIN);
+        lv_obj_set_style_translate_y(o, 0, LV_PART_MAIN);
+    }
+
     // The PIN grace period. Having just put it in your pocket and taken it straight back
     // out, typing the code again is pure friction; an hour later it is the whole point.
     // 0 seconds (the default) means always ask, so nothing changes unless it is turned on.

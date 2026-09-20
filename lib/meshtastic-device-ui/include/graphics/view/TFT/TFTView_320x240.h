@@ -606,6 +606,12 @@ class TFTView_320x240 : public MeshtasticView
     void handleBackGesture(void);            // runs on the "erase" key when nothing is being typed
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
+    void serviceStayOn(void);                 // the lock screen kept lit: expire, boost, drift
+    void stayOnBoost(void);                   // a key was pressed: 3s at full, no unlock
+    uint32_t stayOnSinceMs = 0;               // 0 = not being kept lit
+    uint32_t stayOnBoostUntil = 0;
+    uint32_t stayOnDriftMs = 0;
+    uint8_t stayOnDriftIdx = 0;
     void showLockGlance(void);
     void glanceNotifRow(lv_obj_t *parent, const char *who, const char *text, const char *age);
     void glanceWidgetCard(lv_obj_t *parent, const struct LockWidgetText &w);               // the iPod-style glance: clock, who messaged, slide to unlock
@@ -650,6 +656,11 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *lockpage_pin_row = nullptr;     // hidden unless the mode is PIN
     lv_obj_t *lockpage_grace_row = nullptr;   // ditto
     lv_obj_t *lockpage_wx_row = nullptr;      // hidden unless the widget is Weather
+    lv_obj_t *lockpage_stay_label = nullptr;  // "keep the lock screen lit" - see lockDevice()
+    lv_obj_t *lockpage_dim_row = nullptr;     // hidden unless it is being kept lit
+    lv_obj_t *lockpage_dim_label = nullptr;
+    lv_obj_t *lockpage_unlock_row = nullptr;  // ditto
+    lv_obj_t *lockpage_unlock_label = nullptr;
     lv_obj_t *lockglance_screen = nullptr;    // shown on wake, before the PIN pad
     lv_obj_t *glance_clock_label = nullptr;
     lv_obj_t *glance_notif_btn = nullptr;     // top left: "Notifications" / "3 msgs"
@@ -889,6 +900,7 @@ class TFTView_320x240 : public MeshtasticView
     static void tuiOpenChannelChat(uint8_t ch);
     static bool tuiDeviceLocked(void); // is the PIN/swipe still owed?
     static bool mapsScreenActive(void); // is the map the screen being looked at?
+    static bool stayOnActive(void);     // is the lock screen being kept lit?
     static void tuiUnreadRecount(void); // re-sum the per-conversation counts
     static int tuiBatteryPct(void);        // for the status bar
     static bool tuiBatteryPlugged(void);

@@ -20,6 +20,10 @@ extern volatile bool tdeck_calib_request;
 // I / O zoom the map (jeeab/t-ui#7). -1 out, +1 in.
 extern volatile int tdeck_map_zoom_request;
 extern "C" bool tdeck_maps_active(void);
+// The lock screen kept lit: a key brightens it rather than waking it, unless it is THE key.
+extern "C" bool tdeck_stayon_active(void);
+extern "C" int tdeck_lock_unlock_key(void); // 0 slide only, 1 spacebar, 2 Alt+W
+extern volatile bool tdeck_stayon_boost_request;
 // The "erase" key pressed while nothing is being typed into: a request to go back, polled by
 // the launcher (which decides whether Back is allowed from the screen in front of the user).
 extern volatile bool tdeck_back_request;
@@ -98,6 +102,26 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
             // the stiff trackball double-click) — but it must not type onto the hidden screen,
             // so we record the request and swallow the key below.
             if (tdeck_input_gated) {
+                // The lock screen is being KEPT LIT. That is a pocket, so a key must not wake
+                // it: only the one chosen key does, and everything else just brightens the
+                // screen for three seconds so the time can be read in sunlight.
+                if (tdeck_stayon_active()) {
+                    const int uk = tdeck_lock_unlock_key();
+                    // ⚠️ ALT+W'S BYTE IS NOT KNOWN YET. The keyboard's own chip generates
+                    // these combos (Alt+C is 0x0C) and it cannot be derived from the letter.
+                    // Every key seen here is logged so the byte can be read off the cable the
+                    // first time it is pressed, and then hard-coded. Until then Alt+W is
+                    // offered in Settings but behaves as "some other key", i.e. it brightens.
+                    LOG_INFO("stayon key=0x%02x (%u)", (unsigned)data->key, (unsigned)data->key);
+                    const bool isUnlock = (uk == 1 && data->key == ' ');
+                    if (isUnlock)
+                        tdeck_wake_request = true;
+                    else
+                        tdeck_stayon_boost_request = true;
+                    data->state = LV_INDEV_STATE_RELEASED;
+                    data->key = 0;
+                    break;
+                }
                 tdeck_wake_request = true;
                 break;
             }

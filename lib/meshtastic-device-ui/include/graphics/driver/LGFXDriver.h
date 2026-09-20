@@ -18,6 +18,11 @@
 //                       a trackball double-click, isn't wired up on that screen).
 extern volatile bool tdeck_input_gated;
 extern volatile bool tdeck_hold_dark;
+//  tdeck_dim_floor   -> keep the lock screen LIT at this brightness instead of fading to
+//                       black (0 = off, the original behaviour). The idle fade below stops
+//                       here rather than at zero. Input is still gated at the floor, because
+//                       the point of this is a device sitting in a pocket showing the time.
+extern volatile uint8_t tdeck_dim_floor;
 extern volatile bool tdeck_prog_mode;
 
 // Optional "keyboard backlight follows the screen" (src/TDeckKeyboardLight.cpp). Off unless
@@ -122,15 +127,19 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
                 // brightness the instant a touch — or a trackball double-click via
                 // lv_display_trigger_activity() — resets LVGL's inactivity timer.
                 uint32_t brightness = lgfx->getBrightness();
-                if (brightness > 0) {
-                    // Manual lock snaps straight to black; an idle timeout fades gently.
+                // The fade stops at the floor when the lock screen is being kept lit. A manual
+                // lock still snaps straight to black - holding the ball means "off now".
+                const uint32_t floor = tdeck_hold_dark ? 0 : tdeck_dim_floor;
+                if (brightness > floor) {
                     lgfx->setBrightness(tdeck_hold_dark ? 0 : brightness - 1);
                 }
-                // Once the screen is actually dark, gate input so only a trackball double-click
-                // (which calls lv_display_trigger_activity) can wake it.
-                if (tdeck_hold_dark || lgfx->getBrightness() == 0) {
+                // Once it has settled - dark, or down at the floor - gate input. At the floor
+                // the keyboard driver decides what a key means: the unlock key gets you in,
+                // anything else just brightens it for a moment.
+                if (tdeck_hold_dark || lgfx->getBrightness() <= floor) {
                     tdeck_input_gated = true;
-                    tdeck_kbdlight_screen(false); // keys go dark with the screen
+                    if (floor == 0)
+                        tdeck_kbdlight_screen(false); // keys go dark with the screen
                 }
             }
             // no BL pin defined to control brightness, so show blank screen instead

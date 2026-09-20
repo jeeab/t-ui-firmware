@@ -33,6 +33,9 @@ extern "C" int tdeck_trackball_speed(void);
 extern "C" int tdeck_trackball_style(void); // 0 = see-through, 1 = solid
 // "Go back" - the same request the keyboard's erase key raises (TFTView_320x240.cpp).
 extern volatile bool tdeck_back_request;
+// The lock screen kept lit: rolling or clicking brightens it, it does not unlock.
+extern "C" bool tdeck_stayon_active(void);
+extern volatile bool tdeck_stayon_boost_request;
 
 // ---- the trackball cursor -------------------------------------------------------------
 // A real LVGL pointer, reported exactly like the touchscreen, so a click lands on whatever is
@@ -364,6 +367,12 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
 #endif
         // slow down repeating key to max. four events per second
         // the button is an exception for LONG_PRESSED monitoring
+        // Kept-lit lock screen: any trackball activity brightens it for three seconds and
+        // nothing else. The double-click that goes Home still works, because that is handled
+        // above this and sets tb_home_request directly.
+        if (action != TB_ACTION_NONE && tdeck_stayon_active()) {
+            tdeck_stayon_boost_request = true;
+        }
         if (action != TB_ACTION_NONE && (action == TB_ACTION_PRESSED || millis() > lastPressed + 250)) {
             // On the PIN screen the trackball must not select or navigate anything: the group
             // still holds the launcher's tiles, so a click here would press a button behind the
