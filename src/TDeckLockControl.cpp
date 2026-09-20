@@ -17,26 +17,21 @@
 
 static int s_lockEnabled = -1; // -1 = not read from NVS yet; 0 = off; 1 = on
 
+extern "C" int tdeck_lock_mode(void); // TDeckLockPrefs.cpp - 0 Off, 1 Swipe, 2 PIN
+
+// Kept as the one-bit question "is there a lock at all", now answered by the three-way
+// mode so there is a single source of truth. Everything that used to call this still
+// works; Swipe counts as locked, because it is.
 extern "C" bool tdeck_lock_enabled(void)
 {
-    if (s_lockEnabled < 0) {
-        Preferences p;
-        if (p.begin("tdecklock", true)) { // read-only
-            s_lockEnabled = p.getBool("en", true) ? 1 : 0;
-            p.end();
-        } else {
-            s_lockEnabled = 1; // namespace not created yet -> lock ON by default
-        }
-    }
-    return s_lockEnabled != 0;
+    return tdeck_lock_mode() != 0;
 }
 
+extern "C" void tdeck_lock_set_mode(int mode); // TDeckLockPrefs.cpp
+
+// On -> PIN, off -> Off. Only here for anything still flipping a switch; the Settings
+// page sets the mode directly.
 extern "C" void tdeck_lock_set_enabled(bool en)
 {
-    s_lockEnabled = en ? 1 : 0;
-    Preferences p;
-    if (p.begin("tdecklock", false)) { // read-write
-        p.putBool("en", en);
-        p.end();
-    }
+    tdeck_lock_set_mode(en ? 2 : 0);
 }

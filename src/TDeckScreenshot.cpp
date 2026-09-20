@@ -64,6 +64,7 @@ static const int kShotH = 240;
 static uint16_t *s_buf = nullptr;      // kShotW * kShotH RGB565, PSRAM
 static volatile bool s_capturing = false;
 static uint32_t s_armedAtMs = 0; // for the watchdog below
+static uint32_t s_covered = 0;   // pixels written since arming, for the coverage test
 static volatile bool s_ready = false;  // buffer full, waiting to be written
 static volatile bool s_failed = false; // could not allocate, or could not write
 static char s_lastPath[32] = {0};
@@ -120,6 +121,7 @@ extern "C" void tdeck_shot_begin(void)
     memset(s_buf, 0, (size_t)kShotW * kShotH * 2);
     s_failed = false;
     s_armedAtMs = millis();
+    s_covered = 0;
     s_capturing = true;
 #endif
 }
@@ -142,6 +144,7 @@ extern "C" void tdeck_shot_capture_area(int x1, int y1, int x2, int y2, const ui
             if (x < 0 || x >= kShotW)
                 continue;
             s_buf[y * kShotW + x] = px[(y - y1) * aw + (x - x1)];
+            s_covered++;
         }
     }
 #else
@@ -149,13 +152,25 @@ extern "C" void tdeck_shot_capture_area(int x1, int y1, int x2, int y2, const ui
 #endif
 }
 
-// The last area of a refresh has gone past: the buffer now holds a whole frame.
+// The last area of a refresh has gone past.
+//
+// ⚠️ "A refresh finished" is NOT "the whole screen has been captured". LVGL only
+// redraws what changed, and a clock label ticking over is a refresh of its own. Arming a
+// capture and then invalidating the screen leaves a window in which some tiny in-flight
+// refresh completes first - and the shot came out almost entirely black with a sliver of
+// clock, which is exactly what happened when paging the launcher.
+//
+// So finishing requires COVERAGE: essentially every pixel written since arming. Anything
+// less and we keep waiting for the full redraw that the invalidate asked for. The 2s
+// watchdog in the service is still the backstop if that never arrives.
 extern "C" void tdeck_shot_frame_done(void)
 {
-    if (s_capturing) {
-        s_capturing = false;
-        s_ready = true;
-    }
+    if (!s_capturing)
+        return;
+    if (s_covered < (uint32_t)(kShotW * kShotH) - 64) // a hair of slack for clipped edges
+        return;
+    s_capturing = false;
+    s_ready = true;
 }
 
 #if SHOT_HAVE_FS
