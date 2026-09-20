@@ -606,6 +606,7 @@ class TFTView_320x240 : public MeshtasticView
     void handleBackGesture(void);            // runs on the "erase" key when nothing is being typed
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
+    void serviceBattLog(void);                // a line a minute to /battlog.csv
     void serviceStayOn(void);                 // the lock screen kept lit: expire, boost, drift
     void stayOnBoost(void);                   // a key was pressed: 3s at full, no unlock
     uint32_t stayOnSinceMs = 0;               // 0 = not being kept lit

@@ -115,6 +115,9 @@ extern "C" int tdeck_lock_unlock_key(void);    // 0 slide only, 1 space, 2 Alt+W
 extern "C" void tdeck_lock_set_stayon_mins(int m);
 extern "C" void tdeck_lock_set_dim_pct(int pct);
 extern "C" void tdeck_lock_set_unlock_key(int k);
+// Battery log (src/TDeckBattLog.cpp). One line a minute, so the cost of keeping the screen
+// lit can be MEASURED rather than guessed - this board has no current sensor.
+extern "C" bool tdeck_battlog_sample(int *mv, int *pct, int *usb, int *charging);
 extern "C" void tdeck_lock_set_wx_minutes(uint32_t mins);
 // Screenshot (src/TDeckScreenshot.cpp): arm it, then ask what happened.
 extern "C" void tdeck_shot_begin(void);
@@ -1482,6 +1485,7 @@ void TFTView_320x240::createLauncher(void)
             // is what you want anyway.
             // The lock screen being KEPT lit is its own state; the idle timeout below must not
             // treat it as "sitting there forgotten" and snap it black.
+            THIS->serviceBattLog(); // self-throttled to once a minute
             if (tdeck_stayon_boost_request) {
                 tdeck_stayon_boost_request = false;
                 THIS->stayOnBoost();
@@ -8898,6 +8902,42 @@ void TFTView_320x240::handleBackGesture(void)
 // Black out the screen and require the PIN to get back in.
 // Runs once every 60ms while the lock screen is being kept lit. Three jobs: expire the
 // window, run the three-second brightness boost, and drift the content.
+// One line a minute to /battlog.csv. Written HERE, on the tft task, because this is where
+// SDFs lives and task_handler() already holds the SPI lock - the same rule as every other
+// card write in this file.
+//
+// The point of it: Jake asked what an always-on screen costs and the honest answer was that
+// this board cannot report current. Voltage over time can still answer it - run the device
+// unplugged for a few hours dark, then a few hours lit, and compare millivolts per hour.
+void TFTView_320x240::serviceBattLog(void)
+{
+    static uint32_t lastMs = 0;
+    const uint32_t now = lv_tick_get();
+    if (lastMs && (now - lastMs) < 60000)
+        return;
+
+    int mv = 0, pct = 0, usb = 0, chg = 0;
+    if (!tdeck_battlog_sample(&mv, &pct, &usb, &chg))
+        return; // no reading yet - a zero row is worse than no row
+    lastMs = now ? now : 1;
+
+    // What state the screen was in, which is the whole independent variable.
+    //   0 dark   1 lit-but-dimmed (lock screen kept on)   2 awake
+    const int state = tdeck_hold_dark ? 0 : (stayOnSinceMs ? 1 : (tdeck_input_gated ? 0 : 2));
+
+    char line[96];
+    snprintf(line, sizeof(line), "%lu,%d,%d,%d,%d,%d,%d,%lu", (unsigned long)(now / 1000), mv, pct, usb, chg,
+             state, (int)tdeck_dim_floor, (unsigned long)db.uiConfig.screen_brightness);
+
+    FsFile f = SDFs.open("/battlog.csv", O_WRONLY | O_CREAT | O_APPEND);
+    if (!f)
+        return;
+    if (f.fileSize() == 0)
+        f.println("uptime_s,mv,pct,usb,chg,screen,dimfloor,brightness");
+    f.println(line);
+    f.close();
+}
+
 void TFTView_320x240::serviceStayOn(void)
 {
     const uint32_t now = lv_tick_get();
@@ -9363,14 +9403,16 @@ void TFTView_320x240::remoteService(void)
     case 10: { // dump the tail of /diaglog.txt
         // PSRAM, and only the tail: the file grows for the life of the card and the whole of
         // it is neither wanted nor affordable.
-        const int kTail = 2048;
+        const int kTail = (x == 1) ? 6144 : 2048;
         char *tail = (char *)heap_caps_malloc(kTail + 1, MALLOC_CAP_SPIRAM);
         if (!tail) {
             tdeck_remote_reply("diag no memory");
             break;
         }
         int n = 0;
-        FsFile f = SDFs.open("/diaglog.txt", O_RDONLY);
+        // x picks the file: 0 = the fault log, 1 = the battery log.
+        const char *path = (x == 1) ? "/battlog.csv" : "/diaglog.txt";
+        FsFile f = SDFs.open(path, O_RDONLY);
         if (f) {
             const uint32_t sz = f.fileSize();
             if (sz > (uint32_t)kTail)
@@ -9396,6 +9438,11 @@ void TFTView_320x240::remoteService(void)
             char *nl = strchr(p, '\n');
             if (nl)
                 *nl = 0;
+            // println() writes CRLF, so each line arrives with a trailing carriage return
+            // that the terminal renders as a stray character. Trim it.
+            char *cr = strchr(p, '\r');
+            if (cr)
+                *cr = 0;
             if (*p) {
                 LOG_INFO("@@dg %s", p);
                 lines++;
