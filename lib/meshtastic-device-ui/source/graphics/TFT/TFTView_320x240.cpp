@@ -632,7 +632,9 @@ struct LauncherApp {
 
 static const LauncherApp kApps[] = {
     // Mesh opens the full Meshtastic MUI (nodes/map/messages/settings all live in there).
-    {"Mesh", &img_home_button_image, 0x30d158, &objects.home_button, &objects.home_panel, &objects.top_panel, nullptr},
+    // Purple, not the green it used to be: Chats is green too, and side by side on page one
+    // the two tiles were indistinguishable at a glance now that the tint colours them.
+    {"Mesh", &img_home_button_image, 0xbf5af2, &objects.home_button, &objects.home_panel, &objects.top_panel, nullptr},
     // Notes = self-contained module (NotesApp.cpp), .txt files in /notes on SD.
     {"Notes", &img_messages_button_image, 0xffd60a, nullptr, nullptr, nullptr, &notes_open},
     // Calculator = self-contained module (CalculatorApp.cpp).
@@ -671,6 +673,19 @@ static const LauncherApp kApps[] = {
 };
 
 // --- simple per-app icons, drawn from lv_obj primitives (no image assets needed) ---
+// Mix an accent colour into a dark base. Each home-screen tile is tinted by its own app
+// colour, top more than bottom, which is what turns a grid of identical grey squares into
+// something you can find an app on without reading the labels. The percentages are low on
+// purpose - 16 and 4 - and were picked by rendering the grid on the PC and looking at it
+// (C:\tdsim, "home-old" and "home-new"). Anything stronger reads as six coloured boxes.
+uint32_t tintAccent(uint32_t base, uint32_t accent, int pct)
+{
+    const int r = (int)(((base >> 16) & 0xff) * (100 - pct) + ((accent >> 16) & 0xff) * pct) / 100;
+    const int g = (int)(((base >> 8) & 0xff) * (100 - pct) + ((accent >> 8) & 0xff) * pct) / 100;
+    const int b = (int)((base & 0xff) * (100 - pct) + (accent & 0xff) * pct) / 100;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
 lv_obj_t *icBox(lv_obj_t *p, int x, int y, int w, int h, uint32_t color, int radius)
 {
     lv_obj_t *o = lv_obj_create(p);
@@ -1200,12 +1215,31 @@ void TFTView_320x240::createLauncher(void)
     // It still flips to a red "last: <reason>" for ~20s after a fault restart.
     tdeck_diag_boot();   // capture last restart reason + last session's memory lows (once)
     lua_seed_bundled();  // install bundled SD apps on first run of this firmware (once, then user-owned)
+    // The strip itself. Flat, not a gradient - Jake, 2026-09-19: "maybe no status bar
+    // gradient". Same height, same colour and same hairline as TuiStatusBar draws on every
+    // other screen, so Home does not look like a different device.
+    {
+        lv_obj_t *bar = lv_obj_create(launcher_screen);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 320, 22);
+        lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0x0a0a0c), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+        lv_obj_set_style_border_color(bar, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE); // the labels on top of it stay tappable
+    }
+
     launcher_mem_label = lv_label_create(launcher_screen);
     lv_label_set_text(launcher_mem_label, "T-Deck");
     lv_obj_set_style_text_color(launcher_mem_label, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_set_style_text_font(launcher_mem_label, &ui_font_montserrat_12, LV_PART_MAIN);
-    // Offset right of center: leaves room on the left for the unread-message count near "mesh".
-    lv_obj_align(launcher_mem_label, LV_ALIGN_TOP_MID, 40, 6);
+    // Dead centre, like the clock on every other screen. It used to be pushed 40px right to
+    // clear the unread count; that count now lives in its own left-hand slot, so it does not
+    // need to be dodged any more.
+    lv_obj_align(launcher_mem_label, LV_ALIGN_TOP_MID, 0, 4);
     // Tap the readout for a full, readable diagnostics popup (the top-bar text is
     // cramped; this is the "hard to see the numbers" fix).
     lv_obj_add_flag(launcher_mem_label, LV_OBJ_FLAG_CLICKABLE);
@@ -1269,8 +1303,11 @@ void TFTView_320x240::createLauncher(void)
     launcher_unread_label = lv_label_create(launcher_screen);
     lv_obj_set_style_text_color(launcher_unread_label, lv_color_hex(0x30d158), LV_PART_MAIN);
     lv_obj_set_style_text_font(launcher_unread_label, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_align(launcher_unread_label, LV_ALIGN_TOP_LEFT, 8, 6);
-    lv_label_set_text(launcher_unread_label, "");
+    lv_obj_align(launcher_unread_label, LV_ALIGN_TOP_LEFT, 6, 4);
+    // "Notifications" when there is nothing, exactly as the shared bar reads, rather than an
+    // empty space that gives no hint there is anything to tap.
+    lv_label_set_text(launcher_unread_label, "Notifications");
+    lv_obj_set_style_text_color(launcher_unread_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
     // Jake: "then youd click the '1msg' it would take you to a notifications page". This is
     // that "1msg". The hit area is grown well past the text, because a 12px label is a
     // cruel tap target.
@@ -1296,7 +1333,10 @@ void TFTView_320x240::createLauncher(void)
     // battery percentage (top-right); fed by updateMetrics()->updateLauncherBattery().
     launcher_battery_label = lv_label_create(launcher_screen);
     lv_obj_set_style_text_color(launcher_battery_label, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(launcher_battery_label, LV_ALIGN_TOP_RIGHT, -8, 6);
+    // montserrat_12 and -6, matching the shared bar. It was the default font, which is bigger
+    // than everything beside it and made Home look like it had been laid out by someone else.
+    lv_obj_set_style_text_font(launcher_battery_label, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(launcher_battery_label, LV_ALIGN_TOP_RIGHT, -6, 4);
     updateLauncherBattery();
 
     // ---- paged app grid (built into buildAppGrid so it can be rebuilt live) ----
@@ -1775,9 +1815,40 @@ void TFTView_320x240::buildAppGrid(void)
         }
         lv_obj_t *tile = lv_btn_create(page);
         lv_obj_set_size(tile, 88, 84);
-        lv_obj_set_style_bg_color(tile, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
-        lv_obj_set_style_radius(tile, 16, LV_PART_MAIN);
         lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(tile, 18, LV_PART_MAIN);
+        // A vertical gradient tinted with the app's own colour, and a lit top edge, so the
+        // tile reads as a surface with light falling on it rather than a flat grey square.
+        {
+            const uint32_t a = launchList[i].color;
+            // Lit from BELOW: dark at the top, lighter at the bottom.
+            //
+            // ⚠️ Jake asked for the Apple-style bottom-left angle, and it is not available.
+            // LVGL has LV_GRAD_DIR_LINEAR, but only behind LV_USE_DRAW_SW_COMPLEX_GRADIENTS,
+            // which is 0 here. Turning it on in the PC renderer, with a clean rebuild and the
+            // proper lv_grad_linear_init()/lv_grad_init_stops() helpers in both orders, drew
+            // nothing at all - the tiles came out transparent. Recorded so nobody repeats it.
+            //
+            // 8%, not the 16% first tried: "maybe just less vibrant". At 8 the tile is grey
+            // with a hint of the app in it; at 16 it was six coloured boxes.
+            lv_obj_set_style_bg_color(tile, lv_color_hex(tintAccent(0x131316, a, 4)), LV_PART_MAIN);
+            lv_obj_set_style_bg_grad_color(tile, lv_color_hex(tintAccent(0x2e2e34, a, 8)), LV_PART_MAIN);
+            lv_obj_set_style_bg_grad_dir(tile, LV_GRAD_DIR_VER, LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_border_side(tile, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+            lv_obj_set_style_border_color(tile, lv_color_hex(0x35353a), LV_PART_MAIN);
+            lv_obj_set_style_border_width(tile, 1, LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(tile, 10, LV_PART_MAIN);
+            lv_obj_set_style_shadow_color(tile, lv_color_hex(0x000000), LV_PART_MAIN);
+            lv_obj_set_style_shadow_opa(tile, 110, LV_PART_MAIN);
+            lv_obj_set_style_shadow_offset_y(tile, 4, LV_PART_MAIN);
+            // Pressed: brighter and pushed down a couple of pixels, so a tap on a touchscreen
+            // this size gives you something back before the app has finished opening.
+            lv_obj_set_style_bg_color(tile, lv_color_hex(tintAccent(0x3a3a41, a, 14)),
+                                      LV_PART_MAIN | LV_STATE_PRESSED);
+            lv_obj_set_style_translate_y(tile, 2, LV_PART_MAIN | LV_STATE_PRESSED);
+            lv_obj_set_style_shadow_opa(tile, 40, LV_PART_MAIN | LV_STATE_PRESSED);
+        }
         lv_obj_add_event_cb(tile, tile_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         lv_obj_add_event_cb(tile, tile_long_cb, LV_EVENT_LONG_PRESSED, NULL);
 
@@ -1812,8 +1883,10 @@ void TFTView_320x240::buildAppGrid(void)
         for (size_t p = 0; p < pageCount; p++) {
             lv_obj_t *d = lv_obj_create(dots);
             lv_obj_remove_style_all(d);
-            lv_obj_set_size(d, 7, 7);
-            lv_obj_set_style_radius(d, 4, LV_PART_MAIN);
+            // The page you are on is a PILL; the others stay dots. Five identical dots with
+            // one of them slightly lighter is a thing you have to hunt for on a 320px screen.
+            lv_obj_set_size(d, p == 0 ? 16 : 6, 6);
+            lv_obj_set_style_radius(d, 3, LV_PART_MAIN);
             lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN);
             lv_obj_set_style_bg_color(d, lv_color_hex(p == 0 ? 0xffffff : 0x48484a), LV_PART_MAIN);
         }
@@ -1830,9 +1903,12 @@ void TFTView_320x240::buildAppGrid(void)
                     cur = 0;
                 if (cur > (int)n - 1)
                     cur = (int)n - 1;
-                for (uint32_t k = 0; k < n; k++)
-                    lv_obj_set_style_bg_color(lv_obj_get_child(THIS->launcher_dots, k),
-                                              lv_color_hex((int)k == cur ? 0xffffff : 0x48484a), LV_PART_MAIN);
+                for (uint32_t k = 0; k < n; k++) {
+                    lv_obj_t *d = lv_obj_get_child(THIS->launcher_dots, k);
+                    const bool on = ((int)k == cur);
+                    lv_obj_set_style_bg_color(d, lv_color_hex(on ? 0xffffff : 0x48484a), LV_PART_MAIN);
+                    lv_obj_set_width(d, on ? 16 : 6); // the pill follows the page
+                }
             },
             LV_EVENT_SCROLL, NULL);
     } else {
@@ -16912,7 +16988,11 @@ void TFTView_320x240::updateUnreadMessages(void)
     else
         top[0] = '\0';
     if (launcher_unread_label) {
-        lv_label_set_text(launcher_unread_label, top);
+        // "Notifications" rather than blank when there is nothing, matching the shared top bar
+        // on every other screen. Blank gave no hint that the corner was tappable at all.
+        lv_label_set_text(launcher_unread_label, top[0] ? top : "Notifications");
+        lv_obj_set_style_text_color(launcher_unread_label,
+                                    lv_color_hex(unreadMessages > 0 ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
         // The "mesh off" warning sits immediately right of this count, so it has to move when the
         // count's width changes ("" -> "3 msgs"). align_to is one-shot, so redo it here.
         if (launcher_mesh_off_label) {
@@ -16921,6 +17001,8 @@ void TFTView_320x240::updateUnreadMessages(void)
                             unreadMessages > 0 ? 6 : 0, 0);
         }
     }
+    // The PIN pad still wants the COUNT only - blank when there is nothing. A permanent
+    // "Notifications" on a keypad is noise, and it opens nothing from there.
     if (lockpad_unread_label)
         lv_label_set_text(lockpad_unread_label, top);
 }
