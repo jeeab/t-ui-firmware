@@ -8,6 +8,11 @@
 
 PacketAPI *packetAPI = nullptr;
 
+// The size of ONE queued packet, so the queue depth can be turned into bytes instead of
+// guessed at. DataPacket holds a unique_ptr to a heap-allocated copy of this struct, so the
+// real cost per entry is this plus two small allocation headers plus the deque node.
+extern "C" uint32_t tdeck_pktq_itemsz(void) { return (uint32_t)sizeof(meshtastic_FromRadio); }
+
 PacketAPI *PacketAPI::create(PacketServer *_server)
 {
     if (!packetAPI) {
@@ -38,6 +43,12 @@ int32_t PacketAPI::runOnce()
         success = sendPacket();
     }
     success |= receivePacket();
+    // A FULL OUTBOUND QUEUE IS NOT "NOTHING TO DO". Now that the queue is bounded by a memory
+    // budget rather than by an unreachable 300 (see PacketServer.cpp), it genuinely fills
+    // during the boot node sync. Backing off to 50ms in that case would turn every boot into a
+    // crawl - come straight back instead, the moment the UI task has drained one.
+    if (!success && server && !server->available())
+        return 10;
     return success ? 10 : 50;
 }
 

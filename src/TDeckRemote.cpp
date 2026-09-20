@@ -45,6 +45,14 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h> // uxTaskGetStackHighWaterMark, for the stack figures in @@mem
 
+// Radio-to-UI packet queue (lib/.../comms/packet/PacketServer.cpp and src/mesh/api/PacketAPI.cpp):
+// how deep it is now, how deep it has ever been, the cap, and what one entry costs. Reported on
+// the @@mem line while the boot-time heap collapse is being chased.
+extern "C" uint32_t tdeck_pktq_depth(void);
+extern "C" uint32_t tdeck_pktq_peak(void);
+extern "C" uint32_t tdeck_pktq_cap(void);
+extern "C" uint32_t tdeck_pktq_itemsz(void);
+
 static const int kMaxLine = 64;
 static char s_line[kMaxLine];
 static int s_len = 0;
@@ -80,14 +88,16 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 // measurement. The tft task gets 16KB (TFT_TASK_STACK_SIZE).
                 TaskHandle_t tftT = xTaskGetHandle("tft");
                 TaskHandle_t loopT = xTaskGetHandle("loopTask");
-                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u | stack tft=%u loop=%u",
+                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u | stack tft=%u loop=%u | pktq=%u peak=%u cap=%u itemsz=%u",
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
                          tftT ? (unsigned)(uxTaskGetStackHighWaterMark(tftT) * sizeof(StackType_t)) : 0u,
-                         loopT ? (unsigned)(uxTaskGetStackHighWaterMark(loopT) * sizeof(StackType_t)) : 0u);
+                         loopT ? (unsigned)(uxTaskGetStackHighWaterMark(loopT) * sizeof(StackType_t)) : 0u,
+                         (unsigned)tdeck_pktq_depth(), (unsigned)tdeck_pktq_peak(), (unsigned)tdeck_pktq_cap(),
+                         (unsigned)tdeck_pktq_itemsz());
             } else if (!strncmp(s_line, "shot", 4)) {
                 s_cmd = 4;
             } else if (!strncmp(s_line, "get", 3)) {
