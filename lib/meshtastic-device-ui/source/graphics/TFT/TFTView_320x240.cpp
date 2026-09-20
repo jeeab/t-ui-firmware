@@ -2147,17 +2147,74 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
+    // Back, where every other screen keeps it. There is still one at the bottom of the page -
+    // handy once you have scrolled - but reaching it used to mean scrolling all 994 pixels.
+    lv_obj_t *topBack = lv_btn_create(settings_screen);
+    lv_obj_set_size(topBack, 62, 28);
+    lv_obj_align(topBack, LV_ALIGN_TOP_LEFT, 8, 4);
+    lv_obj_set_style_radius(topBack, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(topBack, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        topBack,
+        [](lv_event_t *) {
+            if (THIS->launcher_screen)
+                lv_screen_load_anim(THIS->launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+        },
+        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *topBackLbl = lv_label_create(topBack);
+    lv_label_set_text(topBackLbl, "Back");
+    lv_obj_set_style_text_font(topBackLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(topBackLbl);
+
+    // Section headings. Twenty-four rows with nothing between them is a wall of text; these
+    // are the boundaries the list already had, just made visible.
+    {
+        lv_obj_t *h = lv_label_create(settings_screen);
+        lv_label_set_text(h, "DISPLAY");
+        lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 48);
+    }
+    {
+        lv_obj_t *h = lv_label_create(settings_screen);
+        lv_label_set_text(h, "LOCATION");
+        lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 164);
+    }
+    {
+        lv_obj_t *h = lv_label_create(settings_screen);
+        lv_label_set_text(h, "SOUND");
+        lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 580);
+    }
+    {
+        lv_obj_t *h = lv_label_create(settings_screen);
+        lv_label_set_text(h, "MESH");
+        lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 666);
+    }
+    {
+        lv_obj_t *h = lv_label_create(settings_screen);
+        lv_label_set_text(h, "SYSTEM");
+        lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 758);
+    }
+
     // Everything about the lock lives on its own page now (Jake: "hint hint for putting
     // everything into a lockscreen page on the settings"). Four rows used to sit here
     // between the PIN and the brightness slider; they are one subject, so this is one row.
     lv_obj_t *lockLbl = lv_label_create(settings_screen);
     lv_label_set_text(lockLbl, "Lock screen");
     lv_obj_set_style_text_color(lockLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(lockLbl, LV_ALIGN_TOP_LEFT, 16, 52);
+    lv_obj_align(lockLbl, LV_ALIGN_TOP_LEFT, 16, 78);
 
     lv_obj_t *lockBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(lockBtn, 116, 30);
-    lv_obj_align(lockBtn, LV_ALIGN_TOP_RIGHT, -16, 46);
+    lv_obj_align(lockBtn, LV_ALIGN_TOP_RIGHT, -16, 72);
     lv_obj_set_style_radius(lockBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         lockBtn, [](lv_event_t *) { lv_async_call([](void *) { THIS->openLockSettings(); }, nullptr); },
@@ -2178,13 +2235,13 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *briLbl = lv_label_create(settings_screen);
     lv_label_set_text(briLbl, "Brightness");
     lv_obj_set_style_text_color(briLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(briLbl, LV_ALIGN_TOP_LEFT, 16, 104);
+    lv_obj_align(briLbl, LV_ALIGN_TOP_LEFT, 16, 130);
 
     lv_obj_t *briSlider = lv_slider_create(settings_screen);
     lv_slider_set_range(briSlider, 10, 255); // never let it slide fully dark
     lv_slider_set_value(briSlider, db.uiConfig.screen_brightness ? db.uiConfig.screen_brightness : 153, LV_ANIM_OFF);
     lv_obj_set_size(briSlider, 150, 14);
-    lv_obj_align(briSlider, LV_ALIGN_TOP_RIGHT, -20, 106);
+    lv_obj_align(briSlider, LV_ALIGN_TOP_RIGHT, -20, 132);
     lv_obj_add_event_cb(
         briSlider,
         [](lv_event_t *e) {
@@ -2205,12 +2262,12 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *gpsLbl = lv_label_create(settings_screen);
     lv_label_set_text(gpsLbl, "GPS");
     lv_obj_set_style_text_color(gpsLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(gpsLbl, LV_ALIGN_TOP_LEFT, 16, 142);
+    lv_obj_align(gpsLbl, LV_ALIGN_TOP_LEFT, 16, 194);
 
     gpsEnabled = tdeck_gps_get_enabled(); // reflect the firmware's current GPS state
     gps_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(gps_switch, 56, 28);
-    lv_obj_align(gps_switch, LV_ALIGN_TOP_RIGHT, -16, 136);
+    lv_obj_align(gps_switch, LV_ALIGN_TOP_RIGHT, -16, 188);
     lv_obj_set_style_bg_color(gps_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (gpsEnabled)
         lv_obj_add_state(gps_switch, LV_STATE_CHECKED);
@@ -2228,11 +2285,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *locLbl = lv_label_create(settings_screen);
     lv_label_set_text(locLbl, "Share location");
     lv_obj_set_style_text_color(locLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 176);
+    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 228);
 
     lv_obj_t *locBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(locBtn, 112, 32);
-    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 170);
+    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 222);
     lv_obj_set_style_radius(locBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         locBtn, [](lv_event_t *) { THIS->cycleLocPrecision(); }, LV_EVENT_CLICKED, NULL);
@@ -2246,23 +2303,24 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(gpsHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(gpsHint, "GPS on = always searching, even while asleep. Share location = how exactly others on the mesh see you.");
     lv_obj_set_style_text_color(gpsHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 212);
+    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 264);
 
     // ---- WiFi section ----
     lv_obj_t *wifiHdr = lv_label_create(settings_screen);
-    lv_label_set_text(wifiHdr, "WiFi");
+    lv_label_set_text(wifiHdr, "NETWORK");
     lv_obj_set_style_text_color(wifiHdr, lv_color_hex(0x0a84ff), LV_PART_MAIN);
-    lv_obj_align(wifiHdr, LV_ALIGN_TOP_LEFT, 16, 256);
+    lv_obj_set_style_text_font(wifiHdr, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(wifiHdr, LV_ALIGN_TOP_LEFT, 16, 308);
 
     // Network name -> keyboard (button shows the saved name)
     lv_obj_t *netLbl = lv_label_create(settings_screen);
     lv_label_set_text(netLbl, "Network");
     lv_obj_set_style_text_color(netLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(netLbl, LV_ALIGN_TOP_LEFT, 16, 288);
+    lv_obj_align(netLbl, LV_ALIGN_TOP_LEFT, 16, 340);
 
     lv_obj_t *netBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(netBtn, 150, 30);
-    lv_obj_align(netBtn, LV_ALIGN_TOP_RIGHT, -16, 282);
+    lv_obj_align(netBtn, LV_ALIGN_TOP_RIGHT, -16, 334);
     lv_obj_set_style_radius(netBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         netBtn, [](lv_event_t *) { THIS->wifiScanOpen(); }, LV_EVENT_CLICKED, NULL);
@@ -2277,11 +2335,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *pwLbl = lv_label_create(settings_screen);
     lv_label_set_text(pwLbl, "Password");
     lv_obj_set_style_text_color(pwLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(pwLbl, LV_ALIGN_TOP_LEFT, 16, 320);
+    lv_obj_align(pwLbl, LV_ALIGN_TOP_LEFT, 16, 372);
 
     lv_obj_t *pwBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(pwBtn, 96, 30);
-    lv_obj_align(pwBtn, LV_ALIGN_TOP_RIGHT, -16, 314);
+    lv_obj_align(pwBtn, LV_ALIGN_TOP_RIGHT, -16, 366);
     lv_obj_set_style_radius(pwBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         pwBtn, [](lv_event_t *) { THIS->wifiEntryPrompt(true); }, LV_EVENT_CLICKED, NULL);
@@ -2293,11 +2351,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *wifiLbl = lv_label_create(settings_screen);
     lv_label_set_text(wifiLbl, "Turn WiFi on");
     lv_obj_set_style_text_color(wifiLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(wifiLbl, LV_ALIGN_TOP_LEFT, 16, 356);
+    lv_obj_align(wifiLbl, LV_ALIGN_TOP_LEFT, 16, 408);
 
     wifi_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(wifi_switch, 56, 28);
-    lv_obj_align(wifi_switch, LV_ALIGN_TOP_RIGHT, -16, 350);
+    lv_obj_align(wifi_switch, LV_ALIGN_TOP_RIGHT, -16, 402);
     lv_obj_set_style_bg_color(wifi_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (db.config.network.wifi_enabled)
         lv_obj_add_state(wifi_switch, LV_STATE_CHECKED);
@@ -2314,7 +2372,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_long_mode(wifi_status_label, LV_LABEL_LONG_DOT);
     tui_one_line(wifi_status_label); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 384);
+    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 436);
     updateWifiStatus();
 
     lv_obj_t *wifiHint = lv_label_create(settings_screen);
@@ -2323,7 +2381,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(wifiHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(wifiHint, "Set the name + password, then turn WiFi on.\nIt restarts the device and pauses Bluetooth.");
     lv_obj_set_style_text_color(wifiHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 408);
+    lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 460);
 
     // refresh the status line every couple seconds while this screen is up
     wifi_status_timer = lv_timer_create([](lv_timer_t *) { THIS->updateWifiStatus(); }, 2000, NULL);
@@ -2332,11 +2390,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shareLbl = lv_label_create(settings_screen);
     lv_label_set_text(shareLbl, "Share files (Wi-Fi)");
     lv_obj_set_style_text_color(shareLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shareLbl, LV_ALIGN_TOP_LEFT, 16, 450);
+    lv_obj_align(shareLbl, LV_ALIGN_TOP_LEFT, 16, 502);
 
     lv_obj_t *shareBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(shareBtn, 96, 30);
-    lv_obj_align(shareBtn, LV_ALIGN_TOP_RIGHT, -16, 444);
+    lv_obj_align(shareBtn, LV_ALIGN_TOP_RIGHT, -16, 496);
     lv_obj_set_style_radius(shareBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         shareBtn, [](lv_event_t *) { THIS->openFileShare(); }, LV_EVENT_CLICKED, NULL);
@@ -2349,11 +2407,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *toLbl = lv_label_create(settings_screen);
     lv_label_set_text(toLbl, "Screen timeout");
     lv_obj_set_style_text_color(toLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 490);
+    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 542);
 
     lv_obj_t *toBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(toBtn, 112, 32);
-    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 484);
+    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 536);
     lv_obj_set_style_radius(toBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         toBtn, [](lv_event_t *) { THIS->cycleScreenTimeout(); }, LV_EVENT_CLICKED, NULL);
@@ -2365,10 +2423,10 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *sndLbl = lv_label_create(settings_screen);
     lv_label_set_text(sndLbl, "Sound");
     lv_obj_set_style_text_color(sndLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 532);
+    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 610);
 
     mute_switch = lv_switch_create(settings_screen);
-    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 526);
+    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 604);
     if (tdeck_sound_get_enabled())
         lv_obj_add_state(mute_switch, LV_STATE_CHECKED); // switch ON = sound ON
     lv_obj_add_event_cb(
@@ -2386,7 +2444,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(sndHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(sndHint, "Off = silence everything, including message alerts.");
     lv_obj_set_style_text_color(sndHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 560);
+    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 638);
 
     // "Add channel" row — reads a Meshtastic channel link from /channel.txt on the card.
     // Typing a 150-character link on the thumb keyboard isn't realistic, and there's no
@@ -2394,11 +2452,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *chLbl = lv_label_create(settings_screen);
     lv_label_set_text(chLbl, "Add channel");
     lv_obj_set_style_text_color(chLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 592);
+    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 696);
 
     lv_obj_t *chBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(chBtn, 110, 30);
-    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 588);
+    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 692);
     lv_obj_set_style_radius(chBtn, 8, LV_PART_MAIN);
     lv_obj_t *chBtnLbl = lv_label_create(chBtn);
     lv_obj_set_style_text_font(chBtnLbl, &ui_font_montserrat_12, LV_PART_MAIN);
@@ -2411,7 +2469,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(channel_import_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(channel_import_label, "Put the channel link in channel.txt on the card, then tap.");
     lv_obj_set_style_text_color(channel_import_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 622);
+    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 726);
 
     lv_obj_add_event_cb(
         chBtn, [](lv_event_t *) { THIS->importChannelFromCard(); }, LV_EVENT_CLICKED, NULL);
@@ -2422,7 +2480,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *tzLbl = lv_label_create(settings_screen);
     lv_label_set_text(tzLbl, "Time zone");
     lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 658);
+    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 788);
 
     // When no zone is set the device silently runs on GMT. Showing the list's first entry in
     // that case made it look like Pacific was already chosen while the clock was really on
@@ -2436,7 +2494,7 @@ void TFTView_320x240::createSettingsScreen(void)
                                           : "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
                                             "UTC\nUK\nCentral Europe");
     lv_obj_set_width(tzDd, 150);
-    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 652);
+    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 782);
     lv_dropdown_set_selected(tzDd, tzUnset ? 0 : (uint32_t)tzCur);
     // Keep the open list on-screen: this row sits at the bottom of a tall scrolling screen,
     // so let it drop upward rather than off the end.
@@ -2462,11 +2520,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *clkLbl = lv_label_create(settings_screen);
     lv_label_set_text(clkLbl, "24-hour clock");
     lv_obj_set_style_text_color(clkLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 694);
+    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 824);
 
     lv_obj_t *clk_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(clk_switch, 56, 28);
-    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 688);
+    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 818);
     lv_obj_set_style_bg_color(clk_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (!tdeck_clock_get_12h()) // the switch reads "24-hour", the setting stores "12-hour"
         lv_obj_add_state(clk_switch, LV_STATE_CHECKED);
@@ -2491,7 +2549,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *kbdLbl = lv_label_create(settings_screen);
     lv_label_set_text(kbdLbl, "Keyboard light");
     lv_obj_set_style_text_color(kbdLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 732);
+    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 862);
 
     lv_obj_t *kbdHint = lv_label_create(settings_screen);
     lv_obj_set_width(kbdHint, 288);
@@ -2499,7 +2557,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(kbdHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(kbdHint, "Press Alt + B to turn the keyboard backlight on or off.");
     lv_obj_set_style_text_color(kbdHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 756);
+    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 886);
 
     // The two trackball switches that used to sit here (roll-to-navigate and click-to-select)
     // are gone. They promised something the firmware cannot currently deliver: navigation needs
@@ -2513,7 +2571,7 @@ void TFTView_320x240::createSettingsScreen(void)
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 934);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 1064);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2537,7 +2595,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 978);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1108);
 
     // "Send my location" - Jake, 2026-09-18: "manua share location and info button?"
     //
@@ -2549,11 +2607,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shareNowLbl = lv_label_create(settings_screen);
     lv_label_set_text(shareNowLbl, "Send my location");
     lv_obj_set_style_text_color(shareNowLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 798);
+    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 928);
 
     lv_obj_t *shareNowBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(shareNowBtn, 116, 30);
-    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 794);
+    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 924);
     lv_obj_set_style_radius(shareNowBtn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shareNowBtn, lv_color_hex(0x30d158), LV_PART_MAIN);
     lv_obj_t *shareNowBtnLbl = lv_label_create(shareNowBtn);
@@ -2569,7 +2627,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(share_now_hint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(share_now_hint, "Broadcasts where you are right now, once.");
     lv_obj_set_style_text_color(share_now_hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 824);
+    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 954);
 
     // "Screenshot" - Jake, 2026-09-18: "debug: screen shot thar we can both trigger. saves
     // to sd". Five seconds of countdown, so there is time to leave Settings and get to the
@@ -2578,11 +2636,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shotLbl = lv_label_create(settings_screen);
     lv_label_set_text(shotLbl, "Screenshot");
     lv_obj_set_style_text_color(shotLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 862);
+    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 992);
 
     shot_btn = lv_btn_create(settings_screen);
     lv_obj_set_size(shot_btn, 116, 30);
-    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 858);
+    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 988);
     lv_obj_set_style_radius(shot_btn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shot_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
     shot_btn_label = lv_label_create(shot_btn);
@@ -2598,7 +2656,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(shot_hint_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(shot_hint_label, "Tap, then go to the screen you want. Saved to /shots on the card.");
     lv_obj_set_style_text_color(shot_hint_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 888);
+    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 1018);
 }
 
 /**
