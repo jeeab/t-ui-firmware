@@ -1,5 +1,6 @@
 #if HAS_TFT && defined(VIEW_320x240) || defined(VIEW_240x320)
 
+#include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "graphics/view/TFT/TFTView_320x240.h"
 #include "Arduino.h"
 #include "graphics/common/BatteryLevel.h"
@@ -11,6 +12,7 @@
 #include "graphics/map/MapPanel.h"
 #include "graphics/map/TileProvider.h"
 #include "graphics/map/URLService.h"
+#include "graphics/view/TFT/LockWidgets.h" // the three lock-screen widgets
 #include "graphics/view/TFT/Themes.h"
 #include "images.h"
 #include "input/InputDriver.h"
@@ -79,6 +81,10 @@ extern "C" bool tdeck_get_mesh_enabled(void);
 extern "C" uint32_t tdeck_gps_num_sats(void);
 extern "C" bool tdeck_gps_has_lock(void);
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
+// Node bridge (src/TDeckNodesBridge.cpp), so the pins search can find people too.
+extern "C" int tdeck_nodes_list(uint32_t *out, int maxN);
+extern "C" const char *tdeck_node_name(uint32_t num);
+extern "C" bool tdeck_node_position(uint32_t num, int32_t *latI, int32_t *lonI);
 extern "C" uint32_t tdeck_gps_dop(void); // PDOP x100, 0 = unknown
 // GPS on/off + check-interval control bridge (src/TDeckGpsControl.cpp) — applied
 // live with no reboot.
@@ -94,6 +100,13 @@ extern "C" void tdeck_lock_set_enabled(bool en);
 // How long after locking before the PIN is asked for again (TDeckLockGrace.cpp). 0 = always ask.
 extern "C" uint32_t tdeck_lock_grace_secs(void);
 extern "C" void tdeck_lock_set_grace_secs(uint32_t secs);
+// Lock settings (src/TDeckLockPrefs.cpp). Mode: 0 Off, 1 Swipe, 2 PIN.
+extern "C" int tdeck_lock_mode(void);
+extern "C" void tdeck_lock_set_mode(int mode);
+extern "C" int tdeck_lock_widget(void);
+extern "C" void tdeck_lock_set_widget(int w);
+extern "C" uint32_t tdeck_lock_wx_minutes(void);
+extern "C" void tdeck_lock_set_wx_minutes(uint32_t mins);
 // Screenshot (src/TDeckScreenshot.cpp): arm it, then ask what happened.
 extern "C" void tdeck_shot_begin(void);
 extern "C" bool tdeck_shot_capturing(void);
@@ -1037,6 +1050,23 @@ extern "C" bool tdeck_lockscreen_active(void)
     return objects.lock_screen && lv_screen_active() == objects.lock_screen;
 }
 
+// "Is this device locked", as opposed to "is the keypad the screen you are looking at".
+// The Notifications page can now be opened FROM the lock screen, so something has to be able
+// to tell that the code has not been given yet - otherwise a notification row would be a way
+// straight into the conversation it came from, and the lock would be decorative.
+//
+// Static member, not a free function: lockState is private and instance() is too, so a free
+// function can reach neither. Same reason as tuiOpenChatWith and the rest beside it.
+bool TFTView_320x240::tuiDeviceLocked(void)
+{
+    return instance() && instance()->lockState != LOCK_NONE;
+}
+
+extern "C" bool tdeck_device_locked(void)
+{
+    return TFTView_320x240::tuiDeviceLocked();
+}
+
 static void tdeckCollectFocusables(lv_obj_t *parent, lv_group_t *g, int depth = 0)
 {
     if (!parent || depth > 6)
@@ -1408,7 +1438,10 @@ void TFTView_320x240::createLauncher(void)
     // Require the PIN at boot. A code is always in effect (default 1234 until the user sets
     // their own), so effectiveLockPin() is non-zero and the device boots locked. Reuses the
     // normal unlock path; bootHome above keeps the pad up through the config-sync window.
-    if (effectiveLockPin() != 0) {
+    if (tdeck_lock_mode() == 1) {
+        // Swipe: the glance is the whole lock. No keypad at boot or ever.
+        showLockGlance();
+    } else if (effectiveLockPin() != 0) {
         lockState = LOCK_ENTRY;
         lockLen = 0;
         lockDigits[0] = 0;
@@ -1876,6 +1909,7 @@ void TFTView_320x240::openArrange(void)
         lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_width(name, 180);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        tui_one_line(name); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(name, LV_ALIGN_LEFT_MID, 12, 0);
 
         lv_obj_t *up = lv_btn_create(row);
@@ -1997,99 +2031,44 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    // (The old "Mesh radio" kill-switch row was removed at Jake's request — mesh just stays on.
-    // setMeshEnabled/tdeck bridge remain, null-guarded on mesh_switch, if it ever comes back.)
-
-    // "Lock PIN" row — opens the keypad in set mode to choose a new PIN
-    lv_obj_t *pinLbl = lv_label_create(settings_screen);
-    lv_label_set_text(pinLbl, "Lock PIN");
-    lv_obj_set_style_text_color(pinLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(pinLbl, LV_ALIGN_TOP_LEFT, 16, 52);
-
-    lv_obj_t *pinBtn = lv_btn_create(settings_screen);
-    lv_obj_set_size(pinBtn, 96, 30);
-    lv_obj_align(pinBtn, LV_ALIGN_TOP_RIGHT, -16, 46);
-    lv_obj_set_style_radius(pinBtn, 8, LV_PART_MAIN);
-    lv_obj_add_event_cb(
-        pinBtn, [](lv_event_t *e) { THIS->showLockPad(true); }, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *pinBtnLbl = lv_label_create(pinBtn);
-    lv_label_set_text(pinBtnLbl, "Change");
-    lv_obj_center(pinBtnLbl);
-
-    // "Lock screen" on/off, directly under the PIN row it belongs with. Off = the device
-    // never shows the PIN pad (boots straight to Home; a double-click on Home still sleeps
-    // the screen, it just wakes back to Home). The idle screen-dim is unaffected. Persists
-    // in NVS (src/TDeckLockControl.cpp); default on, so untouched devices don't change.
+    // Everything about the lock lives on its own page now (Jake: "hint hint for putting
+    // everything into a lockscreen page on the settings"). Four rows used to sit here
+    // between the PIN and the brightness slider; they are one subject, so this is one row.
     lv_obj_t *lockLbl = lv_label_create(settings_screen);
     lv_label_set_text(lockLbl, "Lock screen");
     lv_obj_set_style_text_color(lockLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(lockLbl, LV_ALIGN_TOP_LEFT, 16, 84);
+    lv_obj_align(lockLbl, LV_ALIGN_TOP_LEFT, 16, 52);
 
-    lv_obj_t *lock_switch = lv_switch_create(settings_screen);
-    lv_obj_set_size(lock_switch, 56, 28);
-    lv_obj_align(lock_switch, LV_ALIGN_TOP_RIGHT, -16, 78);
-    lv_obj_set_style_bg_color(lock_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    if (tdeck_lock_enabled())
-        lv_obj_add_state(lock_switch, LV_STATE_CHECKED);
+    lv_obj_t *lockBtn = lv_btn_create(settings_screen);
+    lv_obj_set_size(lockBtn, 116, 30);
+    lv_obj_align(lockBtn, LV_ALIGN_TOP_RIGHT, -16, 46);
+    lv_obj_set_style_radius(lockBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
-        lock_switch,
-        [](lv_event_t *e) {
-            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
-            tdeck_lock_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));
-        },
-        LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t *pinHint = lv_label_create(settings_screen);
-    lv_obj_set_width(pinHint, 288);
-    lv_label_set_long_mode(pinHint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_font(pinHint, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_label_set_text(pinHint, "Double-click Home to lock/sleep. Lock screen off = no PIN. Default PIN 1234.");
-    lv_obj_set_style_text_color(pinHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(pinHint, LV_ALIGN_TOP_LEFT, 16, 112);
-
-    // "Ask for PIN" row - Jake, 2026-09-18: "lock screen. setting for amount of time aftwe
-    // lock/sleep for it to require a pin unlock." Sliding to unlock always happens; this
-    // decides whether sliding then lands on the keypad. A plain cycling button rather than a
-    // dropdown: lv_roller/lv_dropdown open a list that has caused trouble on this screen, and
-    // there are only five sensible answers. Default "Always", so nothing changes unless asked.
-    lv_obj_t *graceLbl = lv_label_create(settings_screen);
-    lv_label_set_text(graceLbl, "Ask for PIN");
-    lv_obj_set_style_text_color(graceLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(graceLbl, LV_ALIGN_TOP_LEFT, 16, 124);
-
-    lock_grace_btn = lv_btn_create(settings_screen);
-    lv_obj_set_size(lock_grace_btn, 116, 30);
-    lv_obj_align(lock_grace_btn, LV_ALIGN_TOP_RIGHT, -16, 120);
-    lv_obj_set_style_radius(lock_grace_btn, 8, LV_PART_MAIN);
-    lock_grace_label = lv_label_create(lock_grace_btn);
-    lv_obj_set_style_text_font(lock_grace_label, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_center(lock_grace_label);
-    updateLockGraceLabel();
-    lv_obj_add_event_cb(
-        lock_grace_btn,
-        [](lv_event_t *) {
-            static const uint32_t kSteps[] = {0, 60, 300, 900, 3600};
-            const uint32_t cur = tdeck_lock_grace_secs();
-            int at = 0;
-            for (int i = 0; i < 5; i++)
-                if (kSteps[i] == cur)
-                    at = i;
-            tdeck_lock_set_grace_secs(kSteps[(at + 1) % 5]);
-            THIS->updateLockGraceLabel();
-        },
+        lockBtn, [](lv_event_t *) { lv_async_call([](void *) { THIS->openLockSettings(); }, nullptr); },
         LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lockBtnLbl = lv_label_create(lockBtn);
+    lv_label_set_text(lockBtnLbl, "Open");
+    lv_obj_center(lockBtnLbl);
+
+
+    // (The old "Mesh radio" kill-switch row was removed at Jake's request — mesh just stays on.
+    // setMeshEnabled/tdeck bridge remain, null-guarded on mesh_switch, if it ever comes back.)
+
+
+
+
 
     // "Brightness" row — live slider; persisted on release
     lv_obj_t *briLbl = lv_label_create(settings_screen);
     lv_label_set_text(briLbl, "Brightness");
     lv_obj_set_style_text_color(briLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(briLbl, LV_ALIGN_TOP_LEFT, 16, 200);
+    lv_obj_align(briLbl, LV_ALIGN_TOP_LEFT, 16, 104);
 
     lv_obj_t *briSlider = lv_slider_create(settings_screen);
     lv_slider_set_range(briSlider, 10, 255); // never let it slide fully dark
     lv_slider_set_value(briSlider, db.uiConfig.screen_brightness ? db.uiConfig.screen_brightness : 153, LV_ANIM_OFF);
     lv_obj_set_size(briSlider, 150, 14);
-    lv_obj_align(briSlider, LV_ALIGN_TOP_RIGHT, -20, 202);
+    lv_obj_align(briSlider, LV_ALIGN_TOP_RIGHT, -20, 106);
     lv_obj_add_event_cb(
         briSlider,
         [](lv_event_t *e) {
@@ -2110,12 +2089,12 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *gpsLbl = lv_label_create(settings_screen);
     lv_label_set_text(gpsLbl, "GPS");
     lv_obj_set_style_text_color(gpsLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(gpsLbl, LV_ALIGN_TOP_LEFT, 16, 238);
+    lv_obj_align(gpsLbl, LV_ALIGN_TOP_LEFT, 16, 142);
 
     gpsEnabled = tdeck_gps_get_enabled(); // reflect the firmware's current GPS state
     gps_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(gps_switch, 56, 28);
-    lv_obj_align(gps_switch, LV_ALIGN_TOP_RIGHT, -16, 232);
+    lv_obj_align(gps_switch, LV_ALIGN_TOP_RIGHT, -16, 136);
     lv_obj_set_style_bg_color(gps_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (gpsEnabled)
         lv_obj_add_state(gps_switch, LV_STATE_CHECKED);
@@ -2133,11 +2112,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *locLbl = lv_label_create(settings_screen);
     lv_label_set_text(locLbl, "Share location");
     lv_obj_set_style_text_color(locLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 272);
+    lv_obj_align(locLbl, LV_ALIGN_TOP_LEFT, 16, 176);
 
     lv_obj_t *locBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(locBtn, 112, 32);
-    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 266);
+    lv_obj_align(locBtn, LV_ALIGN_TOP_RIGHT, -16, 170);
     lv_obj_set_style_radius(locBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         locBtn, [](lv_event_t *) { THIS->cycleLocPrecision(); }, LV_EVENT_CLICKED, NULL);
@@ -2151,29 +2130,30 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(gpsHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(gpsHint, "GPS on = always searching, even while asleep. Share location = how exactly others on the mesh see you.");
     lv_obj_set_style_text_color(gpsHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 308);
+    lv_obj_align(gpsHint, LV_ALIGN_TOP_LEFT, 16, 212);
 
     // ---- WiFi section ----
     lv_obj_t *wifiHdr = lv_label_create(settings_screen);
     lv_label_set_text(wifiHdr, "WiFi");
     lv_obj_set_style_text_color(wifiHdr, lv_color_hex(0x0a84ff), LV_PART_MAIN);
-    lv_obj_align(wifiHdr, LV_ALIGN_TOP_LEFT, 16, 352);
+    lv_obj_align(wifiHdr, LV_ALIGN_TOP_LEFT, 16, 256);
 
     // Network name -> keyboard (button shows the saved name)
     lv_obj_t *netLbl = lv_label_create(settings_screen);
     lv_label_set_text(netLbl, "Network");
     lv_obj_set_style_text_color(netLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(netLbl, LV_ALIGN_TOP_LEFT, 16, 384);
+    lv_obj_align(netLbl, LV_ALIGN_TOP_LEFT, 16, 288);
 
     lv_obj_t *netBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(netBtn, 150, 30);
-    lv_obj_align(netBtn, LV_ALIGN_TOP_RIGHT, -16, 378);
+    lv_obj_align(netBtn, LV_ALIGN_TOP_RIGHT, -16, 282);
     lv_obj_set_style_radius(netBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         netBtn, [](lv_event_t *) { THIS->wifiScanOpen(); }, LV_EVENT_CLICKED, NULL);
     wifi_net_btn_lbl = lv_label_create(netBtn);
     lv_obj_set_width(wifi_net_btn_lbl, 134);
     lv_label_set_long_mode(wifi_net_btn_lbl, LV_LABEL_LONG_DOT);
+    tui_one_line(wifi_net_btn_lbl); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_center(wifi_net_btn_lbl);
     updateWifiNetLabel();
 
@@ -2181,11 +2161,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *pwLbl = lv_label_create(settings_screen);
     lv_label_set_text(pwLbl, "Password");
     lv_obj_set_style_text_color(pwLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(pwLbl, LV_ALIGN_TOP_LEFT, 16, 416);
+    lv_obj_align(pwLbl, LV_ALIGN_TOP_LEFT, 16, 320);
 
     lv_obj_t *pwBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(pwBtn, 96, 30);
-    lv_obj_align(pwBtn, LV_ALIGN_TOP_RIGHT, -16, 410);
+    lv_obj_align(pwBtn, LV_ALIGN_TOP_RIGHT, -16, 314);
     lv_obj_set_style_radius(pwBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         pwBtn, [](lv_event_t *) { THIS->wifiEntryPrompt(true); }, LV_EVENT_CLICKED, NULL);
@@ -2197,11 +2177,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *wifiLbl = lv_label_create(settings_screen);
     lv_label_set_text(wifiLbl, "Turn WiFi on");
     lv_obj_set_style_text_color(wifiLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(wifiLbl, LV_ALIGN_TOP_LEFT, 16, 452);
+    lv_obj_align(wifiLbl, LV_ALIGN_TOP_LEFT, 16, 356);
 
     wifi_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(wifi_switch, 56, 28);
-    lv_obj_align(wifi_switch, LV_ALIGN_TOP_RIGHT, -16, 446);
+    lv_obj_align(wifi_switch, LV_ALIGN_TOP_RIGHT, -16, 350);
     lv_obj_set_style_bg_color(wifi_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (db.config.network.wifi_enabled)
         lv_obj_add_state(wifi_switch, LV_STATE_CHECKED);
@@ -2216,8 +2196,9 @@ void TFTView_320x240::createSettingsScreen(void)
     wifi_status_label = lv_label_create(settings_screen);
     lv_obj_set_width(wifi_status_label, 288);
     lv_label_set_long_mode(wifi_status_label, LV_LABEL_LONG_DOT);
+    tui_one_line(wifi_status_label); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 480);
+    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 384);
     updateWifiStatus();
 
     lv_obj_t *wifiHint = lv_label_create(settings_screen);
@@ -2226,7 +2207,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(wifiHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(wifiHint, "Set the name + password, then turn WiFi on.\nIt restarts the device and pauses Bluetooth.");
     lv_obj_set_style_text_color(wifiHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 504);
+    lv_obj_align(wifiHint, LV_ALIGN_TOP_LEFT, 16, 408);
 
     // refresh the status line every couple seconds while this screen is up
     wifi_status_timer = lv_timer_create([](lv_timer_t *) { THIS->updateWifiStatus(); }, 2000, NULL);
@@ -2235,11 +2216,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shareLbl = lv_label_create(settings_screen);
     lv_label_set_text(shareLbl, "Share files (Wi-Fi)");
     lv_obj_set_style_text_color(shareLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shareLbl, LV_ALIGN_TOP_LEFT, 16, 546);
+    lv_obj_align(shareLbl, LV_ALIGN_TOP_LEFT, 16, 450);
 
     lv_obj_t *shareBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(shareBtn, 96, 30);
-    lv_obj_align(shareBtn, LV_ALIGN_TOP_RIGHT, -16, 540);
+    lv_obj_align(shareBtn, LV_ALIGN_TOP_RIGHT, -16, 444);
     lv_obj_set_style_radius(shareBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         shareBtn, [](lv_event_t *) { THIS->openFileShare(); }, LV_EVENT_CLICKED, NULL);
@@ -2252,11 +2233,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *toLbl = lv_label_create(settings_screen);
     lv_label_set_text(toLbl, "Screen timeout");
     lv_obj_set_style_text_color(toLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 586);
+    lv_obj_align(toLbl, LV_ALIGN_TOP_LEFT, 16, 490);
 
     lv_obj_t *toBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(toBtn, 112, 32);
-    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 580);
+    lv_obj_align(toBtn, LV_ALIGN_TOP_RIGHT, -16, 484);
     lv_obj_set_style_radius(toBtn, 8, LV_PART_MAIN);
     lv_obj_add_event_cb(
         toBtn, [](lv_event_t *) { THIS->cycleScreenTimeout(); }, LV_EVENT_CLICKED, NULL);
@@ -2268,10 +2249,10 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *sndLbl = lv_label_create(settings_screen);
     lv_label_set_text(sndLbl, "Sound");
     lv_obj_set_style_text_color(sndLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 628);
+    lv_obj_align(sndLbl, LV_ALIGN_TOP_LEFT, 16, 532);
 
     mute_switch = lv_switch_create(settings_screen);
-    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 622);
+    lv_obj_align(mute_switch, LV_ALIGN_TOP_RIGHT, -16, 526);
     if (tdeck_sound_get_enabled())
         lv_obj_add_state(mute_switch, LV_STATE_CHECKED); // switch ON = sound ON
     lv_obj_add_event_cb(
@@ -2289,7 +2270,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(sndHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(sndHint, "Off = silence everything, including message alerts.");
     lv_obj_set_style_text_color(sndHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 656);
+    lv_obj_align(sndHint, LV_ALIGN_TOP_LEFT, 16, 560);
 
     // "Add channel" row — reads a Meshtastic channel link from /channel.txt on the card.
     // Typing a 150-character link on the thumb keyboard isn't realistic, and there's no
@@ -2297,11 +2278,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *chLbl = lv_label_create(settings_screen);
     lv_label_set_text(chLbl, "Add channel");
     lv_obj_set_style_text_color(chLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 688);
+    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 592);
 
     lv_obj_t *chBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(chBtn, 110, 30);
-    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 684);
+    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 588);
     lv_obj_set_style_radius(chBtn, 8, LV_PART_MAIN);
     lv_obj_t *chBtnLbl = lv_label_create(chBtn);
     lv_obj_set_style_text_font(chBtnLbl, &ui_font_montserrat_12, LV_PART_MAIN);
@@ -2314,7 +2295,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(channel_import_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(channel_import_label, "Put the channel link in channel.txt on the card, then tap.");
     lv_obj_set_style_text_color(channel_import_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 718);
+    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 622);
 
     lv_obj_add_event_cb(
         chBtn, [](lv_event_t *) { THIS->importChannelFromCard(); }, LV_EVENT_CLICKED, NULL);
@@ -2325,7 +2306,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *tzLbl = lv_label_create(settings_screen);
     lv_label_set_text(tzLbl, "Time zone");
     lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 754);
+    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 658);
 
     // When no zone is set the device silently runs on GMT. Showing the list's first entry in
     // that case made it look like Pacific was already chosen while the clock was really on
@@ -2339,7 +2320,7 @@ void TFTView_320x240::createSettingsScreen(void)
                                           : "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
                                             "UTC\nUK\nCentral Europe");
     lv_obj_set_width(tzDd, 150);
-    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 748);
+    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 652);
     lv_dropdown_set_selected(tzDd, tzUnset ? 0 : (uint32_t)tzCur);
     // Keep the open list on-screen: this row sits at the bottom of a tall scrolling screen,
     // so let it drop upward rather than off the end.
@@ -2365,11 +2346,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *clkLbl = lv_label_create(settings_screen);
     lv_label_set_text(clkLbl, "24-hour clock");
     lv_obj_set_style_text_color(clkLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 790);
+    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 694);
 
     lv_obj_t *clk_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(clk_switch, 56, 28);
-    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 784);
+    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 688);
     lv_obj_set_style_bg_color(clk_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (!tdeck_clock_get_12h()) // the switch reads "24-hour", the setting stores "12-hour"
         lv_obj_add_state(clk_switch, LV_STATE_CHECKED);
@@ -2394,7 +2375,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *kbdLbl = lv_label_create(settings_screen);
     lv_label_set_text(kbdLbl, "Keyboard light");
     lv_obj_set_style_text_color(kbdLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 828);
+    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 732);
 
     lv_obj_t *kbdHint = lv_label_create(settings_screen);
     lv_obj_set_width(kbdHint, 288);
@@ -2402,7 +2383,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(kbdHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(kbdHint, "Press Alt + B to turn the keyboard backlight on or off.");
     lv_obj_set_style_text_color(kbdHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 852);
+    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 756);
 
     // The two trackball switches that used to sit here (roll-to-navigate and click-to-select)
     // are gone. They promised something the firmware cannot currently deliver: navigation needs
@@ -2416,7 +2397,7 @@ void TFTView_320x240::createSettingsScreen(void)
     // Back to the grid
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 1030);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 934);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2440,7 +2421,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1074);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 978);
 
     // "Send my location" - Jake, 2026-09-18: "manua share location and info button?"
     //
@@ -2452,11 +2433,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shareNowLbl = lv_label_create(settings_screen);
     lv_label_set_text(shareNowLbl, "Send my location");
     lv_obj_set_style_text_color(shareNowLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 894);
+    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 798);
 
     lv_obj_t *shareNowBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(shareNowBtn, 116, 30);
-    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 890);
+    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 794);
     lv_obj_set_style_radius(shareNowBtn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shareNowBtn, lv_color_hex(0x30d158), LV_PART_MAIN);
     lv_obj_t *shareNowBtnLbl = lv_label_create(shareNowBtn);
@@ -2472,7 +2453,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(share_now_hint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(share_now_hint, "Broadcasts where you are right now, once.");
     lv_obj_set_style_text_color(share_now_hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 920);
+    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 824);
 
     // "Screenshot" - Jake, 2026-09-18: "debug: screen shot thar we can both trigger. saves
     // to sd". Five seconds of countdown, so there is time to leave Settings and get to the
@@ -2481,11 +2462,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shotLbl = lv_label_create(settings_screen);
     lv_label_set_text(shotLbl, "Screenshot");
     lv_obj_set_style_text_color(shotLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 958);
+    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 862);
 
     shot_btn = lv_btn_create(settings_screen);
     lv_obj_set_size(shot_btn, 116, 30);
-    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 954);
+    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 858);
     lv_obj_set_style_radius(shot_btn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shot_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
     shot_btn_label = lv_label_create(shot_btn);
@@ -2501,7 +2482,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(shot_hint_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(shot_hint_label, "Tap, then go to the screen you want. Saved to /shots on the card.");
     lv_obj_set_style_text_color(shot_hint_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 984);
+    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 888);
 }
 
 /**
@@ -4959,6 +4940,7 @@ void TFTView_320x240::getappsBuildList(void)
         lv_obj_set_style_text_font(ds, &ui_font_montserrat_12, LV_PART_MAIN);
         lv_obj_set_width(ds, 262);
         lv_label_set_long_mode(ds, LV_LABEL_LONG_DOT);
+        tui_one_line(ds); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_label_set_text(ds, a.desc);
         lv_obj_set_style_text_color(ds, lv_color_hex(0xdcdce2), LV_PART_MAIN);
         lv_obj_align(ds, LV_ALIGN_TOP_LEFT, 0, 36);
@@ -6259,6 +6241,10 @@ void TFTView_320x240::diagLog(const char *) {}
 
 void TFTView_320x240::closePinsList(void)
 {
+    // Both are children of pins_overlay and die with it; null them so a stale pointer can
+    // never be handed to lv_obj_clean() by a rebuild that arrives after the close.
+    pins_list = nullptr;
+    pins_search_ta = nullptr;
     if (pins_overlay) {
         lv_obj_delete_async(pins_overlay); // safe to call from within a child's event callback
         pins_overlay = nullptr;
@@ -6336,17 +6322,196 @@ void TFTView_320x240::openPinsList(void)
     }
     lv_obj_center(al);
 
-    lv_obj_t *list = lv_obj_create(pins_overlay);
-    lv_obj_remove_style_all(list);
-    lv_obj_set_size(list, 314, 194);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 42);
-    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(list, 6, LV_PART_MAIN);
-    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    // ---- the search box -------------------------------------------------------------------
+    // Jake's note, D5: "Map: search possible offline?" Tiles are pictures and hold no text, so
+    // searching the MAP offline cannot be done without a place-name database on the card. What
+    // he is nearly always asking - where is my camp, where is Nick - is already in memory with
+    // names and coordinates, so that is what this searches. Typed on the physical keyboard.
+    pins_search_ta = lv_textarea_create(pins_overlay);
+    lv_textarea_set_one_line(pins_search_ta, true);
+    lv_textarea_set_max_length(pins_search_ta, sizeof(pinFilter) - 1);
+    lv_textarea_set_placeholder_text(pins_search_ta, "Find a pin or a node");
+    lv_textarea_set_text(pins_search_ta, pinFilter); // survives the Nodes toggle rebuilding us
+    lv_obj_set_size(pins_search_ta, 304, 34);
+    lv_obj_align(pins_search_ta, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_text_font(pins_search_ta, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        pins_search_ta,
+        [](lv_event_t *) {
+            const char *t = lv_textarea_get_text(THIS->pins_search_ta);
+            strncpy(THIS->pinFilter, t ? t : "", sizeof(THIS->pinFilter) - 1);
+            THIS->pinFilter[sizeof(THIS->pinFilter) - 1] = 0;
+            // Deferred: this handler belongs to the text box, and the rebuild empties the list
+            // beside it. They are siblings rather than parent and child, so it would probably
+            // survive - but "probably" is how this device learned to freeze mid-tap.
+            lv_async_call([](void *) { THIS->rebuildPinRows(); }, nullptr);
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+    // Focused once, with no re-focusing guard: the guard would fight the trackball every
+    // 400ms and you could never scroll the results. Tap the box to type again.
+    {
+        lv_group_t *g = lv_group_get_default();
+        if (g) {
+            lv_group_add_obj(g, pins_search_ta);
+            lv_group_focus_obj(pins_search_ta);
+        }
+    }
 
-    if (mapPins.empty()) {
+    pins_list = lv_obj_create(pins_overlay);
+    lv_obj_remove_style_all(pins_list);
+    lv_obj_set_size(pins_list, 314, 158);
+    lv_obj_align(pins_list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_flex_flow(pins_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(pins_list, 6, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(pins_list, LV_DIR_VER);
+
+    rebuildPinRows();
+}
+
+// A quiet heading inside the results, so pins and nodes do not read as one jumbled list.
+void TFTView_320x240::pinsSectionHeader(lv_obj_t *list, const char *text)
+{
+    lv_obj_t *h = lv_label_create(list);
+    lv_label_set_text(h, text);
+    lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(h, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+}
+
+// Does `hay` contain the already-lower-cased `needle`? Plain substring, no wildcards: on a
+// four-inch screen with a thumb keyboard, "camp" should just work.
+bool TFTView_320x240::nameContains(const char *hay, const char *needle)
+{
+    if (!needle[0])
+        return true;
+    if (!hay)
+        return false;
+    for (const char *h = hay; *h; h++) {
+        const char *a = h;
+        const char *b = needle;
+        while (*a && *b) {
+            const char ca = (*a >= 'A' && *a <= 'Z') ? *a + 32 : *a;
+            if (ca != *b)
+                break;
+            a++;
+            b++;
+        }
+        if (!*b)
+            return true;
+    }
+    return false;
+}
+
+// One matched node: name, how far and which way, and a Go that puts the map on it.
+void TFTView_320x240::pinsNodeRow(lv_obj_t *list, uint32_t num, const char *name, int32_t latI, int32_t lonI)
+{
+    lv_obj_t *row = lv_obj_create(list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 302, 40);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x16202c), LV_PART_MAIN); // blue-tinted: not a pin
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dot = lv_obj_create(row);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 12, 12);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_border_color(dot, lv_color_hex(0x64d2ff), LV_PART_MAIN);
+    lv_obj_set_style_border_width(dot, 2, LV_PART_MAIN);
+    lv_obj_align(dot, LV_ALIGN_LEFT_MID, 8, 0);
+
+    lv_obj_t *nm = lv_label_create(row);
+    lv_label_set_text(nm, name);
+    lv_obj_set_style_text_color(nm, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_width(nm, 140);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    tui_one_line(nm); // LONG_DOT needs a pinned height - see TuiLabel.h
+    lv_obj_align(nm, LV_ALIGN_LEFT_MID, 28, -6);
+
+    char away[40] = "";
+    awayText(latI * 1e-7, lonI * 1e-7, away, sizeof(away));
+    lv_obj_t *aw = lv_label_create(row);
+    lv_label_set_text(aw, away[0] ? away : "node");
+    lv_obj_set_style_text_font(aw, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(aw, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(aw, LV_ALIGN_LEFT_MID, 28, 10);
+
+    lv_obj_t *go = lv_btn_create(row);
+    lv_obj_set_size(go, 44, 28);
+    lv_obj_align(go, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_add_event_cb(
+        go,
+        [](lv_event_t *e) {
+            // The node number is all we carry; look the position up again when the tap lands,
+            // because a node can move between the list being drawn and the button being hit.
+            const uint32_t n = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+            lv_async_call(
+                [](void *ud) {
+                    const uint32_t nn = (uint32_t)(uintptr_t)ud;
+                    int32_t la = 0, lo = 0;
+                    if (!tdeck_node_position(nn, &la, &lo))
+                        return;
+                    THIS->closePinsList();
+                    THIS->showNodeOnUserMap(nn, la, lo);
+                },
+                (void *)(uintptr_t)n);
+        },
+        LV_EVENT_CLICKED, (void *)(uintptr_t)num);
+    lv_obj_t *gl = lv_label_create(go);
+    lv_label_set_text(gl, "Go");
+    lv_obj_set_style_text_font(gl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(gl);
+}
+
+// "1.4 mi NE" / "320 ft S", or empty when we do not know where WE are. Same arithmetic the
+// pin rows already use; pulled out so both say the same thing the same way.
+void TFTView_320x240::awayText(double lat, double lon, char *out, size_t n)
+{
+    out[0] = 0;
+    int32_t ourLat = 0, ourLon = 0;
+    if (!tdeck_gps_position(&ourLat, &ourLon))
+        return;
+    const double a = ourLat * 1e-7 * M_PI / 180.0, b = ourLon * 1e-7 * M_PI / 180.0;
+    const double c = lat * M_PI / 180.0, d = lon * M_PI / 180.0;
+    const double dLat = c - a, dLon = d - b;
+    const double hv = sin(dLat / 2) * sin(dLat / 2) + cos(a) * cos(c) * sin(dLon / 2) * sin(dLon / 2);
+    const double m = 6371000.0 * 2 * atan2(sqrt(hv), sqrt(1 - hv));
+    const double yy = sin(dLon) * cos(c), xx = cos(a) * sin(c) - sin(a) * cos(c) * cos(dLon);
+    double brg = atan2(yy, xx) * 180.0 / M_PI;
+    if (brg < 0)
+        brg += 360.0;
+    static const char *kPts[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    const char *pt = kPts[(int)((brg + 22.5) / 45.0) % 8];
+    if (m < 1609.34)
+        snprintf(out, n, "%d ft %s", (int)(m * 3.28084), pt);
+    else
+        snprintf(out, n, "%.1f mi %s", m / 1609.34, pt);
+}
+
+// The results. Split out of openPinsList so a keystroke redraws the list WITHOUT tearing down
+// the box you are typing into.
+void TFTView_320x240::rebuildPinRows(void)
+{
+
+    if (!pins_list)
+        return;
+    lv_obj_t *list = pins_list;
+    lv_obj_clean(list);
+
+    // Lower-case a string into a small buffer, so matching is case-insensitive without
+    // dragging in a locale. "camp" has to find "Camp Gate".
+    char needle[24];
+    {
+        size_t i = 0;
+        for (; pinFilter[i] && i < sizeof(needle) - 1; i++)
+            needle[i] = (pinFilter[i] >= 'A' && pinFilter[i] <= 'Z') ? pinFilter[i] + 32 : pinFilter[i];
+        needle[i] = 0;
+    }
+    const bool filtering = needle[0] != 0;
+
+    if (mapPins.empty() && !filtering) {
         lv_obj_t *empty = lv_label_create(list);
-        lv_label_set_text(empty, "No pins yet.\nTap Add pin, then tap the map.");
+        lv_label_set_text(empty, "No pins yet.\nTap Add pin, then tap the map.\n\nThe box above also finds your nodes.");
         lv_obj_set_style_text_color(empty, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         return;
     }
@@ -6368,8 +6533,12 @@ void TFTView_320x240::openPinsList(void)
         return *y != 0;
     });
 
+    int shownPins = 0;
     for (MapPin *pp : sorted) {
         MapPin &p = *pp;
+        if (filtering && !nameContains(p.label, needle))
+            continue;
+        shownPins++;
         lv_obj_t *row = lv_obj_create(list);
         lv_obj_remove_style_all(row);
         lv_obj_set_size(row, 302, 74); // share line, then the coordinates line, under the buttons
@@ -6401,6 +6570,7 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_width(name, 78); // pulled in to make room for Share; long names still ellipsize
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        tui_one_line(name); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(name, LV_ALIGN_TOP_LEFT, 30, 6);
 
         // Jake, 2026-08-26: sharing is a button now, sitting right after the name, and it flips to
@@ -6509,6 +6679,7 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_set_style_text_color(st, lv_color_hex(mine ? (shared ? 0x30d158 : 0x8e8e93) : 0x64d2ff), LV_PART_MAIN);
         lv_obj_set_width(st, 286);
         lv_label_set_long_mode(st, LV_LABEL_LONG_DOT);
+        tui_one_line(st); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(st, LV_ALIGN_LEFT_MID, 6, 0);
 
         // Jake, 2026-09-18: "more info on pins. lat, long." Six decimal places is about 11 cm,
@@ -6543,7 +6714,57 @@ void TFTView_320x240::openPinsList(void)
         lv_obj_set_style_text_color(co, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_set_width(co, 286);
         lv_label_set_long_mode(co, LV_LABEL_LONG_DOT);
+        tui_one_line(co); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(co, LV_ALIGN_TOP_LEFT, 10, 54);
+    }
+
+    // ---- nodes, but only while searching -------------------------------------------------
+    // With an empty box this screen is exactly what it always was: your pins. Type something
+    // and the people on your mesh join in, because "where is Nick" is the same question as
+    // "where is my camp" and it would be strange to answer only one of them here.
+    int shownNodes = 0, moreNodes = 0;
+    if (filtering) {
+        // 250 node numbers is a kilobyte. The tft task has a 16KB stack (measured headroom is
+        // in @@mem), so it would fit - but this runs on every keystroke, nested inside LVGL's
+        // own draw recursion, and PSRAM costs nothing for the length of one call.
+        uint32_t *nums = (uint32_t *)heap_caps_malloc(sizeof(uint32_t) * 260, MALLOC_CAP_SPIRAM);
+        if (nums) {
+            const int n = tdeck_nodes_list(nums, 260);
+            for (int i = 0; i < n; i++) {
+                int32_t nlat = 0, nlon = 0;
+                if (!tdeck_node_position(nums[i], &nlat, &nlon))
+                    continue; // no position: nothing for a MAP search to show you
+                const char *nm = tdeck_node_name(nums[i]);
+                if (!nm || !nameContains(nm, needle))
+                    continue;
+                if (shownNodes >= 12) { // a long list of near-misses is not a search result
+                    moreNodes++;
+                    continue;
+                }
+                shownNodes++;
+                if (shownNodes == 1)
+                    pinsSectionHeader(list, "Nodes");
+                pinsNodeRow(list, nums[i], nm, nlat, nlon);
+            }
+            heap_caps_free(nums);
+        }
+    }
+
+    if (filtering && shownPins == 0 && shownNodes == 0) {
+        lv_obj_t *none = lv_label_create(list);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Nothing called \"%s\".\n\nPins and nodes only - map tiles are\npictures, with no names in them.",
+                 pinFilter);
+        lv_label_set_text(none, msg);
+        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_text_font(none, &ui_font_montserrat_12, LV_PART_MAIN);
+    } else if (moreNodes) {
+        lv_obj_t *more = lv_label_create(list);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "and %d more node%s - type a bit more", moreNodes, moreNodes == 1 ? "" : "s");
+        lv_label_set_text(more, msg);
+        lv_obj_set_style_text_color(more, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_text_font(more, &ui_font_montserrat_12, LV_PART_MAIN);
     }
 
     // Deleting a shared pin still leaves us asking the mesh to drop their copies, and that has no
@@ -6601,6 +6822,7 @@ void TFTView_320x240::openSharePicker(uint32_t id)
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_set_width(title, 236);
     lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    tui_one_line(title); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 10);
 
     lv_obj_t *closeBtn = lv_btn_create(share_overlay);
@@ -6658,6 +6880,7 @@ void TFTView_320x240::openSharePicker(uint32_t id)
         lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_width(lbl, 272);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        tui_one_line(lbl); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 16, sub ? 3 : 7);
         if (sub) {
             lv_obj_t *s = lv_label_create(row);
@@ -6900,13 +7123,18 @@ void TFTView_320x240::closeRenamePin(void)
 // proven pattern the WiFi entry + Notes editor use — no on-screen (virtual) keyboard.
 void TFTView_320x240::beginTextEntry(lv_obj_t *ta)
 {
+    // ⚠️ endTextEntry() FIRST. It clears text_entry_ta as well as deleting the timer, so
+    // setting the field before calling it left text_entry_ta null - and the guard's callback
+    // checks that field before re-focusing. The guard has therefore never actually guarded
+    // anything since it was written; the rename box only kept focus because nothing on that
+    // overlay competes for it. Found while adding the pins search, 2026-09-19.
+    endTextEntry(); // never stack two guards
     text_entry_ta = ta;
     lv_group_t *g = lv_group_get_default();
     if (g) {
         lv_group_add_obj(g, ta);
         lv_group_focus_obj(ta);
     }
-    endTextEntry(); // never stack two guards
     text_entry_guard = lv_timer_create(
         [](lv_timer_t *) {
             lv_group_t *g = lv_group_get_default();
@@ -8107,10 +8335,11 @@ void TFTView_320x240::handleHomeGesture(void)
         // A code is always in effect (built-in default 1234 until the user sets their own), so
         // any wake — a deliberate lock OR an idle timeout, in any app — stops here. This is
         // the single, deterministic wake path.
-        // Waking shows the GLANCE first now - time, who has messaged, slide to unlock -
-        // and the keypad only after the slide (see lockGlanceUnlocked). With the lock
-        // switched off entirely there is nothing to glance past, so go straight in.
-        if (effectiveLockPin() != 0) {
+        // Waking shows the GLANCE - time, battery, who has messaged, slide to unlock.
+        // The keypad comes after the slide and only in PIN mode (see lockGlanceUnlocked).
+        // Keyed off the MODE, not off effectiveLockPin(): in Swipe mode there is no code,
+        // so asking "is there a PIN" would skip the glance and unlock the device outright.
+        if (tdeck_lock_mode() != 0) {
             showLockGlance();
         } else {
             lockState = LOCK_NONE;
@@ -8224,6 +8453,11 @@ void TFTView_320x240::lockDevice(void)
 
 uint32_t TFTView_320x240::effectiveLockPin(void)
 {
+    // Jake, 2026-09-19: "can i have either or, pin or swipe? ... seems like i have to
+    // have both." Only PIN mode has a code. In Swipe mode the glance still appears and
+    // still has to be slid, but nothing ever asks for four digits.
+    if (tdeck_lock_mode() != 2)
+        return 0;
     // Lock switched off in Settings -> report 0. Every gate in this file already treats 0 as
     // "no lock" (boot and wake both skip the pad on 0), so one flag checked in one place
     // disables the whole lock cleanly. Default is ON, so untouched devices are unchanged.
@@ -8515,6 +8749,13 @@ void TFTView_320x240::remoteService(void)
         else if (scr == THIS->lockpad_screen) name = "lock-pad";
         else if (scr == THIS->settings_screen) name = "settings";
         else if (scr == THIS->maps_screen) name = "maps";
+        else if (scr == THIS->lockpage_screen) name = "lock-settings";
+        // Overlays live on the top LAYER rather than being screens of their own, so the
+        // active screen is still whatever is behind them. The sweep needs to know which one
+        // it is actually looking at, so say so.
+        else if (THIS->pins_overlay) name = "pins";
+        else if (THIS->rename_overlay) name = "rename";
+        else if (THIS->share_overlay) name = "share-picker";
         // Free INTERNAL heap rides along: it is the number that predicts a crash on this
         // device, and I want to see it before asking for a screenshot, not after.
         snprintf(buf, sizeof(buf), "info screen=%s uptime=%lus lock=%d heap=%uk", name,
@@ -8538,6 +8779,34 @@ void TFTView_320x240::remoteService(void)
         THIS->handleHomeGesture();
         tdeck_remote_reply("home");
         break;
+    case 9: { // open a screen by name
+        // Deferred: several of these load a screen, and we are inside the poll timer's
+        // callback on objects that a screen change tears down.
+        static int want = 0;
+        want = x;
+        lv_async_call(
+            [](void *) {
+                switch (want) {
+                case 1: THIS->openLockSettings(); break;
+                case 2: THIS->openSettings(); break;
+                case 3: channels_open(); break;
+                case 4: nodes_open(); break;
+                case 5: notif_open(); break;
+                case 6: notes_open(); break;
+                case 7: THIS->showLockGlance(); break;
+                case 8: favorites_open(); break;
+                case 9: THIS->openMaps(); break;
+                case 10: THIS->openMaps(); lv_async_call([](void *) { THIS->openPinsList(); }, nullptr); break;
+                case 11: THIS->openGetApps(); break;
+                case 12: THIS->showLockPad(false); break;
+                default: break;
+                }
+            },
+            nullptr);
+        snprintf(buf, sizeof(buf), "open %d", x);
+        tdeck_remote_reply(buf);
+        break;
+    }
     case 8: // key
         THIS->remoteInit();
         s_remoteKey = (uint32_t)x;
@@ -8568,6 +8837,213 @@ void TFTView_320x240::remoteService(void)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Settings > Lock screen. Jake, 2026-09-19: "hint hint for putting everything into a
+// lockscreen page on the settings."
+//
+// The four lock settings used to be scattered down the main Settings list between
+// brightness and Wi-Fi. They are one subject, so they get one page, and the main list
+// gets a single row that opens it.
+//
+// Every control here is a cycling BUTTON rather than a dropdown: lv_dropdown opens a
+// list that has misbehaved on this screen before, and none of these has more than five
+// choices. One tap moves to the next, which is faster than opening a list anyway.
+// ---------------------------------------------------------------------------
+static const char *lockModeName(int m)
+{
+    switch (m) {
+    case 0:  return "Off";
+    case 1:  return "Swipe";
+    default: return "PIN";
+    }
+}
+
+static const char *lockWidgetName(int w)
+{
+    switch (w) {
+    case 0:  return "None";
+    case 1:  return "Weather";
+    case 2:  return "Satellites";
+    default: return "Sun";
+    }
+}
+
+static const char *wxPeriodName(uint32_t m)
+{
+    switch (m) {
+    case 0:   return "Never";
+    case 30:  return "30 min";
+    case 180: return "3 hours";
+    case 360: return "6 hours";
+    default:  return "1 hour";
+    }
+}
+
+void TFTView_320x240::updateLockPageLabels(void)
+{
+    if (lockpage_mode_label)
+        lv_label_set_text(lockpage_mode_label, lockModeName(tdeck_lock_mode()));
+    if (lockpage_widget_label)
+        lv_label_set_text(lockpage_widget_label, lockWidgetName(tdeck_lock_widget()));
+    if (lockpage_wx_label)
+        lv_label_set_text(lockpage_wx_label, wxPeriodName(tdeck_lock_wx_minutes()));
+    if (lockpage_grace_label) {
+        switch (tdeck_lock_grace_secs()) {
+        case 60:   lv_label_set_text(lockpage_grace_label, "After 1 min"); break;
+        case 300:  lv_label_set_text(lockpage_grace_label, "After 5 min"); break;
+        case 900:  lv_label_set_text(lockpage_grace_label, "After 15 min"); break;
+        case 3600: lv_label_set_text(lockpage_grace_label, "After 1 hour"); break;
+        default:   lv_label_set_text(lockpage_grace_label, "Always"); break;
+        }
+    }
+    // Rows that only make sense for the mode you are in. A greyed-out PIN row on a
+    // device with no PIN is a question the user should never have to answer.
+    const bool pinMode = (tdeck_lock_mode() == 2);
+    const bool weather = (tdeck_lock_widget() == 1);
+    for (auto &pair : std::initializer_list<std::pair<lv_obj_t *, bool>>{
+             {lockpage_pin_row, pinMode}, {lockpage_grace_row, pinMode}, {lockpage_wx_row, weather}}) {
+        if (!pair.first)
+            continue;
+        if (pair.second)
+            lv_obj_clear_flag(pair.first, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(pair.first, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// One row: a title on the left and a control on the right, in a container so the whole
+// row can be hidden as a unit when it does not apply.
+lv_obj_t *TFTView_320x240::lockPageRow(lv_obj_t *parent, const char *title, int y, const char *btnText,
+                                       lv_obj_t **outLabel, lv_event_cb_t cb)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 320, 40);
+    lv_obj_align(row, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(row);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_color(t, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(t, LV_ALIGN_LEFT_MID, 16, 0);
+
+    lv_obj_t *b = lv_btn_create(row);
+    lv_obj_set_size(b, 124, 30);
+    lv_obj_align(b, LV_ALIGN_RIGHT_MID, -16, 0);
+    lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, btnText);
+    lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(l);
+    if (outLabel)
+        *outLabel = l;
+    return row;
+}
+
+void TFTView_320x240::openLockSettings(void)
+{
+    if (!lockpage_screen) {
+        lockpage_screen = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(lockpage_screen, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_scroll_dir(lockpage_screen, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(lockpage_screen, LV_SCROLLBAR_MODE_AUTO);
+
+        lv_obj_t *back = lv_btn_create(lockpage_screen);
+        lv_obj_set_size(back, 54, 26);
+        lv_obj_align(back, LV_ALIGN_TOP_LEFT, 8, 5);
+        lv_obj_set_style_radius(back, 8, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(back, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            back, [](lv_event_t *) { lv_async_call([](void *) { THIS->openSettings(); }, nullptr); },
+            LV_EVENT_CLICKED, NULL);
+        lv_obj_t *bl = lv_label_create(back);
+        lv_label_set_text(bl, "Back");
+        lv_obj_set_style_text_font(bl, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_center(bl);
+
+        lv_obj_t *title = lv_label_create(lockpage_screen);
+        lv_label_set_text(title, "Lock screen");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+        int y = 44;
+        lockPageRow(lockpage_screen, "Lock", y, "PIN", &lockpage_mode_label, [](lv_event_t *) {
+            tdeck_lock_set_mode((tdeck_lock_mode() + 1) % 3);
+            THIS->updateLockPageLabels();
+        });
+        y += 42;
+        lockpage_pin_row = lockPageRow(lockpage_screen, "Change PIN", y, "Change", nullptr,
+                                       [](lv_event_t *) { THIS->showLockPad(true); });
+        y += 42;
+        lockpage_grace_row = lockPageRow(lockpage_screen, "Ask for PIN", y, "Always", &lockpage_grace_label,
+                                         [](lv_event_t *) {
+                                             static const uint32_t kSteps[] = {0, 60, 300, 900, 3600};
+                                             const uint32_t cur = tdeck_lock_grace_secs();
+                                             int at = 0;
+                                             for (int i = 0; i < 5; i++)
+                                                 if (kSteps[i] == cur)
+                                                     at = i;
+                                             tdeck_lock_set_grace_secs(kSteps[(at + 1) % 5]);
+                                             THIS->updateLockPageLabels();
+                                         });
+        y += 48;
+        lockPageRow(lockpage_screen, "Widget", y, "Sun", &lockpage_widget_label, [](lv_event_t *) {
+            tdeck_lock_set_widget((tdeck_lock_widget() + 1) % 4);
+            THIS->updateLockPageLabels();
+        });
+        y += 42;
+        lockpage_wx_row = lockPageRow(lockpage_screen, "Weather update", y, "1 hour", &lockpage_wx_label,
+                                      [](lv_event_t *) {
+                                          static const uint32_t kMins[] = {0, 30, 60, 180, 360};
+                                          const uint32_t cur = tdeck_lock_wx_minutes();
+                                          int at = 2;
+                                          for (int i = 0; i < 5; i++)
+                                              if (kMins[i] == cur)
+                                                  at = i;
+                                          tdeck_lock_set_wx_minutes(kMins[(at + 1) % 5]);
+                                          THIS->updateLockPageLabels();
+                                      });
+        y += 46;
+
+        lv_obj_t *hint = lv_label_create(lockpage_screen);
+        lv_obj_set_width(hint, 288);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(hint, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_label_set_text(hint,
+                          "Off: wakes straight to Home.  Swipe: slide to unlock, no code.  "
+                          "PIN: slide, then the keypad.\n\n"
+                          "The widget fills the lock screen when nothing needs your attention. "
+                          "Notifications take that space until you clear them.\n\n"
+                          "Weather keeps its last reading when it cannot reach the internet.");
+        lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 16, y);
+    }
+    updateLockPageLabels();
+    lv_screen_load_anim(lockpage_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+}
+
+// The lock screen. Jake designed this one himself, 2026-09-19:
+//
+//   "Let's do battery top right, clock center, 'Notifications' top left. Which turns into
+//    '1msg' or whatever when there is one. Have the notifications be a button that takes you
+//    to the notifications page."
+//
+// and, for the space underneath:
+//
+//   "give the option of 'Lockscreen widget': Weather ... Satellites connected,
+//    sundown/sunrise. Lets keep notifications prioitized on the lockscreen until you clear
+//    the notifications."
+//
+// So: a thin top row of chrome, then ONE slot in the middle that belongs to whatever matters
+// most at that moment - unread messages if there are any, otherwise the chosen widget - then
+// slide to unlock along the bottom. Nothing competes for the same space.
+//
+// ⚠️ THE UNLOCK BUTTON IS GONE. It used to sit top-right; the battery lives there now. Two
+// other ways in remain and both are deliberate: the slider, and a trackball double-click
+// (handleHomeGesture). A tap near the slider's right-hand end also lands it, because that is
+// how LVGL sliders behave - there is a PIN behind it either way.
 void TFTView_320x240::showLockGlance(void)
 {
     lockState = LOCK_GLANCE;
@@ -8579,72 +9055,97 @@ void TFTView_320x240::showLockGlance(void)
         lv_obj_set_style_bg_color(lockglance_screen, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_clear_flag(lockglance_screen, LV_OBJ_FLAG_SCROLLABLE);
 
+        // ---- top left: Notifications, which is a button ----
+        glance_notif_btn = lv_btn_create(lockglance_screen);
+        lv_obj_set_size(glance_notif_btn, 104, 26);
+        lv_obj_align(glance_notif_btn, LV_ALIGN_TOP_LEFT, 8, 6);
+        lv_obj_set_style_radius(glance_notif_btn, 8, LV_PART_MAIN);
+        lv_obj_set_style_border_width(glance_notif_btn, 1, LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            glance_notif_btn,
+            // Deferred: this handler belongs to a button on the screen that is about to be
+            // replaced. The page it opens is READ-ONLY while the device is locked - tapping a
+            // row there does not walk into the conversation, or the lock would be decorative.
+            [](lv_event_t *) { lv_async_call([](void *) { notif_open(); }, nullptr); },
+            LV_EVENT_CLICKED, NULL);
+        glance_notif_label = lv_label_create(glance_notif_btn);
+        lv_obj_set_style_text_font(glance_notif_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(glance_notif_label, "Notifications");
+        lv_obj_center(glance_notif_label);
+
+        // ---- centre: the clock ----
         glance_clock_label = lv_label_create(lockglance_screen);
         lv_obj_set_style_text_color(glance_clock_label, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_style_text_font(glance_clock_label, &ui_font_montserrat_20, LV_PART_MAIN);
-        lv_obj_align(glance_clock_label, LV_ALIGN_TOP_MID, 0, 10);
+        lv_obj_align(glance_clock_label, LV_ALIGN_TOP_MID, 0, 6);
+
+        // ---- top right: the battery, as a figure AND a cell, so it reads without being read ----
+        glance_bat_shell = lv_obj_create(lockglance_screen);
+        lv_obj_remove_style_all(glance_bat_shell);
+        lv_obj_set_size(glance_bat_shell, 24, 12);
+        lv_obj_align(glance_bat_shell, LV_ALIGN_TOP_RIGHT, -10, 13);
+        lv_obj_set_style_radius(glance_bat_shell, 3, LV_PART_MAIN);
+        lv_obj_set_style_border_color(glance_bat_shell, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_border_width(glance_bat_shell, 1, LV_PART_MAIN);
+        lv_obj_clear_flag(glance_bat_shell, LV_OBJ_FLAG_SCROLLABLE);
+        glance_bat_fill = lv_obj_create(glance_bat_shell);
+        lv_obj_remove_style_all(glance_bat_fill);
+        lv_obj_set_size(glance_bat_fill, 17, 8);
+        lv_obj_align(glance_bat_fill, LV_ALIGN_LEFT_MID, 2, 0);
+        lv_obj_set_style_radius(glance_bat_fill, 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(glance_bat_fill, LV_OPA_COVER, LV_PART_MAIN);
+        glance_bat_label = lv_label_create(lockglance_screen);
+        lv_obj_set_style_text_font(glance_bat_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(glance_bat_label, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(glance_bat_label, LV_ALIGN_TOP_RIGHT, -38, 13);
 
         glance_date_label = lv_label_create(lockglance_screen);
         lv_obj_set_style_text_color(glance_date_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_set_style_text_font(glance_date_label, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_align(glance_date_label, LV_ALIGN_TOP_MID, 0, 38);
+        lv_obj_align(glance_date_label, LV_ALIGN_TOP_MID, 0, 36);
 
+        // ---- the slot: notifications, or the widget, never both ----
         glance_list = lv_obj_create(lockglance_screen);
         lv_obj_remove_style_all(glance_list);
-        lv_obj_set_size(glance_list, 312, 122);
-        lv_obj_align(glance_list, LV_ALIGN_TOP_MID, 0, 58);
+        lv_obj_set_size(glance_list, 300, 96);
+        lv_obj_align(glance_list, LV_ALIGN_TOP_MID, 0, 62);
         lv_obj_set_flex_flow(glance_list, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(glance_list, 5, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(glance_list, 2, LV_PART_MAIN);
+        lv_obj_set_style_pad_row(glance_list, 4, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(glance_list, 0, LV_PART_MAIN);
         lv_obj_set_scroll_dir(glance_list, LV_DIR_VER);
 
-        // Slide to unlock. An lv_slider rather than a hand-rolled drag: it already handles
-        // the press, the travel and the release, and the knob cannot be flicked past the end.
+        // Slide to unlock. An lv_slider rather than a hand-rolled drag: it already handles the
+        // press, the travel and the release, and the knob cannot be flicked past the end.
         glance_slider = lv_slider_create(lockglance_screen);
-        lv_obj_set_size(glance_slider, 296, 46);
-        lv_obj_align(glance_slider, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_set_size(glance_slider, 296, 44);
+        lv_obj_align(glance_slider, LV_ALIGN_BOTTOM_MID, 0, -7);
         lv_slider_set_range(glance_slider, 0, 100);
         lv_slider_set_value(glance_slider, 0, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(glance_slider, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(glance_slider, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_border_color(glance_slider, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
         lv_obj_set_style_border_width(glance_slider, 1, LV_PART_MAIN);
-        lv_obj_set_style_radius(glance_slider, 23, LV_PART_MAIN);
-        // The filled part stays invisible: on the real thing the track does not fill in
-        // behind the knob, the knob simply travels along it.
+        lv_obj_set_style_radius(glance_slider, 22, LV_PART_MAIN);
+        // At value 0 an LVGL slider puts the knob's CENTRE on the track's left edge, so half
+        // the knob hangs off the screen. Padding on MAIN insets the travel area and brings it
+        // fully into view. Seen on the PC renderer; the build log has no opinion about this.
+        lv_obj_set_style_pad_left(glance_slider, 22, LV_PART_MAIN);
+        lv_obj_set_style_pad_right(glance_slider, 22, LV_PART_MAIN);
+        // The filled part stays invisible: on the real thing the track does not fill in behind
+        // the knob, the knob simply travels along it.
         lv_obj_set_style_bg_opa(glance_slider, LV_OPA_TRANSP, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(glance_slider, lv_color_hex(0xf2f2f7), LV_PART_KNOB);
         lv_obj_set_style_radius(glance_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-        // ⚠️ NOT pad_all 15. An LVGL slider knob is sized from the TRACK's height plus its
-        // own padding, so 15 on a 46px track gave a 76px knob - taller than the track it sits
-        // in, hanging off the left edge of the screen and covering the notification above it.
-        // Caught by rendering the screen on the PC (C:	dsim); it is invisible in a build log.
+        // ⚠️ NOT pad_all 15. An LVGL slider knob is sized from the TRACK's height plus its own
+        // padding, so 15 on a 44px track gave a 74px knob - taller than the track it sits in,
+        // hanging off the left edge and covering the notification above it. Caught by rendering
+        // the screen on the PC (C:\tdsim); it is invisible in a build log.
         lv_obj_set_style_pad_all(glance_slider, -4, LV_PART_KNOB);
 
         glance_slide_label = lv_label_create(lockglance_screen);
         lv_label_set_text(glance_slide_label, "slide to unlock");
         lv_obj_set_style_text_color(glance_slide_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_align(glance_slide_label, LV_ALIGN_BOTTOM_MID, 14, -22);
-
-        // ⚠️ A PLAIN BUTTON AS WELL AS THE SLIDER, DELIBERATELY. This screen now stands
-        // between Jake and his own device: if the slider misbehaves on real hardware, a gesture
-        // is not an acceptable only way in. A trackball double-click is the third way (see
-        // handleHomeGesture), but a visible button needs nothing explained and nothing working
-        // except a tap. It is also what he asked for first - "an 'unlock' button(or ball click)"
-        // - before he suggested the swipe.
-        lv_obj_t *unlockBtn = lv_btn_create(lockglance_screen);
-        lv_obj_set_size(unlockBtn, 74, 30);
-        lv_obj_align(unlockBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
-        lv_obj_set_style_radius(unlockBtn, 8, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(unlockBtn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
-        lv_obj_add_event_cb(
-            unlockBtn,
-            [](lv_event_t *) { lv_async_call([](void *) { THIS->lockGlanceUnlocked(); }, nullptr); },
-            LV_EVENT_CLICKED, NULL);
-        lv_obj_t *ul = lv_label_create(unlockBtn);
-        lv_label_set_text(ul, "Unlock");
-        lv_obj_set_style_text_font(ul, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_center(ul);
+        lv_obj_align(glance_slide_label, LV_ALIGN_BOTTOM_MID, 14, -20);
 
         lv_obj_add_event_cb(
             glance_slider,
@@ -8676,14 +9177,122 @@ void TFTView_320x240::showLockGlance(void)
 
     lv_slider_set_value(glance_slider, 0, LV_ANIM_OFF);
     lv_obj_set_style_text_opa(glance_slide_label, LV_OPA_COVER, LV_PART_MAIN);
-    refreshLockGlance(true); // first draw: build the rows
+    refreshLockGlance(true); // first draw: build the slot
     lv_screen_load_anim(lockglance_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }
 
-// force = rebuild the notification rows too. Without it this only refreshes the clock, which
-// is all that needs doing most of the time: tearing down and recreating three rows twice a
-// second for a screen that is usually just sitting there is pure allocation churn on a device
-// whose internal heap has been measured under 2KB free.
+// One notification, as a row in the slot.
+void TFTView_320x240::glanceNotifRow(lv_obj_t *parent, const char *who, const char *text, const char *age)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 300, 38);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x14241a), LV_PART_MAIN); // a green-tinted card:
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);             // unread reads at a glance
+    lv_obj_set_style_radius(row, 9, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dot = lv_obj_create(row);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 7, 7);
+    lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 10, 8);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(0x30d158), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+
+    lv_obj_t *w = lv_label_create(row);
+    lv_label_set_text(w, who);
+    lv_obj_set_style_text_color(w, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_style_text_font(w, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_width(w, 210);
+    lv_obj_set_height(w, 16); // see glanceWidgetCard: LONG_DOT clips to the HEIGHT, and the
+    lv_label_set_long_mode(w, LV_LABEL_LONG_DOT); // default height grows instead of clipping
+    lv_obj_align(w, LV_ALIGN_TOP_LEFT, 24, 4);
+
+    lv_obj_t *a = lv_label_create(row);
+    lv_label_set_text(a, age);
+    lv_obj_set_style_text_color(a, lv_color_hex(0x30d158), LV_PART_MAIN);
+    lv_obj_set_style_text_font(a, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(a, LV_ALIGN_TOP_RIGHT, -10, 4);
+
+    lv_obj_t *t = lv_label_create(row);
+    lv_label_set_text(t, text);
+    lv_obj_set_style_text_color(t, lv_color_hex(0xc7f5d2), LV_PART_MAIN);
+    lv_obj_set_style_text_font(t, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_width(t, 266);
+    lv_obj_set_height(t, 16);
+    lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+    lv_obj_align(t, LV_ALIGN_TOP_LEFT, 24, 19);
+}
+
+// The widget card: whichever of the three is chosen, drawn in one shape.
+void TFTView_320x240::glanceWidgetCard(lv_obj_t *parent, const LockWidgetText &w)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 300, 96);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x121214), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *big = lv_label_create(card);
+    lv_label_set_text(big, w.big);
+    lv_obj_set_style_text_color(big, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_style_text_font(big, &ui_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_align(big, LV_ALIGN_TOP_LEFT, 14, 8);
+
+    if (w.tag[0]) {
+        lv_obj_t *tag = lv_label_create(card);
+        lv_label_set_text(tag, w.tag);
+        lv_obj_set_style_text_color(tag, lv_color_hex(w.tagColor), LV_PART_MAIN);
+        lv_obj_set_style_text_font(tag, &ui_font_montserrat_12, LV_PART_MAIN);
+        // Beside the headline rather than at a fixed x: "8 sats" and "Partly cloudy" are very
+        // different widths, and a hard-coded column puts one of them on top of the other.
+        lv_obj_align_to(tag, big, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -3);
+    }
+
+    if (w.line1[0]) {
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, w.line1);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_text_font(l1, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_width(l1, w.right[0] ? 190 : 272);
+        // ⚠️ AN EXPLICIT HEIGHT, OR LONG_DOT DOES NOTHING. LVGL clips to the label's height,
+        // and the default height is SIZE_CONTENT - so a long line simply grows a second row
+        // and lands on top of whatever is underneath. A 31-character place name did exactly
+        // that in the PC renderer; the dots only appear once the height is pinned to one line.
+        lv_obj_set_height(l1, 16);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_DOT);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 14, 44);
+    }
+    if (w.right[0]) {
+        lv_obj_t *r = lv_label_create(card);
+        lv_label_set_text(r, w.right);
+        lv_obj_set_style_text_color(r, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_text_font(r, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(r, LV_ALIGN_TOP_RIGHT, -14, 44);
+    }
+    if (w.line2[0]) {
+        lv_obj_t *l2 = lv_label_create(card);
+        lv_label_set_text(l2, w.line2);
+        lv_obj_set_style_text_color(l2, lv_color_hex(0x6a6a70), LV_PART_MAIN);
+        lv_obj_set_style_text_font(l2, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_width(l2, 272);
+        lv_obj_set_height(l2, 16);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_DOT);
+        lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 14, 62);
+    }
+}
+
+// force = rebuild the slot too. Without it this only refreshes the clock and the battery,
+// which is all that needs doing most of the time: tearing down and recreating three cards
+// twice a second for a screen that is usually just sitting there is pure allocation churn on a
+// device whose internal heap has been measured under 2KB free.
+//
+// The slot is rebuilt when its CONTENT changes, tracked as a 32-bit hash of the text that
+// would be drawn. That is four bytes instead of keeping a copy of every string, and it covers
+// both cases at once: a message arriving, and the minute ticking over on the sun widget.
 void TFTView_320x240::refreshLockGlance(bool force)
 {
     if (!lockglance_screen)
@@ -8710,66 +9319,111 @@ void TFTView_320x240::refreshLockGlance(bool force)
         lv_label_set_text(glance_date_label, "");
     }
 
-    // Rows only change when a message arrives (or the list is cleared), so track the count and
-    // leave them alone otherwise.
-    static int lastCount = -1;
-    const int nowCount = notif_count();
-    if (!force && nowCount == lastCount)
-        return;
-    lastCount = nowCount;
-
-    lv_obj_clean(glance_list);
-    char who[24], text[56];
-    uint32_t age = 0;
-    int shown = 0;
-    for (int i = 0; i < 3 && notif_peek(i, who, sizeof(who), text, sizeof(text), &age); i++) {
-        lv_obj_t *row = lv_obj_create(glance_list);
-        lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, 300, 36);
-        lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *w = lv_label_create(row);
-        lv_label_set_text(w, who);
-        lv_obj_set_style_text_color(w, lv_color_hex(0xffffff), LV_PART_MAIN);
-        lv_obj_set_style_text_font(w, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_set_width(w, 210);
-        lv_label_set_long_mode(w, LV_LABEL_LONG_DOT);
-        lv_obj_align(w, LV_ALIGN_TOP_LEFT, 8, 3);
-
-        char ageBuf[16];
-        if (age < 60)
-            snprintf(ageBuf, sizeof(ageBuf), "now");
-        else if (age < 3600)
-            snprintf(ageBuf, sizeof(ageBuf), "%um", (unsigned)(age / 60));
-        else
-            snprintf(ageBuf, sizeof(ageBuf), "%uh", (unsigned)(age / 3600));
-        lv_obj_t *a = lv_label_create(row);
-        lv_label_set_text(a, ageBuf);
-        lv_obj_set_style_text_color(a, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_set_style_text_font(a, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_align(a, LV_ALIGN_TOP_RIGHT, -8, 3);
-
-        lv_obj_t *t = lv_label_create(row);
-        lv_label_set_text(t, text);
-        lv_obj_set_style_text_color(t, lv_color_hex(0xc7c7cc), LV_PART_MAIN);
-        lv_obj_set_style_text_font(t, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_set_width(t, 284);
-        lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-        lv_obj_align(t, LV_ALIGN_TOP_LEFT, 8, 18);
-        shown++;
+    // ---- battery, top right ----
+    if (glance_bat_label && glance_bat_fill) {
+        if (launcherBatPct < 0) {
+            lv_label_set_text(glance_bat_label, "--");
+            lv_obj_set_style_text_color(glance_bat_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(glance_bat_fill, LV_OPA_TRANSP, LV_PART_MAIN);
+        } else {
+            snprintf(buf, sizeof(buf), "%d%%%s", launcherBatPct, launcherBatPlugged ? "+" : "");
+            lv_label_set_text(glance_bat_label, buf);
+            uint32_t col = 0xf2f2f7;
+            if (launcherBatPlugged)
+                col = 0x30d158;
+            else if (launcherBatPct <= 15)
+                col = 0xff453a;
+            lv_obj_set_style_text_color(glance_bat_label, lv_color_hex(col), LV_PART_MAIN);
+            // The cell is 24 wide with a 1px border, so 20px of usable inside. Never below 2,
+            // or a nearly-flat battery looks like a rendering fault instead of a warning.
+            int w = (launcherBatPct * 20) / 100;
+            lv_obj_set_width(glance_bat_fill, w < 2 ? 2 : w);
+            lv_obj_set_style_bg_color(glance_bat_fill, lv_color_hex(col), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(glance_bat_fill, LV_OPA_COVER, LV_PART_MAIN);
+        }
     }
 
-    const int total = notif_count();
-    if (total > shown) {
-        lv_obj_t *more = lv_label_create(glance_list);
-        char m[32];
-        snprintf(m, sizeof(m), "and %d more", total - shown);
-        lv_label_set_text(more, m);
-        lv_obj_set_style_text_color(more, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_set_style_text_font(more, &ui_font_montserrat_12, LV_PART_MAIN);
+    // ---- the Notifications button's own label ----
+    const int unread = notif_count();
+    if (glance_notif_label) {
+        if (unread == 0)
+            snprintf(buf, sizeof(buf), "Notifications");
+        else if (unread == 1)
+            snprintf(buf, sizeof(buf), "1 msg");
+        else
+            snprintf(buf, sizeof(buf), "%d msgs", unread);
+        lv_label_set_text(glance_notif_label, buf);
+        lv_obj_set_style_text_color(glance_notif_label, lv_color_hex(unread ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(glance_notif_btn, lv_color_hex(unread ? 0x14401f : 0x1c1c1e), LV_PART_MAIN);
+        lv_obj_set_style_border_color(glance_notif_btn, lv_color_hex(unread ? 0x30d158 : 0x3a3a3c), LV_PART_MAIN);
+    }
+
+    // ---- the slot: unread messages win it outright, exactly as Jake asked ----
+    const int widget = unread ? 0 : tdeck_lock_widget();
+    LockWidgetText w{};
+    const bool haveWidget =
+        widget && lockwidget_fill(widget, db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC,
+                                  db.config.display.use_12h_clock, &w);
+
+    // FNV-1a over what would be drawn. Cheap, and it catches every change that matters.
+    uint32_t h = 2166136261u;
+    auto mix = [&h](const char *p) {
+        for (; p && *p; p++) {
+            h ^= (uint8_t)*p;
+            h *= 16777619u;
+        }
+        h ^= 0x5c;
+        h *= 16777619u;
+    };
+    h ^= (uint32_t)unread;
+    h *= 16777619u;
+    if (haveWidget) {
+        mix(w.big);
+        mix(w.tag);
+        mix(w.line1);
+        mix(w.line2);
+        mix(w.right);
+    } else if (unread) {
+        char who[24], text[56];
+        uint32_t age = 0;
+        for (int i = 0; i < 2 && notif_peek(i, who, sizeof(who), text, sizeof(text), &age); i++) {
+            mix(who);
+            mix(text);
+        }
+    }
+    if (!force && h == glanceSlotHash)
+        return;
+    glanceSlotHash = h;
+
+    lv_obj_clean(glance_list);
+
+    if (unread) {
+        // Two rows, not three: the slot is 96px and a row is 38 plus 4 of padding, so a third
+        // would be cut in half by the slider. "and N more" says the rest are there.
+        char who[24], text[56];
+        uint32_t age = 0;
+        int shown = 0;
+        for (int i = 0; i < 2 && notif_peek(i, who, sizeof(who), text, sizeof(text), &age); i++) {
+            char ageBuf[16];
+            if (age < 60)
+                snprintf(ageBuf, sizeof(ageBuf), "now");
+            else if (age < 3600)
+                snprintf(ageBuf, sizeof(ageBuf), "%um", (unsigned)(age / 60));
+            else
+                snprintf(ageBuf, sizeof(ageBuf), "%uh", (unsigned)(age / 3600));
+            glanceNotifRow(glance_list, who, text, ageBuf);
+            shown++;
+        }
+        if (unread > shown) {
+            lv_obj_t *more = lv_label_create(glance_list);
+            char m[32];
+            snprintf(m, sizeof(m), "and %d more", unread - shown);
+            lv_label_set_text(more, m);
+            lv_obj_set_style_text_color(more, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+            lv_obj_set_style_text_font(more, &ui_font_montserrat_12, LV_PART_MAIN);
+        }
+    } else if (haveWidget) {
+        glanceWidgetCard(glance_list, w);
     }
 }
 

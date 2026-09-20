@@ -28,6 +28,7 @@
 //   @@key <code>      - inject an LVGL keycode (see lv_keys)
 //   @@home            - the Home gesture (trackball double-click)
 //   @@back            - the Back gesture
+//   @@open <screen>   - lock|settings|chats|nodes|alerts|notes|glance
 //   @@shot            - take a screenshot to internal flash
 //   @@get             - stream the last capture back (RLE+base64, ~2s)
 //
@@ -41,6 +42,8 @@
 #include <cstdio>
 #include <cstring>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h> // uxTaskGetStackHighWaterMark, for the stack figures in @@mem
 
 static const int kMaxLine = 64;
 static char s_line[kMaxLine];
@@ -70,12 +73,21 @@ extern "C" void tdeck_remote_feed(uint8_t c)
             } else if (!strncmp(s_line, "mem", 3)) {
                 // Memory is answered straight here, not on the UI task: it reads heap
                 // counters only, and the UI task is the one under pressure.
-                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u",
+                // Stack headroom is on the SAME line as the heap figures: the driver on the
+                // PC stops reading at the first "@@ok", so a second line would never arrive.
+                // Added 2026-09-19 during the UI audit - several screens put 512B-1KB arrays
+                // on the stack inside LVGL callbacks, and "is that safe?" deserves a
+                // measurement. The tft task gets 16KB (TFT_TASK_STACK_SIZE).
+                TaskHandle_t tftT = xTaskGetHandle("tft");
+                TaskHandle_t loopT = xTaskGetHandle("loopTask");
+                LOG_INFO("@@ok mem internal free=%u largest=%u min=%u | psram free=%u largest=%u | stack tft=%u loop=%u",
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+                         tftT ? (unsigned)(uxTaskGetStackHighWaterMark(tftT) * sizeof(StackType_t)) : 0u,
+                         loopT ? (unsigned)(uxTaskGetStackHighWaterMark(loopT) * sizeof(StackType_t)) : 0u);
             } else if (!strncmp(s_line, "shot", 4)) {
                 s_cmd = 4;
             } else if (!strncmp(s_line, "get", 3)) {
@@ -83,6 +95,32 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 // the main loop rather than the UI task - it only reads the PSRAM buffer,
                 // and the UI task holds the SPI lock the radio needs.
                 tdeck_shot_stream_begin();
+            } else if (!strncmp(s_line, "open", 4)) {
+                // Jump straight to a screen by name. Tapping tiles to reach a screen means
+                // knowing which launcher page is showing, and getting that wrong opens the
+                // wrong app - which cost more time than this command took to write.
+                const char *a = s_line + 4;
+                while (*a == ' ')
+                    a++;
+                int which = -1;
+                if (!strncmp(a, "lock", 4))          which = 1;  // Settings > Lock screen
+                else if (!strncmp(a, "settings", 8)) which = 2;
+                else if (!strncmp(a, "chats", 5))    which = 3;
+                else if (!strncmp(a, "nodes", 5))    which = 4;
+                else if (!strncmp(a, "alerts", 6))   which = 5;
+                else if (!strncmp(a, "notes", 5))    which = 6;
+                else if (!strncmp(a, "glance", 6))   which = 7;
+                else if (!strncmp(a, "favorites", 9)) which = 8;
+                else if (!strncmp(a, "maps", 4))     which = 9;
+                else if (!strncmp(a, "pins", 4))     which = 10; // the pins list, i.e. the search
+                else if (!strncmp(a, "getapps", 7))  which = 11;
+                else if (!strncmp(a, "lockpad", 7))  which = 12; // the PIN keypad itself
+                if (which > 0) {
+                    s_x = which;
+                    s_cmd = 9;
+                } else {
+                    LOG_INFO("@@err open: lock|settings|chats|nodes|alerts|notes|glance|favorites|maps|pins|getapps|lockpad");
+                }
             } else if (!strncmp(s_line, "home", 4)) {
                 s_cmd = 2;
             } else if (!strncmp(s_line, "back", 4)) {

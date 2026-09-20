@@ -12,6 +12,7 @@
 // chat input gets typed into), with a periodic refocus guard because the
 // trackball encoder can wander focus. Trackball double-click = Home still works.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "lvgl.h"
 #include <cstdio>
 #include <cstdlib>
@@ -340,6 +341,7 @@ void rebuildList(void)
         lv_label_set_text(lbl, notePreview[i]);
         lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        tui_one_line(lbl); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_set_width(lbl, LV_PCT(100));
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
     }

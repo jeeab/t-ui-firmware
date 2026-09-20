@@ -25,6 +25,7 @@
 // is Jake's "when screen locked" item) and it takes taps only on its own two
 // buttons, so nothing underneath is ever silently swallowed.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "lvgl.h"
 #include <cstdio>
 #include <cstring>
@@ -54,6 +55,9 @@ extern "C" bool notif_unread_from(uint32_t nodeNum); // does this node have some
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
 extern "C" void tui_open_channel_chat(uint8_t ch);
 extern "C" bool tdeck_lockscreen_active(void);
+// Is the PIN/swipe still owed? This page can now be opened FROM the lock screen (the
+// "Notifications" button in its top-left corner), so it has to know.
+extern "C" bool tdeck_device_locked(void);
 extern "C" void tdeck_pop_request(void); // TDeckPop.cpp - the pop. Safe from any task.
 
 namespace
@@ -78,6 +82,7 @@ lv_obj_t *screen = nullptr;
 lv_obj_t *listCont = nullptr;
 lv_obj_t *emptyLbl = nullptr;
 lv_obj_t *prevScreen = nullptr;
+lv_obj_t *lockedLbl = nullptr; // "Unlock to open a conversation"
 lv_obj_t *launcherScreen = nullptr; // captured at notif_init(): the always-safe way back
 
 lv_obj_t *popup = nullptr;
@@ -154,6 +159,7 @@ void buildPopup(void)
     lv_obj_align(popupWho, LV_ALIGN_TOP_LEFT, 26, 6);
     lv_obj_set_width(popupWho, 230);
     lv_label_set_long_mode(popupWho, LV_LABEL_LONG_DOT);
+    tui_one_line(popupWho); // LONG_DOT needs a pinned height - see TuiLabel.h
 
     popupText = lv_label_create(popup);
     lv_obj_set_style_text_color(popupText, lv_color_hex(0x8e8e93), LV_PART_MAIN);
@@ -161,6 +167,7 @@ void buildPopup(void)
     lv_obj_align(popupText, LV_ALIGN_TOP_LEFT, 26, 30);
     lv_obj_set_width(popupText, 230);
     lv_label_set_long_mode(popupText, LV_LABEL_LONG_DOT);
+    tui_one_line(popupText); // LONG_DOT needs a pinned height - see TuiLabel.h
 
     lv_obj_t *x = lv_btn_create(popup);
     lv_obj_set_size(x, 34, 34);
@@ -212,6 +219,18 @@ void onRowTap(lv_event_t *e)
     const int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (!store || idx < 0 || idx >= count)
         return;
+    // ⛔ READ-ONLY WHILE LOCKED, DELIBERATELY. The lock screen shows who has messaged and the
+    // first line, and its "Notifications" button opens this page - so you can see WHAT is
+    // waiting without the code. Walking from here into the conversation would be a way past
+    // the PIN, and a lock you can step around is decoration. Jake has not asked for a bypass
+    // and this will not build one on its own.
+    if (tdeck_device_locked()) {
+        if (lockedLbl) {
+            lv_label_set_text(lockedLbl, "Unlock first - slide, then your code");
+            lv_obj_set_style_text_color(lockedLbl, lv_color_hex(0xff9f0a), LV_PART_MAIN);
+        }
+        return;
+    }
     // Copy out BEFORE anything can rebuild or clear the store — the row we are
     // standing on is about to be destroyed by the screen change.
     const uint32_t from = store[idx].from;
@@ -285,6 +304,14 @@ void buildScreen(void)
     lv_obj_set_style_pad_all(listCont, 8, LV_PART_MAIN);
     lv_obj_set_scroll_dir(listCont, LV_DIR_VER);
 
+    // Shown only when this page was opened from the lock screen. See onRowTap.
+    lockedLbl = lv_label_create(screen);
+    lv_label_set_text(lockedLbl, "Unlock to open a conversation");
+    lv_obj_set_style_text_font(lockedLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lockedLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(lockedLbl, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_add_flag(lockedLbl, LV_OBJ_FLAG_HIDDEN);
+
     emptyLbl = lv_label_create(screen);
     lv_label_set_text(emptyLbl, "Nothing new.\nMessages you have not read yet\nshow up here.");
     lv_obj_set_style_text_color(emptyLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
@@ -317,6 +344,7 @@ void rebuild(void)
         lv_obj_set_style_text_color(who, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_width(who, 200);
         lv_label_set_long_mode(who, LV_LABEL_LONG_DOT);
+        tui_one_line(who); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(who, LV_ALIGN_TOP_LEFT, 10, 5);
 
         // A group message and a direct one are different things; say which.
@@ -342,6 +370,7 @@ void rebuild(void)
         lv_obj_set_style_text_color(tx, lv_color_hex(0xc7c7cc), LV_PART_MAIN);
         lv_obj_set_width(tx, 276);
         lv_label_set_long_mode(tx, LV_LABEL_LONG_DOT);
+        tui_one_line(tx); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(tx, LV_ALIGN_TOP_LEFT, 10, 28);
     }
 }
@@ -468,5 +497,17 @@ extern "C" void notif_open(void)
         buildScreen();
     hidePopup();
     rebuild();
+    // The footer only earns its 18px when it has something to say.
+    const bool locked = tdeck_device_locked();
+    if (lockedLbl) {
+        lv_label_set_text(lockedLbl, "Unlock to open a conversation");
+        lv_obj_set_style_text_color(lockedLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        if (locked)
+            lv_obj_clear_flag(lockedLbl, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(lockedLbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (listCont)
+        lv_obj_set_height(listCont, locked ? 186 : 204);
     lv_screen_load_anim(screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }

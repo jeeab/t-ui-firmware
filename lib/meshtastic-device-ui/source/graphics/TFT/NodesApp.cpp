@@ -20,6 +20,7 @@
 // The star is Meshtastic's own favourite bit, not a file of ours, so a node
 // starred here is starred in the phone app too and survives a reboot.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "lvgl.h"
 #include <Arduino.h>
 #include <cmath>
@@ -286,6 +287,7 @@ void buildSheet(void)
     lv_obj_set_style_text_color(sheetTitle, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_set_width(sheetTitle, 236);
     lv_label_set_long_mode(sheetTitle, LV_LABEL_LONG_DOT);
+    tui_one_line(sheetTitle); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_align(sheetTitle, LV_ALIGN_TOP_MID, 0, 2);
 
     sheetBtn(sheet, "Message", 26, 0x0a84ff, [](lv_event_t *) {
@@ -377,6 +379,7 @@ void addRow(lv_obj_t *parent, uint32_t num, int idx)
     lv_label_set_text(name, tdeck_node_name(num));
     lv_obj_set_style_text_color(name, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    tui_one_line(name); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_set_width(name, unread ? 276 : 290);
     lv_obj_align(name, LV_ALIGN_TOP_LEFT, unread ? 20 : 8, 3);
 

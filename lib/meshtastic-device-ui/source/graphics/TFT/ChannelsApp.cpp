@@ -22,6 +22,7 @@
 // Same arrangement as NodesApp: its own launcher screen, fed by extern "C" bridges,
 // touching none of MUI's internals.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "lvgl.h"
 #include "util/ILog.h"
 #include <Arduino.h>
@@ -170,6 +171,7 @@ lv_obj_t *convoRow(uint32_t num, const char *name, const char *preview, const ch
     lv_obj_t *nm = lv_label_create(row);
     lv_obj_set_width(nm, 168);
     lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    tui_one_line(nm); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_label_set_text(nm, (name && name[0]) ? name : "(unnamed)");
     lv_obj_set_style_text_color(nm, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(nm, LV_ALIGN_TOP_LEFT, 60, 9);
@@ -180,6 +182,7 @@ lv_obj_t *convoRow(uint32_t num, const char *name, const char *preview, const ch
     lv_label_set_text(pv, (preview && preview[0]) ? preview : "No messages yet");
     lv_obj_set_style_text_color(pv, lv_color_hex(unread ? 0xc7f5d2 : 0x8e8e93), LV_PART_MAIN);
     lv_obj_set_style_text_font(pv, &ui_font_montserrat_12, LV_PART_MAIN);
+    tui_one_line(pv); // LONG_DOT needs a pinned height - see TuiLabel.h
     lv_obj_align(pv, LV_ALIGN_TOP_LEFT, 60, 32);
 
     if (unread) {

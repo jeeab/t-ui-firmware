@@ -244,6 +244,14 @@ class TFTView_320x240 : public MeshtasticView
     void loadPins(void);
     bool savePins(void); // returns false if the SD write failed (surfaced on-screen)
     void openPinsList(void);
+    void rebuildPinRows(void);               // just the results, so typing does not kill the box
+    void pinsNodeRow(lv_obj_t *list, uint32_t num, const char *name, int32_t latI, int32_t lonI);
+    void pinsSectionHeader(lv_obj_t *list, const char *text);
+    static bool nameContains(const char *hay, const char *lowercaseNeedle);
+    void awayText(double lat, double lon, char *out, size_t n); // "1.4 mi NE", or empty
+    lv_obj_t *pins_list = nullptr;            // the results, inside pins_overlay
+    lv_obj_t *pins_search_ta = nullptr;       // the box you type in
+    char pinFilter[24] = "";                  // outlives a rebuild, so the Nodes toggle is safe
     void closePinsList(void);
     void deletePin(uint32_t id);
 
@@ -598,9 +606,15 @@ class TFTView_320x240 : public MeshtasticView
     void handleBackGesture(void);            // runs on the "erase" key when nothing is being typed
     void lockDevice(void);                   // black out the screen + require the PIN
     void showLockPad(bool setMode);          // PIN keypad — unlock, or (setMode) choose a new PIN
-    void showLockGlance(void);               // the iPod-style glance: clock, who messaged, slide to unlock
+    void showLockGlance(void);
+    void glanceNotifRow(lv_obj_t *parent, const char *who, const char *text, const char *age);
+    void glanceWidgetCard(lv_obj_t *parent, const struct LockWidgetText &w);               // the iPod-style glance: clock, who messaged, slide to unlock
     void remoteInit(void);                   // second LVGL pointer device, for injected taps
     void remoteService(void);                // run one pending remote command, UI task only
+    void openLockSettings(void);             // Settings > Lock screen, all of it in one page
+    void updateLockPageLabels(void);
+    lv_obj_t *lockPageRow(lv_obj_t *parent, const char *title, int y, const char *btnText,
+                          lv_obj_t **outLabel, lv_event_cb_t cb);
     void updateLockGraceLabel(void);         // "Ask for PIN" button text, from the stored seconds
     void startScreenshotCountdown(void);     // Settings: capture the screen in five seconds
     void sendLocationNow(void);              // Settings: broadcast my position once, now
@@ -621,8 +635,22 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *shot_hint_label = nullptr;      // and reports where the file went
     lv_obj_t *lock_grace_btn = nullptr;       // Settings: "Ask for PIN" cycling button
     lv_obj_t *lock_grace_label = nullptr;
+    lv_obj_t *lockpage_screen = nullptr;      // Settings > Lock screen
+    lv_obj_t *lockpage_mode_label = nullptr;
+    lv_obj_t *lockpage_widget_label = nullptr;
+    lv_obj_t *lockpage_wx_label = nullptr;
+    lv_obj_t *lockpage_grace_label = nullptr;
+    lv_obj_t *lockpage_pin_row = nullptr;     // hidden unless the mode is PIN
+    lv_obj_t *lockpage_grace_row = nullptr;   // ditto
+    lv_obj_t *lockpage_wx_row = nullptr;      // hidden unless the widget is Weather
     lv_obj_t *lockglance_screen = nullptr;    // shown on wake, before the PIN pad
     lv_obj_t *glance_clock_label = nullptr;
+    lv_obj_t *glance_notif_btn = nullptr;     // top left: "Notifications" / "3 msgs"
+    lv_obj_t *glance_notif_label = nullptr;
+    lv_obj_t *glance_bat_shell = nullptr;     // top right: the cell outline...
+    lv_obj_t *glance_bat_fill = nullptr;      // ...what is left in it...
+    lv_obj_t *glance_bat_label = nullptr;     // ...and the figure
+    uint32_t glanceSlotHash = 0;              // rebuild the middle only when it would differ
     lv_obj_t *glance_date_label = nullptr;
     lv_obj_t *glance_list = nullptr;          // the notification rows
     lv_obj_t *glance_slider = nullptr;        // slide to unlock
@@ -852,6 +880,7 @@ class TFTView_320x240 : public MeshtasticView
     static void tuiRequestPosition(uint32_t nodeNum); // ask a node where it is
     static void tuiShowOnUserMap(uint32_t nodeNum, int32_t latI, int32_t lonI);
     static void tuiOpenChannelChat(uint8_t ch);
+    static bool tuiDeviceLocked(void); // is the PIN/swipe still owed?
 
   private:
     void openChatWithNode(uint32_t nodeNum);
