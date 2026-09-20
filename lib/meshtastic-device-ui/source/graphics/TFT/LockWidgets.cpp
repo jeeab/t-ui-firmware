@@ -37,6 +37,10 @@ extern "C" bool tdeck_wall_clock(int *year, int *mon, int *day, int *hour, int *
 // and "sunset is at 7:42" is still the answer you wanted - the Sundown app made the same call.
 extern "C" bool tdeck_lastpos_get(int32_t *lat, int32_t *lon);
 extern "C" void tdeck_lastpos_set(int32_t lat, int32_t lon);
+// A freshly fetched forecast waiting to be written to the card (src/TDeckWeatherAuto.cpp).
+// Handed over once; we own the buffer and must free it. See tdeck_wx_auto_service() for
+// why the fetch happens there and the file is written here.
+extern "C" char *tdeck_wx_auto_take(int *len);
 
 namespace
 {
@@ -347,8 +351,172 @@ bool field(const char *line, int idx, char *out, size_t n)
     return true;
 }
 
+// ---------------------------------------------------------------- refreshing the cache
+
+// Find "key": in a JSON body. wantArray picks between the scalar and the array when the same
+// name appears as both - which Open-Meteo does for weather_code (once under `current`, once
+// under `daily`) and for time. Returns a pointer just past the colon (or past the '[').
+const char *jsonFind(const char *body, const char *key, bool wantArray)
+{
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const size_t plen = strlen(pat);
+    for (const char *p = strstr(body, pat); p; p = strstr(p + 1, pat)) {
+        const char *v = p + plen;
+        if (wantArray) {
+            if (*v == '[')
+                return v + 1;
+            continue;
+        }
+        // ⚠️ KEEP LOOKING UNTIL THE VALUE IS A NUMBER. Open-Meteo sends a "current_units"
+        // block BEFORE "current", carrying the same names with their units as strings -
+        // "temperature_2m":"°F", "weather_code":"wmo code". Taking the first match got
+        // the unit, not the reading. (Lua's pattern skipped these for free; C has to be told.)
+        if (*v == '-' || *v == '.' || (*v >= '0' && *v <= '9'))
+            return v;
+    }
+    return nullptr;
+}
+
+// Copy one plain scalar (number) into out.
+bool jsonScalar(const char *body, const char *key, char *out, size_t n)
+{
+    const char *v = jsonFind(body, key, false);
+    if (!v)
+        return false;
+    size_t i = 0;
+    while (*v && (*v == '-' || *v == '.' || (*v >= '0' && *v <= '9')) && i < n - 1)
+        out[i++] = *v++;
+    out[i] = 0;
+    return i > 0;
+}
+
+// Copy element `idx` of an array, stripping quotes. Elements are numbers or ISO dates.
+bool jsonElem(const char *arr, int idx, char *out, size_t n)
+{
+    const char *p = arr;
+    for (int k = 0; k < idx; k++) {
+        p = strchr(p, ',');
+        if (!p)
+            return false;
+        p++;
+    }
+    while (*p == ' ' || *p == '"')
+        p++;
+    size_t i = 0;
+    while (*p && *p != ',' && *p != ']' && *p != '"' && i < n - 1)
+        out[i++] = *p++;
+    out[i] = 0;
+    return i > 0;
+}
+
+// Merge a freshly fetched forecast into the file the Weather app owns, keeping the place name
+// it looked up and stamping the time so the widget can say how old the reading is.
+//
+// It only ever UPDATES: with no existing cache there is no place name, and inventing one would
+// be worse than saying "open the Weather app once", which is what the widget already does.
+void mergeFetched(char *body)
+{
+    char *old = (char *)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    char *out = (char *)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    if (!old || !out) {
+        if (old)
+            heap_caps_free(old);
+        if (out)
+            heap_caps_free(out);
+        return;
+    }
+    int n = -1;
+    FsFile f = SDFs.open("/apps/weather/forecast.txt", O_RDONLY);
+    if (f) {
+        n = f.read((uint8_t *)old, 1023);
+        f.close();
+    }
+    if (n <= 0) {
+        heap_caps_free(old);
+        heap_caps_free(out);
+        return; // the app has never saved one; not ours to create
+    }
+    old[n] = 0;
+
+    // line 3 carries the place, which we keep exactly as it was
+    char keep[96] = "";
+    {
+        char *l1 = strchr(old, '\n');
+        char *l2 = l1 ? strchr(l1 + 1, '\n') : nullptr;
+        char *l3 = l2 ? strchr(l2 + 1, '\n') : nullptr;
+        if (l2) {
+            const size_t len = (size_t)((l3 ? l3 : old + n) - (l2 + 1));
+            const size_t cap = len < sizeof(keep) - 1 ? len : sizeof(keep) - 1;
+            memcpy(keep, l2 + 1, cap);
+            keep[cap] = 0;
+        }
+    }
+    if (!keep[0]) {
+        heap_caps_free(old);
+        heap_caps_free(out);
+        return;
+    }
+    // drop any stamp already on the end, then add the current one
+    {
+        int bars = 0;
+        for (char *p = keep; *p; p++) {
+            if (*p == '|' && ++bars == 3) {
+                *p = 0;
+                break;
+            }
+        }
+    }
+    char stamp[24] = "";
+    int y, mo, d, hh, mi, ss, off;
+    if (tdeck_wall_clock(&y, &mo, &d, &hh, &mi, &ss, &off))
+        snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d %02d:%02d", y, mo, d, hh, mi);
+
+    char temp[12] = "", code[8] = "", wind[12] = "";
+    if (!jsonScalar(body, "temperature_2m", temp, sizeof(temp))) {
+        heap_caps_free(old);
+        heap_caps_free(out);
+        return; // not a forecast we understand; leave the good cache alone
+    }
+    jsonScalar(body, "weather_code", code, sizeof(code));
+    jsonScalar(body, "wind_speed_10m", wind, sizeof(wind));
+
+    int len = snprintf(out, 1024, "4\n%s|%s|%s\n%s|%s\n", temp, code, wind, keep, stamp);
+
+    const char *aDate = jsonFind(body, "time", true);
+    const char *aCode = jsonFind(body, "weather_code", true);
+    const char *aHi = jsonFind(body, "temperature_2m_max", true);
+    const char *aLo = jsonFind(body, "temperature_2m_min", true);
+    if (aDate && aCode && aHi && aLo) {
+        for (int i = 0; i < 7 && len < 900; i++) {
+            char dt[16], cd[8], hi[12], lo[12];
+            if (!jsonElem(aDate, i, dt, sizeof(dt)) || !jsonElem(aCode, i, cd, sizeof(cd)) ||
+                !jsonElem(aHi, i, hi, sizeof(hi)) || !jsonElem(aLo, i, lo, sizeof(lo)))
+                break;
+            len += snprintf(out + len, (size_t)(1024 - len), "%s|%s|%s|%s\n", dt, cd, hi, lo);
+        }
+    }
+
+    FsFile w = SDFs.open("/apps/weather/forecast.txt", O_WRONLY | O_CREAT | O_TRUNC);
+    if (w) {
+        w.write((const uint8_t *)out, (size_t)len);
+        w.close();
+        wx.readAtMs = 0; // force the next read to pick the new file up
+    }
+    heap_caps_free(old);
+    heap_caps_free(out);
+}
+
 void loadWeatherCache(void)
 {
+    // A background refresh may have landed since last time. Writing the file is done HERE,
+    // on the tft task, because this is where SDFs lives and where the SPI lock is already
+    // held - the fetch itself ran on the main loop and never touched the card.
+    if (char *fresh = tdeck_wx_auto_take(nullptr)) {
+        mergeFetched(fresh);
+        heap_caps_free(fresh);
+    }
+
     const uint32_t now = lv_tick_get();
     if (wx.readAtMs && (now - wx.readAtMs) < 60000)
         return;

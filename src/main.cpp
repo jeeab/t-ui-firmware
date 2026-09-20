@@ -1298,6 +1298,8 @@ extern "C" void tdeck_sound_service(void);
 extern "C" void tdeck_pop_service(void); // TDeckPop.cpp - starts the new-message pop off-thread
 extern "C" void tdeck_shot_service(void); // TDeckScreenshot.cpp - writes a pending screenshot
 extern "C" void tdeck_share_location_service(void); // TDeckShareLocation.cpp - one-shot position send
+extern "C" void tdeck_wx_auto_service(void); // TDeckWeatherAuto.cpp - lock-screen forecast,
+                                             // only ever when Wi-Fi is ALREADY up
 // T-Deck launcher 12/24-hour switch: apply + persist a pending clock-format change from this
 // (main) thread, for the same reason as the others. Defined in src/TDeckClockFormat.cpp.
 extern "C" void tdeck_clock_service(void);
@@ -1396,6 +1398,7 @@ void loop()
     tdeck_pop_service();
     tdeck_shot_service();
     tdeck_share_location_service();
+    tdeck_wx_auto_service();
     tdeck_clock_service();
     tdeck_net_service();
 #ifdef NETDOOR_SELFTEST
