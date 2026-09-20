@@ -1,6 +1,7 @@
 #if HAS_TFT && defined(VIEW_320x240) || defined(VIEW_240x320)
 
 #include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
+#include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar (note item A4)
 #include "graphics/view/TFT/TFTView_320x240.h"
 #include "Arduino.h"
 #include "graphics/common/BatteryLevel.h"
@@ -1057,6 +1058,38 @@ extern "C" bool tdeck_lockscreen_active(void)
 //
 // Static member, not a free function: lockState is private and instance() is too, so a free
 // function can reach neither. Same reason as tuiOpenChatWith and the rest beside it.
+// --- what the status bar needs from the view ----------------------------------------------
+// Static members, then extern "C" wrappers: launcherBatPct and db are private, and a free
+// function can reach neither. Same arrangement as every other bridge in this file.
+int TFTView_320x240::tuiBatteryPct(void) { return instance() ? instance()->launcherBatPct : -1; }
+
+bool TFTView_320x240::tuiBatteryPlugged(void) { return instance() && instance()->launcherBatPlugged; }
+
+bool TFTView_320x240::tuiClockText(char *out, int outN)
+{
+    if (!out || outN <= 0)
+        return false;
+    out[0] = 0;
+    TFTView_320x240 *self = instance();
+    time_t now;
+    time(&now);
+    if (!self || !VALID_TIME(now))
+        return false; // no satellites yet: say nothing rather than a confident 00:00
+    tm *lt = localtime(&now);
+    if (self->db.config.display.use_12h_clock) {
+        strftime(out, (size_t)outN, "%I:%M %p", lt);
+        if (out[0] == '0')
+            memmove(out, out + 1, strlen(out));
+    } else {
+        strftime(out, (size_t)outN, "%H:%M", lt);
+    }
+    return true;
+}
+
+extern "C" int tdeck_battery_pct(void) { return TFTView_320x240::tuiBatteryPct(); }
+extern "C" bool tdeck_battery_plugged(void) { return TFTView_320x240::tuiBatteryPlugged(); }
+extern "C" bool tdeck_clock_text(char *out, int outN) { return TFTView_320x240::tuiClockText(out, outN); }
+
 bool TFTView_320x240::tuiDeviceLocked(void)
 {
     return instance() && instance()->lockState != LOCK_NONE;
@@ -1256,6 +1289,7 @@ void TFTView_320x240::createLauncher(void)
     lv_obj_align_to(launcher_mesh_off_label, launcher_unread_label, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
     lv_label_set_text(launcher_mesh_off_label, meshEnabled ? "" : "mesh off");
     updateUnreadMessages(); // reflect any count that already accrued before the grid was built
+    tui_statusbar_init();   // the persistent top bar, on the top layer, hidden until a screen asks
     notif_init();           // build the notification card NOW, on the UI task — a message can
                             // arrive on the mesh task at any moment and must not create objects
 
@@ -1315,6 +1349,9 @@ void TFTView_320x240::createLauncher(void)
 
             // Remote control over USB. Costs one volatile read per tick when idle.
             THIS->remoteService();
+            // The persistent top bar. Cheap: it returns immediately unless the screen showing
+            // has asked for it, and lv_label_set_text skips unchanged strings.
+            tui_statusbar_tick();
             // The PIN pad had no timeout of its own: wake the device, don't type the code, and
             // it sat there lit until the battery ran down. The main screen timeout does not cover
             // it, because the pad counts as an active screen. Ten seconds without a touch and it
@@ -2022,6 +2059,7 @@ void TFTView_320x240::updateLauncherBattery(void)
 void TFTView_320x240::createSettingsScreen(void)
 {
     settings_screen = lv_obj_create(NULL);
+    tui_statusbar_reserve(settings_screen); // 20px of top padding moves every child down
     lv_obj_set_style_bg_color(settings_screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_scroll_dir(settings_screen, LV_DIR_VER); // scrollable now that there are more rows
     lv_obj_set_scrollbar_mode(settings_screen, LV_SCROLLBAR_MODE_AUTO);
@@ -2586,6 +2624,7 @@ void TFTView_320x240::openFileShare(void)
 {
     if (!fileshare_screen) {
         fileshare_screen = lv_obj_create(NULL);
+        tui_statusbar_reserve(fileshare_screen); // 20px of top padding moves every child down
         lv_obj_set_style_bg_color(fileshare_screen, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_clear_flag(fileshare_screen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -5213,6 +5252,7 @@ void TFTView_320x240::openGetApps(void)
 #ifdef ARDUINO_ARCH_ESP32
     if (!getapps_screen) {
         getapps_screen = lv_obj_create(NULL);
+        tui_statusbar_reserve(getapps_screen); // 20px of top padding moves every child down
         lv_obj_set_style_bg_color(getapps_screen, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_clear_flag(getapps_screen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -7494,6 +7534,7 @@ void TFTView_320x240::openFiles(void)
 {
     if (!files_screen) {
         files_screen = lv_obj_create(NULL);
+        tui_statusbar_reserve(files_screen); // 20px of top padding moves every child down
         lv_obj_set_style_bg_color(files_screen, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_clear_flag(files_screen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -8956,6 +8997,7 @@ void TFTView_320x240::openLockSettings(void)
 {
     if (!lockpage_screen) {
         lockpage_screen = lv_obj_create(NULL);
+        tui_statusbar_reserve(lockpage_screen); // an ordinary settings page: you are already unlocked here
         lv_obj_set_style_bg_color(lockpage_screen, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_set_scroll_dir(lockpage_screen, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(lockpage_screen, LV_SCROLLBAR_MODE_AUTO);

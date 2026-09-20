@@ -9,6 +9,7 @@
 // a short LVGL timer just repaints while running. Trackball double-click = Home
 // exits, same as everywhere. The timer is paused when the screen isn't showing.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar
 #include "lvgl.h"
 #include <Arduino.h> // millis()
 #include <cstdio>
@@ -219,6 +220,7 @@ lv_obj_t *makeButton(lv_obj_t *parent, const char *text, uint32_t color, lv_even
 void buildScreen(void)
 {
     screen = lv_obj_create(NULL);
+    tui_statusbar_reserve(screen); // note item A4: the persistent top bar
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 

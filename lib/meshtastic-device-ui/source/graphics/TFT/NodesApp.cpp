@@ -20,6 +20,7 @@
 // The star is Meshtastic's own favourite bit, not a file of ours, so a node
 // starred here is starred in the phone app too and survives a reboot.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar
 #include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "lvgl.h"
 #include <Arduino.h>
@@ -493,6 +494,7 @@ void rebuild(void)
 void buildScreen(void)
 {
     screen = lv_obj_create(NULL);
+    tui_statusbar_reserve(screen); // note item A4: the persistent top bar
     // The "more" sheet lives on lv_layer_top, which belongs to the display and not to this
     // screen - so left open it would float over the launcher and everything else. Leaving
     // the app closes it.

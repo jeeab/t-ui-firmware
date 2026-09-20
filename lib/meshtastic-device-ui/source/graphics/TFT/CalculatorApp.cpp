@@ -8,6 +8,7 @@
 // uses (with the periodic refocus guard, since the trackball encoder can move
 // LVGL's focus elsewhere). Back button or trackball double-click exits.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar
 #include "lvgl.h"
 #include <cstdio>
 #include <cstdlib>
@@ -266,6 +267,7 @@ lv_obj_t *gridBtn(const char *txt, char key, int col, int row, uint32_t bg, uint
 void buildScreen(void)
 {
     screen = lv_obj_create(NULL);
+    tui_statusbar_reserve(screen); // note item A4: the persistent top bar
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 

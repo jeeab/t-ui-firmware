@@ -12,6 +12,7 @@
 // chat input gets typed into), with a periodic refocus guard because the
 // trackball encoder can wander focus. Trackball double-click = Home still works.
 // -----------------------------------------------------------------------------
+#include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar
 #include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "lvgl.h"
 #include <cstdio>
@@ -281,6 +282,7 @@ void buildConfirmPanel(void)
 void buildListScreen(void)
 {
     listScreen = lv_obj_create(NULL);
+    tui_statusbar_reserve(listScreen); // note item A4: the persistent top bar
     lv_obj_set_style_bg_color(listScreen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(listScreen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -350,6 +352,7 @@ void rebuildList(void)
 void buildEditScreen(void)
 {
     editScreen = lv_obj_create(NULL);
+    tui_statusbar_reserve(editScreen); // note item A4: the persistent top bar
     lv_obj_set_style_bg_color(editScreen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(editScreen, LV_OBJ_FLAG_SCROLLABLE);
 
