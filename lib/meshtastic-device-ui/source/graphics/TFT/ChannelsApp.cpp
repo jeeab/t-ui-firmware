@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 #include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar
 #include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
+#include "graphics/view/TFT/UnreadCounts.h" // how many are waiting in each conversation
 #include "lvgl.h"
 #include "util/ILog.h"
 #include <Arduino.h>
@@ -121,7 +122,7 @@ void initialsOf(const char *name, char *out, size_t n)
     out[o] = 0;
 }
 
-lv_obj_t *convoRow(uint32_t num, const char *name, const char *preview, const char *when, bool unread,
+lv_obj_t *convoRow(uint32_t num, const char *name, const char *preview, const char *when, uint32_t unread,
                    bool isChannel)
 {
     lv_obj_t *row = lv_obj_create(listCont);
@@ -187,13 +188,23 @@ lv_obj_t *convoRow(uint32_t num, const char *name, const char *preview, const ch
     lv_obj_align(pv, LV_ALIGN_TOP_LEFT, 60, 32);
 
     if (unread) {
-        lv_obj_t *dot = lv_obj_create(row);
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 10, 10);
-        lv_obj_align(dot, LV_ALIGN_BOTTOM_RIGHT, -13, -11);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(dot, lv_color_hex(0x30d158), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+        // A COUNT, not just a dot. The whole point of this change is that "3" in one row and
+        // "1" in another is the thing a single device-wide number could never tell you.
+        lv_obj_t *badge = lv_obj_create(row);
+        lv_obj_remove_style_all(badge);
+        lv_obj_set_size(badge, unread > 9 ? 24 : 18, 18);
+        lv_obj_align(badge, LV_ALIGN_BOTTOM_RIGHT, -12, -8);
+        lv_obj_set_style_radius(badge, 9, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(badge, lv_color_hex(0x30d158), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *n = lv_label_create(badge);
+        char nb[8];
+        snprintf(nb, sizeof(nb), "%u", (unsigned)(unread > 99 ? 99 : unread));
+        lv_label_set_text(n, nb);
+        lv_obj_set_style_text_font(n, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(n, lv_color_hex(0x04210d), LV_PART_MAIN);
+        lv_obj_center(n);
     }
     return row;
 }
@@ -318,7 +329,7 @@ void buildChannelList(void)
             when = age + 5;
 
         lv_obj_t *row = convoRow(convos[i], tdeck_node_name(convos[i]), preview, when,
-                                 notif_unread_from(convos[i]), false);
+                                 unread_get(convos[i]), false);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, onOpenDm, LV_EVENT_CLICKED, (void *)(uintptr_t)convos[i]);
     }
@@ -338,7 +349,10 @@ void buildChannelList(void)
         snprintf(sub, sizeof(sub), "%s  -  %s", role == 1 ? "Primary" : "Secondary",
                  prec >= 32 ? "exact positions" : (prec > 0 ? "approx positions" : "no positions"));
 
-        lv_obj_t *row = convoRow((uint32_t)i, tdeck_channel_name(i), sub, "", false, true);
+        // Channels get a count too now. They never had one: the old flag only ever knew about
+        // direct messages, so a busy channel looked exactly as quiet as an empty one.
+        lv_obj_t *row = convoRow((uint32_t)i, tdeck_channel_name(i), sub, "",
+                                 unread_get(unreadKeyForChannel((uint8_t)i)), true);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, onOpenChat, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 

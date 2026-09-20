@@ -2,6 +2,7 @@
 
 #include "graphics/view/TFT/TuiLabel.h" // tui_one_line: LONG_DOT needs a height
 #include "graphics/view/TFT/TuiStatusBar.h" // the persistent top bar (note item A4)
+#include "graphics/view/TFT/UnreadCounts.h" // unread, counted per conversation
 #include "graphics/view/TFT/TFTView_320x240.h"
 #include "Arduino.h"
 #include "graphics/common/BatteryLevel.h"
@@ -183,6 +184,7 @@ extern "C" void emoji_to_text(const char *in, char *out, size_t outN);
 extern "C" void notif_open(void);
 extern "C" int notif_count(void);
 extern "C" void notif_clear(void);
+extern "C" void notif_clear_one(uint32_t from, uint8_t ch, bool isChannel);
 extern "C" bool notif_peek(int i, char *who, size_t whoN, char *text, size_t textN, uint32_t *ageSecs);
 // Stopwatch module (StopwatchApp.cpp) — opened from its launcher tile.
 extern "C" void stopwatch_open(void);
@@ -9858,8 +9860,16 @@ void TFTView_320x240::ui_set_active(lv_obj_t *b, lv_obj_t *p, lv_obj_t *tp)
                     activeMsgContainer = objects.messages_container;
                 }
             }
-            unreadMessages = 0; // TODO: not all messages may be actually read
-            notif_clear();      // opening the messages IS reading them
+            // ⚠️ ONLY the conversation that was actually open. This used to be
+            // "unreadMessages = 0", carrying upstream's own "TODO: not all messages may be
+            // actually read" - and that TODO is exactly the bug Jake hit: two messages in two
+            // threads, open one, and the count for the other vanished with it.
+            // channelOrNode is a channel index below c_max_channels, a node number above it.
+            const bool wasChannel = (channelOrNode < c_max_channels);
+            unread_clear(wasChannel ? unreadKeyForChannel((uint8_t)channelOrNode) : channelOrNode);
+            unreadMessages = unread_total();
+            // ...and only this conversation's notifications, for the same reason.
+            notif_clear_one(channelOrNode, (uint8_t)channelOrNode, wasChannel);
             updateUnreadMessages();
         } else if (activePanel == objects.node_options_panel) {
             // we're moving away from node options panel, so save latest settings
@@ -16227,7 +16237,11 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
         bool viewingThisChat =
             onMeshScreen && activePanel == objects.messages_panel && container == activeMsgContainer;
         if (!viewingThisChat) {
-            unreadMessages++;
+            // Count it against the conversation it belongs to, not just against the device.
+            // A broadcast belongs to its channel; anything else is a direct message from
+            // `from` - the same test notif_add() below uses.
+            unread_add(to == UINT32_MAX ? unreadKeyForChannel(ch) : from);
+            unreadMessages = unread_total();
             updateUnreadMessages();
             // nodes[from] again: operator[] INSERTS a null for a key MUI has purged, and the
             // very next thing here dereferences it. Look it up once, safely, and share it.
@@ -16600,8 +16614,11 @@ void TFTView_320x240::showMessages(uint32_t nodeNum)
                                           LV_PART_MAIN | LV_STATE_DEFAULT);
             break;
         }
-        unreadMessages = 0; // TODO: not all messages may be actually read
-        notif_clear();      // opening the messages IS reading them
+        // Only THIS node's conversation. The channel overload above does not clear anything
+        // itself; channels are handled on the way out of the panel, from user_data.
+        unread_clear(nodeNum);
+        unreadMessages = unread_total();
+        notif_clear_one(nodeNum, 0, false);
         updateUnreadMessages();
     } else {
         // TODO: log error

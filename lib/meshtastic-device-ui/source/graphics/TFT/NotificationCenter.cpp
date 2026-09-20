@@ -51,6 +51,8 @@ extern "C" int notif_count(void);      // how many are being held
 extern "C" void notif_clear(void);     // "clear" button, and whenever messages are read
 extern "C" bool notif_peek(int i, char *who, size_t whoN, char *text, size_t textN, uint32_t *ageSecs);
 extern "C" bool notif_unread_from(uint32_t nodeNum); // does this node have something unread?
+// Drop the entries for ONE conversation. isChannel picks which of from/ch identifies it.
+extern "C" void notif_clear_one(uint32_t from, uint8_t ch, bool isChannel);
 
 // --- MUI shims (TFTView_320x240.cpp) ---
 extern "C" void tui_open_chat_with(uint32_t nodeNum);
@@ -443,6 +445,34 @@ extern "C" void notif_init(void)
 }
 
 extern "C" int notif_count(void) { return count; }
+
+// Drop just this conversation's entries and close up the gap, keeping the newest-last order
+// the rest of the file relies on. Opening one chat should not wipe the notice that somebody
+// ELSE messaged you - that is the same mistake the device-wide unread counter made.
+extern "C" void notif_clear_one(uint32_t from, uint8_t ch, bool isChannel)
+{
+    if (!store || count == 0)
+        return;
+    int w = 0;
+    for (int r = 0; r < count; r++) {
+        const bool mine = isChannel ? (store[r].isChannel && store[r].ch == ch)
+                                    : (!store[r].isChannel && store[r].from == from);
+        if (mine)
+            continue;
+        if (w != r)
+            store[w] = store[r];
+        w++;
+    }
+    if (w == count)
+        return; // nothing matched, so nothing to redraw
+    count = w;
+    if (count == 0)
+        hidePopup();
+    // Deferred for the same two reasons notif_clear() documents below: this can be called
+    // from a row's own handler, and from message handling mid-refresh with the SPI lock held.
+    if (screen && lv_screen_active() == screen)
+        lv_async_call([](void *) { if (screen && lv_screen_active() == screen) rebuild(); }, nullptr);
+}
 
 extern "C" void notif_clear(void)
 {
