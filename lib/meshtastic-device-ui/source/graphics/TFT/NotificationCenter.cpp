@@ -299,7 +299,7 @@ void buildScreen(void)
 
     listCont = lv_obj_create(screen);
     lv_obj_remove_style_all(listCont);
-    lv_obj_set_size(listCont, 320, 204);
+    lv_obj_set_size(listCont, 320, 184); // -20: the status bar took 20px off the top (tui_statusbar_reserve)
     lv_obj_align(listCont, LV_ALIGN_TOP_LEFT, 0, 36);
     lv_obj_set_flex_flow(listCont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(listCont, 6, LV_PART_MAIN);
@@ -510,6 +510,6 @@ extern "C" void notif_open(void)
             lv_obj_add_flag(lockedLbl, LV_OBJ_FLAG_HIDDEN);
     }
     if (listCont)
-        lv_obj_set_height(listCont, locked ? 186 : 204);
+        lv_obj_set_height(listCont, locked ? 166 : 184); // -20: the status bar took 20px off the top (tui_statusbar_reserve)
     lv_screen_load_anim(screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
 }

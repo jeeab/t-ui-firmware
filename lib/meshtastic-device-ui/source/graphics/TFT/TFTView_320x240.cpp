@@ -5372,7 +5372,7 @@ void TFTView_320x240::openGetApps(void)
 
         // Scrolling list of apps, sitting between the tabs and the Back button.
         getapps_list = lv_obj_create(getapps_screen);
-        lv_obj_set_size(getapps_list, 310, 122);
+        lv_obj_set_size(getapps_list, 310, 102); // -20 for the bar: at 122 the list ran under the Back button at the bottom
         lv_obj_align(getapps_list, LV_ALIGN_TOP_MID, 0, 74);
         lv_obj_set_style_bg_opa(getapps_list, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(getapps_list, 0, LV_PART_MAIN);

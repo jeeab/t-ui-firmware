@@ -439,7 +439,7 @@ void buildScreen(void)
 
     listCont = lv_obj_create(screen);
     lv_obj_remove_style_all(listCont);
-    lv_obj_set_size(listCont, 320, 202);
+    lv_obj_set_size(listCont, 320, 182); // -20: the status bar took 20px off the top (tui_statusbar_reserve)
     lv_obj_align(listCont, LV_ALIGN_TOP_MID, 0, 36);
     lv_obj_set_flex_flow(listCont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(listCont, 6, LV_PART_MAIN);
