@@ -17,6 +17,9 @@ extern volatile bool tdeck_wake_request;
 // Alt+C on the T-Deck keyboard emits a dedicated byte (0x0C, see the C3 keyboard firmware):
 // a touch-independent request to (re)run screen calibration, handled by the launcher's poll.
 extern volatile bool tdeck_calib_request;
+// I / O zoom the map (jeeab/t-ui#7). -1 out, +1 in.
+extern volatile int tdeck_map_zoom_request;
+extern "C" bool tdeck_maps_active(void);
 // The "erase" key pressed while nothing is being typed into: a request to go back, polled by
 // the launcher (which decides whether Back is allowed from the screen in front of the user).
 extern volatile bool tdeck_back_request;
@@ -67,6 +70,25 @@ void I2CKeyboardInputDriver::keyboard_read(lv_indev_t *indev, lv_indev_data_t *d
                 data->state = LV_INDEV_STATE_RELEASED;
                 data->key = 0;
                 break;
+            }
+            // I and O zoom the map (jeeab/t-ui#7). Checked here - after the wake/calibrate
+            // escapes, before the key can reach a widget or a Lua app - and ONLY while the map
+            // is the screen in front of you, so they stay ordinary letters everywhere else.
+            // Typing is still typing: if a text box has focus, "io" types "io".
+            if (!tdeck_input_gated && (data->key == 'i' || data->key == 'I' || data->key == 'o' ||
+                                       data->key == 'O') &&
+                tdeck_maps_active()) {
+                lv_group_t *zg = lv_indev_get_group(indev);
+                lv_obj_t *zf = zg ? lv_group_get_focused(zg) : nullptr;
+                const bool typing = zf && (lv_obj_check_type(zf, &lv_textarea_class) ||
+                                           lv_obj_check_type(zf, &lv_keyboard_class));
+                if (!typing) {
+                    tdeck_map_zoom_request = (data->key == 'i' || data->key == 'I') ? 1 : -1;
+                    lv_display_trigger_activity(NULL); // zooming is using the device
+                    data->state = LV_INDEV_STATE_RELEASED;
+                    data->key = 0;
+                    break;
+                }
             }
             // In programming mode, any key requests an exit (see the poll timer in
             // enterProgrammingMode) — a reliable escape that doesn't rely on the touchscreen.

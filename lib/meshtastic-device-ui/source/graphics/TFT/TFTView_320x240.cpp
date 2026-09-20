@@ -276,6 +276,9 @@ volatile bool tdeck_calib_request = false;
 //  case. The keyboard driver decides "is the user typing?" (it has the focused widget);
 //  handleBackGesture() below decides whether Back is allowed at all.
 volatile bool tdeck_back_request = false;
+// I / O on the keyboard zoom the map (jeeab/t-ui#7): -1 out, +1 in, 0 nothing pending. Set by
+// the keyboard driver, acted on by the UI poll below - never inside the indev read.
+volatile int tdeck_map_zoom_request = 0;
 
 #define LV_COLOR_HEX(C)                                                                                                          \
     {                                                                                                                            \
@@ -1073,6 +1076,13 @@ bool buildTileIconFromFile(lv_obj_t *tile, const char *path)
 // select keys there: the focus group still holds the launcher's tiles (we deliberately leave it
 // alone on the lock screen), and without this a click could fire a tile sitting behind the PIN
 // pad - on a locked device.
+// Is the map the screen being looked at? The keyboard driver asks before it takes I and O,
+// so those keys are ordinary letters everywhere else.
+extern "C" bool tdeck_maps_active(void)
+{
+    return TFTView_320x240::mapsScreenActive();
+}
+
 extern "C" bool tdeck_lockscreen_active(void)
 {
     return objects.lock_screen && lv_screen_active() == objects.lock_screen;
@@ -1116,6 +1126,14 @@ bool TFTView_320x240::tuiClockText(char *out, int outN)
 extern "C" int tdeck_battery_pct(void) { return TFTView_320x240::tuiBatteryPct(); }
 extern "C" bool tdeck_battery_plugged(void) { return TFTView_320x240::tuiBatteryPlugged(); }
 extern "C" bool tdeck_clock_text(char *out, int outN) { return TFTView_320x240::tuiClockText(out, outN); }
+
+// Static, like every other shim here: instance() is private, so a free extern "C" function
+// cannot reach it but a static member can. This file has taught me that more than once.
+bool TFTView_320x240::mapsScreenActive(void)
+{
+    TFTView_320x240 *self = instance();
+    return self && self->maps_screen && lv_screen_active() == self->maps_screen;
+}
 
 bool TFTView_320x240::tuiDeviceLocked(void)
 {
@@ -1416,6 +1434,18 @@ void TFTView_320x240::createLauncher(void)
             // Cursor against an edge scrolls the page. Returns immediately when the cursor is
             // off or hidden, which is almost always.
             THIS->trackballEdgeScroll();
+
+            // I / O zoomed the map (jeeab/t-ui#7). Done here rather than in the keyboard read:
+            // setZoom() rebuilds the tile layer, which is far too much work to do inside an
+            // input callback.
+            if (tdeck_map_zoom_request) {
+                const int dir = tdeck_map_zoom_request;
+                tdeck_map_zoom_request = 0;
+                if (THIS->userMap && TFTView_320x240::mapsScreenActive()) {
+                    THIS->userMap->setZoom(MapTileSettings::getZoomLevel() + dir);
+                    THIS->updateMapsZoom();
+                }
+            }
             // The persistent top bar. Cheap: it returns immediately unless the screen showing
             // has asked for it, and lv_label_set_text skips unchanged strings.
             tui_statusbar_tick();
