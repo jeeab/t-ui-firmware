@@ -611,6 +611,13 @@ class TFTView_320x240 : public MeshtasticView
     void glanceWidgetCard(lv_obj_t *parent, const struct LockWidgetText &w);               // the iPod-style glance: clock, who messaged, slide to unlock
     void remoteInit(void);                   // second LVGL pointer device, for injected taps
     void remoteService(void);                // run one pending remote command, UI task only
+    void trackballEdgeScroll(void);            // cursor at an edge scrolls the page
+    void updateTrackballRows(void);            // the cursor rows, hidden when it is off
+    lv_obj_t *settings_tb_speed_row = nullptr;
+    lv_obj_t *settings_tb_speed_label = nullptr;
+    lv_obj_t *settings_tb_style_row = nullptr;
+    lv_obj_t *settings_tb_style_label = nullptr;
+    lv_obj_t *settings_tb_hint = nullptr;
     void openLockSettings(void);             // Settings > Lock screen, all of it in one page
     void updateLockPageLabels(void);
     lv_obj_t *lockPageRow(lv_obj_t *parent, const char *title, int y, const char *btnText,

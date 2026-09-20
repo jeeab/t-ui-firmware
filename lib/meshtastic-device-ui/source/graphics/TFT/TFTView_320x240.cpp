@@ -124,6 +124,14 @@ extern "C" bool tdeck_trackball_nav_enabled(void);
 extern "C" bool tdeck_trackball_click_enabled(void);
 extern "C" void tdeck_trackball_click_set_enabled(bool en);
 extern "C" void tdeck_trackball_nav_set_enabled(bool en);
+extern "C" int tdeck_trackball_speed(void);            // 0 slow, 1 normal, 2 fast
+extern "C" void tdeck_trackball_set_speed(int v);
+extern "C" int tdeck_trackball_style(void);            // 0 see-through, 1 solid
+extern "C" void tdeck_trackball_set_style(int v);
+extern "C" void tdeck_trackball_cursor_restyle(void);  // repaint without a reboot
+extern "C" void tdeck_trackball_cursor_off(void);      // put the arrow away
+extern "C" bool tdeck_trackball_cursor_state(int *x, int *y); // where it is, if it is up
+extern "C" bool tdeck_trackball_take_scroll(int *dx, int *dy); // roll that hit an edge
 extern "C" bool tdeck_kbdlight_enabled(void);
 extern "C" void tdeck_kbdlight_set_enabled(bool en);
 // 12/24-hour clock (src/TDeckClockFormat.cpp). Drives Meshtastic's own
@@ -1405,6 +1413,9 @@ void TFTView_320x240::createLauncher(void)
 
             // Remote control over USB. Costs one volatile read per tick when idle.
             THIS->remoteService();
+            // Cursor against an edge scrolls the page. Returns immediately when the cursor is
+            // off or hidden, which is almost always.
+            THIS->trackballEdgeScroll();
             // The persistent top bar. Cheap: it returns immediately unless the screen showing
             // has asked for it, and lv_label_set_text skips unchanged strings.
             tui_statusbar_tick();
@@ -2208,14 +2219,14 @@ void TFTView_320x240::createSettingsScreen(void)
         lv_label_set_text(h, "MESH");
         lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
         lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 666);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 680);
     }
     {
         lv_obj_t *h = lv_label_create(settings_screen);
         lv_label_set_text(h, "SYSTEM");
         lv_obj_set_style_text_color(h, lv_color_hex(0x0a84ff), LV_PART_MAIN);
         lv_obj_set_style_text_font(h, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 758);
+        lv_obj_align(h, LV_ALIGN_TOP_LEFT, 16, 786);
     }
 
     // Everything about the lock lives on its own page now (Jake: "hint hint for putting
@@ -2466,11 +2477,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *chLbl = lv_label_create(settings_screen);
     lv_label_set_text(chLbl, "Add channel");
     lv_obj_set_style_text_color(chLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 696);
+    lv_obj_align(chLbl, LV_ALIGN_TOP_LEFT, 16, 710);
 
     lv_obj_t *chBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(chBtn, 110, 30);
-    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 692);
+    lv_obj_align(chBtn, LV_ALIGN_TOP_RIGHT, -16, 706);
     lv_obj_set_style_radius(chBtn, 8, LV_PART_MAIN);
     lv_obj_t *chBtnLbl = lv_label_create(chBtn);
     lv_obj_set_style_text_font(chBtnLbl, &ui_font_montserrat_12, LV_PART_MAIN);
@@ -2483,7 +2494,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(channel_import_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(channel_import_label, "Put the channel link in channel.txt on the card, then tap.");
     lv_obj_set_style_text_color(channel_import_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 726);
+    lv_obj_align(channel_import_label, LV_ALIGN_TOP_LEFT, 16, 740);
 
     lv_obj_add_event_cb(
         chBtn, [](lv_event_t *) { THIS->importChannelFromCard(); }, LV_EVENT_CLICKED, NULL);
@@ -2494,7 +2505,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *tzLbl = lv_label_create(settings_screen);
     lv_label_set_text(tzLbl, "Time zone");
     lv_obj_set_style_text_color(tzLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 788);
+    lv_obj_align(tzLbl, LV_ALIGN_TOP_LEFT, 16, 816);
 
     // When no zone is set the device silently runs on GMT. Showing the list's first entry in
     // that case made it look like Pacific was already chosen while the clock was really on
@@ -2508,7 +2519,7 @@ void TFTView_320x240::createSettingsScreen(void)
                                           : "Pacific\nMountain\nArizona\nCentral\nEastern\nAlaska\nHawaii\n"
                                             "UTC\nUK\nCentral Europe");
     lv_obj_set_width(tzDd, 150);
-    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 782);
+    lv_obj_align(tzDd, LV_ALIGN_TOP_RIGHT, -16, 810);
     lv_dropdown_set_selected(tzDd, tzUnset ? 0 : (uint32_t)tzCur);
     // Keep the open list on-screen: this row sits at the bottom of a tall scrolling screen,
     // so let it drop upward rather than off the end.
@@ -2534,11 +2545,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *clkLbl = lv_label_create(settings_screen);
     lv_label_set_text(clkLbl, "24-hour clock");
     lv_obj_set_style_text_color(clkLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 824);
+    lv_obj_align(clkLbl, LV_ALIGN_TOP_LEFT, 16, 852);
 
     lv_obj_t *clk_switch = lv_switch_create(settings_screen);
     lv_obj_set_size(clk_switch, 56, 28);
-    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 818);
+    lv_obj_align(clk_switch, LV_ALIGN_TOP_RIGHT, -16, 846);
     lv_obj_set_style_bg_color(clk_switch, lv_color_hex(0x30d158), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (!tdeck_clock_get_12h()) // the switch reads "24-hour", the setting stores "12-hour"
         lv_obj_add_state(clk_switch, LV_STATE_CHECKED);
@@ -2563,7 +2574,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *kbdLbl = lv_label_create(settings_screen);
     lv_label_set_text(kbdLbl, "Keyboard light");
     lv_obj_set_style_text_color(kbdLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 862);
+    lv_obj_align(kbdLbl, LV_ALIGN_TOP_LEFT, 16, 890);
 
     lv_obj_t *kbdHint = lv_label_create(settings_screen);
     lv_obj_set_width(kbdHint, 288);
@@ -2571,21 +2582,114 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(kbdHint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(kbdHint, "Press Alt + B to turn the keyboard backlight on or off.");
     lv_obj_set_style_text_color(kbdHint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 886);
+    lv_obj_align(kbdHint, LV_ALIGN_TOP_LEFT, 16, 914);
 
-    // The two trackball switches that used to sit here (roll-to-navigate and click-to-select)
-    // are gone. They promised something the firmware cannot currently deliver: navigation needs
-    // the widgets to be in an LVGL input group, and the default group is already owned by the
-    // node list, which reorders its internal linked list by hand on every received packet (see
-    // tdeckRefreshNavGroup). Borrowing it crashed the device. A switch that does nothing is worse
-    // than no switch, so they come out until this is rebuilt on a group of its own.
+    // ---- Trackball cursor (t-ui-firmware#1) ----------------------------------------------
+    // A T-Deck Plus owner reported the trackball dead in every direction. It is not broken -
+    // rolling is deliberately inert - and Jake promised them this toggle on 2026-08-31.
+    // Default OFF, as promised, so nothing changes for anyone used to the current behaviour.
     //
-    // What survives, and needs no setting: HOLD the trackball for Home, and double-click for Home.
+    // It is a CURSOR rather than focus navigation, because Jake asked for "every item on the
+    // screen selectable" and an LVGL focus group cannot do that: it only ever reaches widgets
+    // that were added to it, which leaves out the map, the games and every Lua app. A pointer
+    // reaches everything, and it also avoids the crash that killed the first attempt (see
+    // tdeckRefreshNavGroup for that story).
+    lv_obj_t *tbLbl = lv_label_create(settings_screen);
+    lv_label_set_text(tbLbl, "Trackball cursor");
+    lv_obj_set_style_text_color(tbLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_align(tbLbl, LV_ALIGN_TOP_LEFT, 16, 966);
 
-    // Back to the grid
+    lv_obj_t *tbSw = lv_switch_create(settings_screen);
+    lv_obj_align(tbSw, LV_ALIGN_TOP_RIGHT, -16, 940);
+    if (tdeck_trackball_nav_enabled())
+        lv_obj_add_state(tbSw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(
+        tbSw,
+        [](lv_event_t *e) {
+            lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+            const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+            tdeck_trackball_nav_set_enabled(on);
+            if (!on)
+                tdeck_trackball_cursor_off(); // put the arrow away immediately
+            THIS->updateTrackballRows();
+        },
+        LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Speed. A trackball in a 3D-printed case rolls very differently from a bare one - Jake's
+    // is stiff, somebody else's is loose - so one hard-coded number cannot suit both.
+    settings_tb_speed_row = lv_obj_create(settings_screen);
+    lv_obj_remove_style_all(settings_tb_speed_row);
+    lv_obj_set_size(settings_tb_speed_row, 320, 36);
+    lv_obj_align(settings_tb_speed_row, LV_ALIGN_TOP_LEFT, 0, 1000);
+    lv_obj_clear_flag(settings_tb_speed_row, LV_OBJ_FLAG_SCROLLABLE);
+    {
+        lv_obj_t *l = lv_label_create(settings_tb_speed_row);
+        lv_label_set_text(l, "Cursor speed");
+        lv_obj_set_style_text_color(l, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(l, LV_ALIGN_LEFT_MID, 16, 0);
+        lv_obj_t *b = lv_btn_create(settings_tb_speed_row);
+        lv_obj_set_size(b, 110, 30);
+        lv_obj_align(b, LV_ALIGN_RIGHT_MID, -16, 0);
+        lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            b,
+            [](lv_event_t *) {
+                tdeck_trackball_set_speed((tdeck_trackball_speed() + 1) % 3);
+                THIS->updateTrackballRows();
+            },
+            LV_EVENT_CLICKED, NULL);
+        settings_tb_speed_label = lv_label_create(b);
+        lv_obj_set_style_text_font(settings_tb_speed_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_center(settings_tb_speed_label);
+    }
+
+    // Style: the two options Jake asked for.
+    settings_tb_style_row = lv_obj_create(settings_screen);
+    lv_obj_remove_style_all(settings_tb_style_row);
+    lv_obj_set_size(settings_tb_style_row, 320, 36);
+    lv_obj_align(settings_tb_style_row, LV_ALIGN_TOP_LEFT, 0, 1038);
+    lv_obj_clear_flag(settings_tb_style_row, LV_OBJ_FLAG_SCROLLABLE);
+    {
+        lv_obj_t *l = lv_label_create(settings_tb_style_row);
+        lv_label_set_text(l, "Cursor style");
+        lv_obj_set_style_text_color(l, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(l, LV_ALIGN_LEFT_MID, 16, 0);
+        lv_obj_t *b = lv_btn_create(settings_tb_style_row);
+        lv_obj_set_size(b, 110, 30);
+        lv_obj_align(b, LV_ALIGN_RIGHT_MID, -16, 0);
+        lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_add_event_cb(
+            b,
+            [](lv_event_t *) {
+                tdeck_trackball_set_style(tdeck_trackball_style() == 0 ? 1 : 0);
+                tdeck_trackball_cursor_restyle(); // visible straight away, no reboot
+                THIS->updateTrackballRows();
+            },
+            LV_EVENT_CLICKED, NULL);
+        settings_tb_style_label = lv_label_create(b);
+        lv_obj_set_style_text_font(settings_tb_style_label, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_center(settings_tb_style_label);
+    }
+
+    // ⚠️ The honest warning Jake asked for. Holding the ball used to go Home from anywhere,
+    // and it was deliberately never a setting precisely because it always worked. With the
+    // cursor on it cannot: a hold has to mean "keep pressing what I am pointing at", or
+    // dragging a slider and scrolling a list would be impossible. Say so here rather than
+    // letting somebody discover it while trying to get out of an app.
+    settings_tb_hint = lv_label_create(settings_screen);
+    lv_obj_set_width(settings_tb_hint, 288);
+    lv_label_set_long_mode(settings_tb_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(settings_tb_hint, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(settings_tb_hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_align(settings_tb_hint, LV_ALIGN_TOP_LEFT, 16, 1076);
+
+    updateTrackballRows();
+
     lv_obj_t *backBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(backBtn, 90, 34);
-    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 1064);
+    lv_obj_align(backBtn, LV_ALIGN_TOP_MID, 0, 1276);
     lv_obj_set_style_radius(backBtn, 10, LV_PART_MAIN);
     lv_obj_add_event_cb(
         backBtn,
@@ -2609,7 +2713,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_label_set_text(verLbl, verBuf);
     lv_obj_set_style_text_align(verLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(verLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1108);
+    lv_obj_align(verLbl, LV_ALIGN_TOP_MID, 0, 1320);
 
     // "Send my location" - Jake, 2026-09-18: "manua share location and info button?"
     //
@@ -2621,11 +2725,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shareNowLbl = lv_label_create(settings_screen);
     lv_label_set_text(shareNowLbl, "Send my location");
     lv_obj_set_style_text_color(shareNowLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 928);
+    lv_obj_align(shareNowLbl, LV_ALIGN_TOP_LEFT, 16, 1140);
 
     lv_obj_t *shareNowBtn = lv_btn_create(settings_screen);
     lv_obj_set_size(shareNowBtn, 116, 30);
-    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 924);
+    lv_obj_align(shareNowBtn, LV_ALIGN_TOP_RIGHT, -16, 1136);
     lv_obj_set_style_radius(shareNowBtn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shareNowBtn, lv_color_hex(0x30d158), LV_PART_MAIN);
     lv_obj_t *shareNowBtnLbl = lv_label_create(shareNowBtn);
@@ -2641,7 +2745,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(share_now_hint, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(share_now_hint, "Broadcasts where you are right now, once.");
     lv_obj_set_style_text_color(share_now_hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 954);
+    lv_obj_align(share_now_hint, LV_ALIGN_TOP_LEFT, 16, 1166);
 
     // "Screenshot" - Jake, 2026-09-18: "debug: screen shot thar we can both trigger. saves
     // to sd". Five seconds of countdown, so there is time to leave Settings and get to the
@@ -2650,11 +2754,11 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_t *shotLbl = lv_label_create(settings_screen);
     lv_label_set_text(shotLbl, "Screenshot");
     lv_obj_set_style_text_color(shotLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 992);
+    lv_obj_align(shotLbl, LV_ALIGN_TOP_LEFT, 16, 1204);
 
     shot_btn = lv_btn_create(settings_screen);
     lv_obj_set_size(shot_btn, 116, 30);
-    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 988);
+    lv_obj_align(shot_btn, LV_ALIGN_TOP_RIGHT, -16, 1200);
     lv_obj_set_style_radius(shot_btn, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(shot_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
     shot_btn_label = lv_label_create(shot_btn);
@@ -2670,7 +2774,7 @@ void TFTView_320x240::createSettingsScreen(void)
     lv_obj_set_style_text_font(shot_hint_label, &ui_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(shot_hint_label, "Tap, then go to the screen you want. Saved to /shots on the card.");
     lv_obj_set_style_text_color(shot_hint_label, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 1018);
+    lv_obj_align(shot_hint_label, LV_ALIGN_TOP_LEFT, 16, 1230);
 }
 
 /**
@@ -2749,6 +2853,93 @@ void TFTView_320x240::importChannelFromCard(void)
         },
         100, NULL);
 #endif
+}
+
+// Keep the trackball rows telling the truth: the speed and style only mean anything when the
+// cursor is on, so they hide when it is off, and the hint changes with it.
+// The deepest scrollable thing under a point. A list inside a screen should scroll before
+// the screen does, which is what "deepest" buys - and an object that has nothing to scroll is
+// skipped, so the cursor does not get stuck against a container that simply cannot move.
+static lv_obj_t *tdeckScrollableAt(lv_obj_t *parent, int x, int y)
+{
+    lv_obj_t *best = nullptr;
+    const uint32_t n = lv_obj_get_child_count(parent);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *c = lv_obj_get_child(parent, i);
+        if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+            continue;
+        lv_area_t a;
+        lv_obj_get_coords(c, &a);
+        if (x < a.x1 || x > a.x2 || y < a.y1 || y > a.y2)
+            continue;
+        lv_obj_t *deeper = tdeckScrollableAt(c, x, y);
+        if (deeper) {
+            best = deeper;
+        } else if (lv_obj_has_flag(c, LV_OBJ_FLAG_SCROLLABLE) &&
+                   (lv_obj_get_scroll_bottom(c) > 0 || lv_obj_get_scroll_top(c) > 0 ||
+                    lv_obj_get_scroll_left(c) > 0 || lv_obj_get_scroll_right(c) > 0)) {
+            best = c;
+        }
+    }
+    return best;
+}
+
+// Rolled into an edge -> scroll whatever is under the cursor. Called from the 60ms timer.
+//
+// ⚠️ Driven by the ROLL, not by the cursor's position: leaving the arrow parked near an edge
+// does nothing at all. Jake asked for that explicitly, and he is right - a page that creeps
+// because you left the cursor somewhere is a page fighting you.
+void TFTView_320x240::trackballEdgeScroll(void)
+{
+    int dx = 0, dy = 0;
+    if (!tdeck_trackball_take_scroll(&dx, &dy))
+        return;
+    int cx = 0, cy = 0;
+    if (!tdeck_trackball_cursor_state(&cx, &cy))
+        return;
+
+    lv_obj_t *scr = lv_screen_active();
+    if (!scr)
+        return;
+    lv_obj_t *target = tdeckScrollableAt(scr, cx, cy);
+    if (!target)
+        target = scr; // Settings scrolls the screen itself
+    // Negative: moving the CONTENT the other way is what brings the next part into view.
+    lv_obj_scroll_by(target, -dx, -dy, LV_ANIM_OFF);
+}
+
+void TFTView_320x240::updateTrackballRows(void)
+{
+    const bool on = tdeck_trackball_nav_enabled();
+    for (lv_obj_t *row : {settings_tb_speed_row, settings_tb_style_row}) {
+        if (!row)
+            continue;
+        if (on)
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (settings_tb_speed_label) {
+        switch (tdeck_trackball_speed()) {
+        case 0:  lv_label_set_text(settings_tb_speed_label, "Slow"); break;
+        case 2:  lv_label_set_text(settings_tb_speed_label, "Fast"); break;
+        default: lv_label_set_text(settings_tb_speed_label, "Normal"); break;
+        }
+    }
+    if (settings_tb_style_label)
+        lv_label_set_text(settings_tb_style_label, tdeck_trackball_style() == 1 ? "Solid" : "Outline");
+    if (settings_tb_hint) {
+        // The two rows above are hidden when the cursor is off, and this layout is absolute -
+        // so without this the hint sat marooned 80px below the switch with nothing between.
+        lv_obj_align(settings_tb_hint, LV_ALIGN_TOP_LEFT, 16, on ? 1048 : 976);
+        lv_label_set_text(settings_tb_hint,
+                          on ? "Roll to move the arrow, click to press what it is on, double-click "
+                               "for Back.\n\nHOLDING the ball no longer goes Home while the cursor "
+                               "is on - a hold has to keep pressing what you are pointing at. Use "
+                               "double-click for Back, or the Home tile."
+                             : "Off: rolling does nothing and everything is chosen by touch. "
+                               "Double-click or hold the ball for Home.");
+    }
 }
 
 void TFTView_320x240::openSettings(void)

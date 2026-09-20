@@ -85,3 +85,69 @@ extern "C" void tdeck_trackball_click_set_enabled(bool en)
     }
     LOG_INFO("trackball click-select: %s", en ? "on" : "off");
 }
+
+// ---- cursor speed -----------------------------------------------------------
+// How far one roll step moves the cursor. 0 = slow, 1 = normal, 2 = fast. Jake asked for it
+// in Settings because a trackball in a 3D-printed case rolls very differently from a bare one
+// - his is stiff, somebody else's is loose, and one hard-coded number cannot suit both.
+static int s_tbSpeed = -1;
+
+extern "C" int tdeck_trackball_speed(void)
+{
+    if (s_tbSpeed < 0) {
+        Preferences p;
+        if (p.begin("tdecktb", true)) {
+            s_tbSpeed = (int)p.getUChar("spd", 1);
+            p.end();
+        } else {
+            s_tbSpeed = 1;
+        }
+        if (s_tbSpeed < 0 || s_tbSpeed > 2)
+            s_tbSpeed = 1;
+    }
+    return s_tbSpeed;
+}
+
+extern "C" void tdeck_trackball_set_speed(int v)
+{
+    if (v < 0 || v > 2)
+        return;
+    s_tbSpeed = v;
+    Preferences p;
+    if (p.begin("tdecktb", false)) {
+        p.putUChar("spd", (uint8_t)v);
+        p.end();
+    }
+}
+
+// ---- cursor style -----------------------------------------------------------
+// 0 = see-through (the default Jake picked), 1 = solid. Two options, as asked.
+static int s_tbStyle = -1;
+
+extern "C" int tdeck_trackball_style(void)
+{
+    if (s_tbStyle < 0) {
+        Preferences p;
+        if (p.begin("tdecktb", true)) {
+            s_tbStyle = (int)p.getUChar("sty", 0);
+            p.end();
+        } else {
+            s_tbStyle = 0;
+        }
+        if (s_tbStyle < 0 || s_tbStyle > 1)
+            s_tbStyle = 0;
+    }
+    return s_tbStyle;
+}
+
+extern "C" void tdeck_trackball_set_style(int v)
+{
+    if (v < 0 || v > 1)
+        return;
+    s_tbStyle = v;
+    Preferences p;
+    if (p.begin("tdecktb", false)) {
+        p.putUChar("sty", (uint8_t)v);
+        p.end();
+    }
+}

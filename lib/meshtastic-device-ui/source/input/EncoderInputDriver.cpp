@@ -3,6 +3,7 @@
 #include "input/EncoderInputDriver.h"
 #include "Arduino.h"
 #include "util/ILog.h"
+#include <esp_heap_caps.h>
 
 volatile EncoderInputDriver::EncoderActionType EncoderInputDriver::action = TB_ACTION_NONE;
 
@@ -26,6 +27,228 @@ extern "C" bool tdeck_lockscreen_active(void);
 // When true the screen is dark/locked: trackball *rolls* are swallowed so they can't wake it
 // (only the double-click below wakes). Defined in TFTView_320x240.cpp.
 extern volatile bool tdeck_input_gated;
+// Settings -> Trackball cursor, and its speed (src/TDeckTrackball.cpp). Default off.
+extern "C" bool tdeck_trackball_nav_enabled(void);
+extern "C" int tdeck_trackball_speed(void);
+extern "C" int tdeck_trackball_style(void); // 0 = see-through, 1 = solid
+// "Go back" - the same request the keyboard's erase key raises (TFTView_320x240.cpp).
+extern volatile bool tdeck_back_request;
+
+// ---- the trackball cursor -------------------------------------------------------------
+// A real LVGL pointer, reported exactly like the touchscreen, so a click lands on whatever is
+// underneath it - a tile, the map, a game, a Lua app - with nothing needing to opt in.
+static lv_indev_t *tbPointer = nullptr;
+static lv_obj_t *tbCursorObj = nullptr;
+static int16_t tbX = 160, tbY = 120; // starts in the middle
+static bool tbTapNow = false;        // deliver one press on the next read
+static uint32_t tbLastMoveMs = 0;
+static uint32_t tbLastStepMs = 0;
+static const uint32_t kCursorIdleHideMs = 6000;
+
+static void tbCursorShow(bool on)
+{
+    if (!tbCursorObj)
+        return;
+    if (on)
+        lv_obj_remove_flag(tbCursorObj, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(tbCursorObj, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---- the arrow ------------------------------------------------------------------------
+// ⛔ ONE OBJECT, NOT A STACK OF BARS. lv_indev_set_cursor() moves a single object to follow
+// the pointer, and it moves on every roll step - an arrow assembled from little rectangles
+// would be ~40 objects to reposition and redraw each time. A canvas is one object with its
+// own pixel buffer: drawn once, then LVGL only moves it. It also gives real per-pixel alpha.
+//
+// THE SHAPE IS A POLYGON, SCAN-FILLED - not a table of row spans. Jake's reference picture
+// (2026-09-20) is the classic pointer drawn as an OUTLINE, hollow in the middle, which on a
+// 320px screen is the best of both: as easy to find as a solid arrow, and it hides nothing,
+// because whatever you are about to click shows through it. Hand-typed spans made the first
+// attempt look like a staircase; a polygon keeps the long edges straight at any scale.
+//
+// Tip at (0,0), down the left edge, out to the tail point, back up, and the long diagonal
+// home. Checked in the PC renderer against his picture before it came anywhere near here.
+static const int kArrowPts[7][2] = {{0, 0}, {0, 19}, {5, 15}, {8, 22}, {10, 21}, {7, 15}, {12, 14}};
+static const int kArrowScale = 2;
+static const int kArrowW = 13 * kArrowScale + 2;
+static const int kArrowH = 23 * kArrowScale + 2;
+
+// Even-odd scanline test, sampled at pixel centres.
+static bool arrowInside(double x, double y)
+{
+    bool in = false;
+    for (int i = 0, j = 6; i < 7; j = i++) {
+        const double xi = kArrowPts[i][0], yi = kArrowPts[i][1];
+        const double xj = kArrowPts[j][0], yj = kArrowPts[j][1];
+        if (((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi))
+            in = !in;
+    }
+    return in;
+}
+
+static bool arrowAt(int px, int py)
+{
+    return arrowInside((px - 1 + 0.5) / kArrowScale, (py - 1 + 0.5) / kArrowScale);
+}
+
+// Repaint for the current style. Called at init and whenever Settings changes it, so the
+// change shows without a reboot. style 0 = outline (hollow), 1 = solid.
+static void tbArrowPaint(void)
+{
+    if (!tbCursorObj)
+        return;
+    const bool solid = (tdeck_trackball_style() == 1);
+    lv_canvas_fill_bg(tbCursorObj, lv_color_hex(0x000000), LV_OPA_TRANSP);
+    for (int y = 0; y < kArrowH; y++) {
+        for (int x = 0; x < kArrowW; x++) {
+            const bool me = arrowAt(x, y);
+            bool rim = false, touching = false;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (!dx && !dy)
+                        continue;
+                    const bool n = arrowAt(x + dx, y + dy);
+                    if (me && !n)
+                        rim = true;
+                    if (!me && n)
+                        touching = true;
+                }
+            if (me && (rim || solid)) {
+                // The rim is always fully opaque white. That is what keeps the arrow readable
+                // over a bright icon - fading it is exactly what sank an earlier translucent
+                // cursor, which vanished over the red Alerts bell.
+                lv_canvas_set_px(tbCursorObj, x, y, lv_color_hex(0xffffff), rim ? LV_OPA_COVER : 150);
+            } else if (!me && touching) {
+                // A dark halo just outside, so the white rim still shows on a white map tile.
+                lv_canvas_set_px(tbCursorObj, x, y, lv_color_hex(0x000000), 200);
+            }
+        }
+    }
+}
+
+extern "C" void tdeck_trackball_cursor_restyle(void)
+{
+    tbArrowPaint();
+}
+
+// Rolled into an edge with nowhere left to go: that overflow becomes scroll. Consumed by
+// the UI timer (tdeck_trackball_take_scroll), never acted on here.
+static int tbScrollDx = 0, tbScrollDy = 0;
+
+// One roll step. It accelerates, so a fast roll crosses the screen while a single nudge moves
+// a few pixels; the Settings speed scales the whole thing.
+static void tbMove(int dx, int dy)
+{
+    const uint32_t now = millis();
+    const uint32_t gap = now - tbLastStepMs;
+    tbLastStepMs = now;
+    int step = (gap < 70) ? 16 : (gap < 160 ? 8 : 4);
+    switch (tdeck_trackball_speed()) {
+    case 0: step = (step + 1) / 2; break; // slow
+    case 2: step = step * 2; break;       // fast
+    default: break;                       // normal
+    }
+
+    int nx = tbX + dx * step, ny = tbY + dy * step;
+    // ⚠️ Only the part of the roll that CANNOT move the cursor becomes scroll. Sitting at an
+    // edge therefore does nothing; you have to keep rolling into it. And the page moves by
+    // however much you rolled, so it stops dead when you do.
+    if (nx < 2) {
+        tbScrollDx += nx - 2;
+        nx = 2;
+    } else if (nx > 317) {
+        tbScrollDx += nx - 317;
+        nx = 317;
+    }
+    if (ny < 2) {
+        tbScrollDy += ny - 2;
+        ny = 2;
+    } else if (ny > 237) {
+        tbScrollDy += ny - 237;
+        ny = 237;
+    }
+    tbX = (int16_t)nx;
+    tbY = (int16_t)ny;
+    tbLastMoveMs = now;
+    tbCursorShow(true);
+}
+
+// Hand the pending scroll to the caller and clear it. Returns false when there is nothing,
+// which is almost always.
+extern "C" bool tdeck_trackball_take_scroll(int *dx, int *dy)
+{
+    if (!tbScrollDx && !tbScrollDy)
+        return false;
+    if (dx)
+        *dx = tbScrollDx;
+    if (dy)
+        *dy = tbScrollDy;
+    tbScrollDx = 0;
+    tbScrollDy = 0;
+    return true;
+}
+
+static void tb_pointer_read(lv_indev_t *, lv_indev_data_t *data)
+{
+    data->point.x = tbX;
+    data->point.y = tbY;
+    // One read pressed, then straight back up: a tap. A HELD button must never become a long
+    // press on whatever is under the cursor - that would make dragging and scrolling
+    // impossible - so the press is always exactly one read long.
+    data->state = tbTapNow ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    tbTapNow = false;
+    if (tbCursorObj && !lv_obj_has_flag(tbCursorObj, LV_OBJ_FLAG_HIDDEN) &&
+        millis() - tbLastMoveMs > kCursorIdleHideMs)
+        tbCursorShow(false);
+}
+
+// Built the first time the cursor is actually wanted, so a device with the setting off never
+// creates any of it.
+static void tbCursorInit(void)
+{
+    if (tbPointer)
+        return;
+    tbPointer = lv_indev_create();
+    lv_indev_set_type(tbPointer, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(tbPointer, tb_pointer_read);
+
+    // PSRAM, allocated once and never freed: the canvas keeps the pointer for the life of
+    // the object. 28 x 38 at 4 bytes a pixel is about 4KB.
+    static uint8_t *arrowBuf = nullptr;
+    if (!arrowBuf)
+        arrowBuf = (uint8_t *)heap_caps_malloc(kArrowW * kArrowH * 4 + 64, MALLOC_CAP_SPIRAM);
+    if (!arrowBuf)
+        return; // no cursor rather than a bad one
+    tbCursorObj = lv_canvas_create(lv_layer_sys());
+    lv_canvas_set_buffer(tbCursorObj, arrowBuf, kArrowW, kArrowH, LV_COLOR_FORMAT_ARGB8888);
+    tbArrowPaint();
+    lv_obj_remove_flag(tbCursorObj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(tbCursorObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_indev_set_cursor(tbPointer, tbCursorObj); // LVGL keeps it on the point for us
+    tbCursorShow(false);
+}
+
+// Cursor off again: put the pointer away so it cannot hover or be seen.
+// Where the cursor is, for the edge-scroll in TFTView. Returns false when there is nothing
+// to do - cursor off, never created, or currently hidden - so the caller can bail cheaply.
+extern "C" bool tdeck_trackball_cursor_state(int *x, int *y)
+{
+    if (!tbCursorObj || !tdeck_trackball_nav_enabled())
+        return false;
+    if (lv_obj_has_flag(tbCursorObj, LV_OBJ_FLAG_HIDDEN))
+        return false;
+    if (x)
+        *x = tbX;
+    if (y)
+        *y = tbY;
+    return true;
+}
+
+extern "C" void tdeck_trackball_cursor_off(void)
+{
+    tbCursorShow(false);
+}
 
 EncoderInputDriver::EncoderInputDriver(void) {}
 
@@ -89,11 +312,20 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
     else if (INPUTDRIVER_ENCODER_TYPE == 3) {
         static uint32_t prevkey = 0;
         static uint32_t lastPressed = millis();
-        static uint32_t lastClickMs = 0; // for trackball double-click -> Home
+        static uint32_t lastClickMs = 0;      // for the double-click gesture
+        static uint32_t tbClickPendingAt = 0; // a single click waiting out the double window
 
         data->key = 0;
         data->enc_diff = 0;
         data->state = LV_INDEV_STATE_RELEASED;
+
+        // A single click that has now outlived the double-click window is a tap. Resolved here
+        // rather than in the block below because it has to fire on a read where nothing at all
+        // happened - that is the whole point of waiting.
+        if (tbClickPendingAt && millis() - tbClickPendingAt > 320) {
+            tbClickPendingAt = 0;
+            tbTapNow = true;
+        }
 
 #ifdef INPUTDRIVER_ENCODER_BTN
         // Fire PRESSED only on the button's DOWN EDGE (released -> pressed). The button is
@@ -115,7 +347,13 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
             btnDownAt = millis();
             longFired = false;
         } else if (btnDown && !longFired && millis() - btnDownAt > 700) {
-            tb_home_request = true; // held -> Home / lock / wake
+            // ⚠️ Only when the cursor is OFF. With it on, a hold has to keep pressing whatever
+            // is being pointed at, or dragging a slider and scrolling a list are impossible.
+            // Double-click becomes Back instead, and repeated Backs still reach Home. The
+            // Settings hint says this out loud, because giving up the always-works gesture is
+            // a real trade and nobody should discover it by surprise.
+            if (!tdeck_trackball_nav_enabled())
+                tb_home_request = true; // held -> Home / lock / wake
             longFired = true;
         } else if (!btnDown && btnWasDown && !longFired) {
             // A quick click. What it MEANS is decided in the block below: either a select, or
@@ -146,8 +384,23 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
                 // navigation is not actually running.
                 data->key = LV_KEY_ENTER;
                 data->state = LV_INDEV_STATE_PRESSED;
+            } else if (action == TB_ACTION_PRESSED && tdeck_trackball_nav_enabled()) {
+                // Cursor mode. Single click presses what the cursor is over; double click goes
+                // Back. Telling them apart means waiting out the window before acting on a
+                // single one, so it is kept short - 320ms is long enough for a deliberate
+                // double and short enough that a single click still feels immediate.
+                tbCursorInit();
+                const uint32_t nowMs = millis();
+                if (lastClickMs && nowMs - lastClickMs < 320) {
+                    tdeck_back_request = true; // double -> Back
+                    lastClickMs = 0;
+                    tbClickPendingAt = 0;      // and cancel the single that was waiting
+                } else {
+                    lastClickMs = nowMs;
+                    tbClickPendingAt = nowMs;  // a tap, unless a second click arrives
+                }
             } else if (action == TB_ACTION_PRESSED) {
-                // Trackball click never selects (selection is by touch). A press only feeds
+                // Cursor off: the click never selects (selection is by touch). It only feeds
                 // the double-click -> Home gesture, which also wakes the screen if it's asleep.
                 uint32_t nowMs = millis();
                 // Generous window: two clicks within 1.5s count as a double-click. The stiff
@@ -167,7 +420,19 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
             // Settings -> Trackball navigation turns rolling back on for people who want it.
             // Switched on, a roll emits the ordinary LVGL arrow keys, which is what used to move
             // the focus highlight and flip launcher pages.
-            // Roll stays inert, and the stored flags are deliberately NOT consulted any more.
+            // Rolling moves the cursor, when the user has asked for it.
+            if (tdeck_trackball_nav_enabled() && action != TB_ACTION_PRESSED &&
+                action != TB_ACTION_NONE) {
+                tbCursorInit();
+                switch (action) {
+                case TB_ACTION_LEFT:  tbMove(-1, 0); break;
+                case TB_ACTION_RIGHT: tbMove(1, 0);  break;
+                case TB_ACTION_UP:    tbMove(0, -1); break;
+                case TB_ACTION_DOWN:  tbMove(0, 1);  break;
+                default: break;
+                }
+            }
+            // Roll stays inert otherwise, and the stored flags are deliberately NOT consulted.
             // The switches are gone from Settings, so anyone who had turned them on would
             // otherwise be left with a trackball that shuffles focus around the node list and no
             // way to stop it. Hold-for-Home and double-click-for-Home both still work, and
