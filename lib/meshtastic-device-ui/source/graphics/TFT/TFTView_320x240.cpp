@@ -106,6 +106,8 @@ extern "C" void tdeck_lock_set_grace_secs(uint32_t secs);
 extern "C" int tdeck_lock_mode(void);
 extern "C" void tdeck_lock_set_mode(int mode);
 extern "C" int tdeck_lock_widget(void);
+extern "C" bool tdeck_units_metric(void);         // F/C, src/TDeckUnits.cpp
+extern "C" void tdeck_units_set_metric(bool metric);
 extern "C" void tdeck_lock_set_widget(int w);
 extern "C" uint32_t tdeck_lock_wx_minutes(void);
 // Keeping the lock screen lit (jeeab/t-ui#8, reshaped - see lockDevice).
@@ -9045,6 +9047,20 @@ void TFTView_320x240::lockDevice(void)
         stayOnSinceMs = lv_tick_get();
         stayOnBoostUntil = 0;
         showLockGlance();
+        // ⭐ THE LOCK SCREEN OWNS ITS OWN DIMMING while it is being kept lit. Jake: "the screen
+        // keep awake in the general settings vs the lock screen settings seem to fight each
+        // other" - and they did, because Settings > Screen Timeout drives the FADE while this
+        // page only sets the floor the fade stops at. With the timeout off, the driver never
+        // faded at all and the lock screen sat at full brightness with "Keep screen on"
+        // apparently doing nothing; with it short, the page dimmed on a schedule that had
+        // nothing to do with the minutes chosen here.
+        //
+        // The user's value is SAVED, not overwritten - it comes back on unlock, so the general
+        // setting still means what it says for the unlocked device.
+        if (!stayOnSavedTimeout) {
+            stayOnSavedTimeout = (int32_t)db.uiConfig.screen_timeout + 1; // +1: 0 is a real value
+            displaydriver->setScreenTimeout(kLockFadeSecs);
+        }
         // 0% would be indistinguishable from off, so the floor never goes below 1.
         const int pct = tdeck_lock_dim_pct();
         tdeck_dim_floor = (uint8_t)(pct <= 0 ? 1 : (pct * 255) / 100);
@@ -9592,6 +9608,8 @@ void TFTView_320x240::updateLockPageLabels(void)
         lv_label_set_text(lockpage_mode_label, lockModeName(tdeck_lock_mode()));
     if (lockpage_widget_label)
         lv_label_set_text(lockpage_widget_label, lockWidgetName(tdeck_lock_widget()));
+    if (lockpage_units_label)
+        lv_label_set_text(lockpage_units_label, tdeck_units_metric() ? "C" : "F");
     if (lockpage_wx_label)
         lv_label_set_text(lockpage_wx_label, wxPeriodName(tdeck_lock_wx_minutes()));
     if (lockpage_grace_label) {
@@ -9607,6 +9625,13 @@ void TFTView_320x240::updateLockPageLabels(void)
     // device with no PIN is a question the user should never have to answer.
     const bool pinMode = (tdeck_lock_mode() == 2);
     const bool weather = (tdeck_lock_widget() == 1);
+    // The units row belongs to the weather widget, so it appears and disappears with it.
+    if (lockpage_units_row) {
+        if (weather)
+            lv_obj_remove_flag(lockpage_units_row, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(lockpage_units_row, LV_OBJ_FLAG_HIDDEN);
+    }
     const bool staying = (tdeck_lock_stayon_mins() != 0);
     if (lockpage_stay_label)
         lv_label_set_text(lockpage_stay_label, stayOnName(tdeck_lock_stayon_mins()));
@@ -9727,6 +9752,27 @@ void TFTView_320x240::openLockSettings(void)
                                           tdeck_lock_set_wx_minutes(kMins[(at + 1) % 5]);
                                           THIS->updateLockPageLabels();
                                       });
+        y += 42;
+        // Jake: "can we have an option of F or C on the weather widget." Sits with the weather
+        // rows because that is where he went looking, and hides with them when the widget is
+        // something else.
+        //
+        // ⭐ It drives Meshtastic's OWN config.display.units, which the widget already read -
+        // the units were never the problem, the missing switch was. A widget-local setting
+        // would have been easier and worse: the widget saying 18C while the node list said 64F,
+        // with no answer to which one the device is actually on.
+        lockpage_units_row = lockPageRow(lockpage_screen, "Temperature", y, "F", &lockpage_units_label,
+                                         [](lv_event_t *) {
+                                             tdeck_units_set_metric(!tdeck_units_metric());
+                                             // Update the copy the widget reads now, so it flips
+                                             // immediately instead of after the next config sync -
+                                             // the same reason the 12h switch does it.
+                                             THIS->db.config.display.units =
+                                                 tdeck_units_metric()
+                                                     ? meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL
+                                                     : meshtastic_Config_DisplayConfig_DisplayUnits_METRIC;
+                                             THIS->updateLockPageLabels();
+                                         });
         y += 48;
 
         // ---- keeping the lock screen lit (jeeab/t-ui#8, reshaped) --------------------------
@@ -10212,6 +10258,12 @@ void TFTView_320x240::lockGlanceUnlocked(void)
     }
     // Straight in. The wake path already cleared the input gate and the forced-dark flag,
     // so there is nothing left to undo except the grace clock itself.
+    // Put the general Screen Timeout back: the lock screen borrowed it while it was being kept
+    // lit (see lockDevice), and it governs the unlocked device again from here.
+    if (stayOnSavedTimeout) {
+        displaydriver->setScreenTimeout((uint16_t)(stayOnSavedTimeout - 1));
+        stayOnSavedTimeout = 0;
+    }
     lockState = LOCK_NONE;
     lockedAtMs = 0;
     lv_display_trigger_activity(NULL);
@@ -10347,6 +10399,12 @@ void TFTView_320x240::submitLockPad(void)
 
     // Unlocking (require at least one digit so a blank OK can't slip through)
     if (lockLen > 0 && entered == effectiveLockPin()) {
+    // Put the general Screen Timeout back: the lock screen borrowed it while it was being kept
+    // lit (see lockDevice), and it governs the unlocked device again from here.
+    if (stayOnSavedTimeout) {
+        displaydriver->setScreenTimeout((uint16_t)(stayOnSavedTimeout - 1));
+        stayOnSavedTimeout = 0;
+    }
         lockState = LOCK_NONE;
         lockedAtMs = 0; // unlocked for real: the next lock starts a fresh grace window
         tdeck_hold_dark = false;

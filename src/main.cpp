@@ -1303,6 +1303,7 @@ extern "C" void tdeck_wx_auto_service(void); // TDeckWeatherAuto.cpp - lock-scre
 // T-Deck launcher 12/24-hour switch: apply + persist a pending clock-format change from this
 // (main) thread, for the same reason as the others. Defined in src/TDeckClockFormat.cpp.
 extern "C" void tdeck_clock_service(void);
+extern "C" void tdeck_units_service(void); // F/C, src/TDeckUnits.cpp
 // T-Deck launcher "internet door" for Lua apps: runs an app's Wi-Fi fetch (BT teardown, join,
 // HTTP) as a non-blocking state machine on this safe thread. Defined in src/TDeckNet.cpp.
 extern "C" void tdeck_net_service(void);
@@ -1402,6 +1403,7 @@ void loop()
     tdeck_share_location_service();
     tdeck_wx_auto_service();
     tdeck_clock_service();
+    tdeck_units_service();
     tdeck_net_service();
 #ifdef NETDOOR_SELFTEST
     netDoorSelfTest();

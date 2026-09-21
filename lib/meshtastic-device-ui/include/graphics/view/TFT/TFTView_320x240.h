@@ -653,6 +653,13 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *lockpage_mode_label = nullptr;
     lv_obj_t *lockpage_widget_label = nullptr;
     lv_obj_t *lockpage_wx_label = nullptr;
+    // The general Screen Timeout, borrowed while the lock screen is kept lit, +1 so that 0 -
+    // itself a valid timeout meaning "off" - is distinguishable from "nothing saved".
+    int32_t stayOnSavedTimeout = 0;
+    static constexpr uint16_t kLockFadeSecs = 10; // how long the kept-lit page waits before dimming
+
+    lv_obj_t *lockpage_units_row = nullptr;   // "Temperature" F/C, weather widget only
+    lv_obj_t *lockpage_units_label = nullptr;
     lv_obj_t *lockpage_grace_label = nullptr;
     lv_obj_t *lockpage_pin_row = nullptr;     // hidden unless the mode is PIN
     lv_obj_t *lockpage_grace_row = nullptr;   // ditto
