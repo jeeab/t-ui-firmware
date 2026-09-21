@@ -166,8 +166,16 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
         if (lgfx->getBrightness() < lastBrightness) {
             lgfx->setBrightness(lastBrightness);
             lastBrightness = lgfx->getBrightness();
-            tdeck_input_gated = false; // screen is lit again — accept touch/keyboard/roll
         }
+        // ⚠️ CLEAR THE GATE UNCONDITIONALLY, not only on the brightness-recovery edge.
+        // Reaching this branch means the screen is LIT and not timing out, so a gate left set
+        // here is a visible UI that silently ignores every touch - Jake hit exactly that
+        // ("its not letting me enter the pin, could be just not recognizing touch inputs")
+        // with the PIN pad on screen. Hanging the clear off "brightness is coming back up"
+        // missed every path where the brightness never actually dipped first.
+        // The kept-lit lock screen does not come through here: it sits in the timeout branch
+        // above, dimmed, and manages its own input rules.
+        tdeck_input_gated = false;
         // Screen is lit. Deliberately outside the if above so this also covers the very
         // first pass after boot, where nothing has dimmed yet and so there is no
         // brightness change to hang the "screen came back" moment off.

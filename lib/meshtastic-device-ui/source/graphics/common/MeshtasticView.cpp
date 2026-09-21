@@ -19,11 +19,17 @@ void MeshtasticView::init(IClientBase *client)
     time(&lastrun20);
 }
 
+extern volatile const char *tdeck_tft_where; // freeze breadcrumb (TFTView_320x240.cpp)
+
 void MeshtasticView::task_handler(void)
 {
+    // These two do utterly different work and `in=mui` could not tell them apart.
+    tdeck_tft_where = "lvgl";
     DeviceGUI::task_handler();
+    tdeck_tft_where = "pkt";
     controller->runOnce();
 
+    tdeck_tft_where = "mui-20s";
     time(&curtime);
     if (curtime - lastrun20 >= 20) {
         lastrun20 = curtime;

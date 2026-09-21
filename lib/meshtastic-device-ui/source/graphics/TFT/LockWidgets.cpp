@@ -37,6 +37,7 @@ extern "C" bool tdeck_wall_clock(int *year, int *mon, int *day, int *hour, int *
 // and "sunset is at 7:42" is still the answer you wanted - the Sundown app made the same call.
 extern "C" bool tdeck_lastpos_get(int32_t *lat, int32_t *lon);
 extern "C" void tdeck_lastpos_set(int32_t lat, int32_t lon);
+extern volatile const char *tdeck_tft_where; // freeze breadcrumb
 // A freshly fetched forecast waiting to be written to the card (src/TDeckWeatherAuto.cpp).
 // Handed over once; we own the buffer and must free it. See tdeck_wx_auto_service() for
 // why the fetch happens there and the file is written here.
@@ -427,6 +428,7 @@ void mergeFetched(char *body)
         return;
     }
     int n = -1;
+    tdeck_tft_where = "sd-weather";
     FsFile f = SDFs.open("/apps/weather/forecast.txt", O_RDONLY);
     if (f) {
         n = f.read((uint8_t *)old, 1023);

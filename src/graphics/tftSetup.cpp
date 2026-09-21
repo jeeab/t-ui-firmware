@@ -28,12 +28,20 @@ CallbackObserver<DeviceScreen, esp_sleep_wakeup_cause_t> endSleepObserver =
     CallbackObserver<DeviceScreen, esp_sleep_wakeup_cause_t>(deviceScreen, &DeviceScreen::wakeUp);
 #endif
 
+// What the tft task is doing, for the freeze record (TFTView_320x240.cpp).
+extern volatile const char *tdeck_tft_where;
+
 void tft_task_handler(void *param = nullptr)
 {
     while (true) {
+        // "waiting for the bus" and "holding the bus" are completely different failures, and
+        // the freeze record could not tell them apart. Now it can.
+        tdeck_tft_where = "spi-wait";
         spiLock->lock();
+        tdeck_tft_where = "handler";
         deviceScreen->task_handler();
         spiLock->unlock();
+        tdeck_tft_where = "idle";
         deviceScreen->sleep();
     }
 }

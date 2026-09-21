@@ -73,10 +73,13 @@ static uint32_t s_stallWrittenForMs = 0;   // last stall duration persisted (0 =
 static uint32_t s_prevStallMs = 0;         // read back at boot
 static char s_prevStallThread[24] = {0};
 static volatile void *s_loopTask = nullptr; // the main loop's task handle (for eTaskGetState)
-static char s_prevStallLock[40] = {0};      // spiLock holder + loop state at stall time
+static char s_prevStallLock[64] = {0};      // spiLock holder + loop state at stall time
 
 // The UI task's own heartbeat, so the watcher below can tell WHICH side stopped. Set from
 // tdeck_diag_tick(), which the UI runs once a second.
+// What the tft task was doing when it stalled (TFTView_320x240.cpp).
+extern volatile const char *tdeck_tft_where;
+
 static volatile uint32_t s_lastUiMs = 0;
 static volatile void *s_uiTask = nullptr;
 
@@ -86,7 +89,7 @@ static volatile void *s_uiTask = nullptr;
 // exactly the situation being recorded.
 static void recordStall(const char *who, uint32_t stuckMs)
 {
-    char lockInfo[40];
+    char lockInfo[64];
     char loopState = '?', uiState = '?';
     if (s_loopTask) {
         switch (eTaskGetState((TaskHandle_t)s_loopTask)) {
@@ -109,10 +112,12 @@ static void recordStall(const char *who, uint32_t stuckMs)
     void *ow = spiLock ? (void *)spiLock->owner : nullptr;
     if (ow) {
         const uint32_t heldMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - spiLock->lockedAtMs;
-        snprintf(lockInfo, sizeof(lockInfo), "%s %lus loop=%c ui=%c", pcTaskGetName((TaskHandle_t)ow),
-                 (unsigned long)(heldMs / 1000), loopState, uiState);
+        snprintf(lockInfo, sizeof(lockInfo), "%s %lus loop=%c ui=%c in=%s", pcTaskGetName((TaskHandle_t)ow),
+                 (unsigned long)(heldMs / 1000), loopState, uiState,
+                 tdeck_tft_where ? (const char *)tdeck_tft_where : "?");
     } else {
-        snprintf(lockInfo, sizeof(lockInfo), "free loop=%c ui=%c", loopState, uiState);
+        snprintf(lockInfo, sizeof(lockInfo), "free loop=%c ui=%c in=%s", loopState, uiState,
+                 tdeck_tft_where ? (const char *)tdeck_tft_where : "?");
     }
     Preferences p;
     if (p.begin("tdeckdiag", false)) {
@@ -304,7 +309,7 @@ extern "C" void tdeck_diag_tick(void)
             // The freeze's WHY: who holds spiLock (both observed stalls — GPS and
             // RadioIf — can only block forever on it), how long they've held it,
             // and whether the main loop is Blocked (mutex wait) or Running (spin).
-            char lockInfo[40];
+            char lockInfo[64];
             {
                 char loopState = '?';
                 if (s_loopTask) {

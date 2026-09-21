@@ -271,6 +271,11 @@ volatile uint8_t tdeck_dim_floor = 0;
 // A key or the trackball was pressed while the lock screen is lit: brighten for three
 // seconds, do NOT unlock. Consumed by the UI poll.
 volatile bool tdeck_stayon_boost_request = false;
+// What the "tft" task is doing right now. Read by the stall watcher (src/TDeckMemInfo.cpp)
+// when it catches a freeze, so the record names the operation and not merely the task.
+// Always a string LITERAL - one pointer store, nothing copied, safe to read from another
+// task because the worst case is a stale but still-valid literal.
+volatile const char *tdeck_tft_where = "boot";
 
 // How long the PIN pad may sit untouched before the screen goes black again. Fixed rather
 // than a setting: it is a lock screen, and ten seconds is long enough to type a six-digit
@@ -1110,6 +1115,16 @@ extern "C" bool tdeck_lockscreen_active(void)
     return objects.lock_screen && lv_screen_active() == objects.lock_screen;
 }
 
+// Is the Home grid in front? The launcher screen is a MEMBER, and instance() is private, so
+// it is mirrored into a file-scope pointer by createLauncher() - the same shim pattern the
+// other extern "C" helpers here use.
+lv_obj_t *tdeck_launcher_scr = nullptr;
+
+extern "C" bool tdeck_on_home_screen(void)
+{
+    return tdeck_launcher_scr && lv_screen_active() == tdeck_launcher_scr;
+}
+
 // "Is this device locked", as opposed to "is the keypad the screen you are looking at".
 // The Notifications page can now be opened FROM the lock screen, so something has to be able
 // to tell that the code has not been given yet - otherwise a notification row would be a way
@@ -1275,6 +1290,7 @@ void TFTView_320x240::createLauncher(void)
     ILOG_DEBUG("createLauncher()");
 
     launcher_screen = lv_obj_create(NULL);
+    tdeck_launcher_scr = launcher_screen; // so tdeck_on_home_screen() can see it
     lv_obj_set_style_bg_color(launcher_screen, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_clear_flag(launcher_screen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -8936,6 +8952,7 @@ void TFTView_320x240::serviceBattLog(void)
     snprintf(line, sizeof(line), "%lu,%d,%d,%d,%d,%d,%d,%lu", (unsigned long)(now / 1000), mv, pct, usb, chg,
              state, (int)tdeck_dim_floor, (unsigned long)db.uiConfig.screen_brightness);
 
+    tdeck_tft_where = "sd-battlog";
     FsFile f = SDFs.open("/battlog.csv", O_WRONLY | O_CREAT | O_APPEND);
     if (!f)
         return;
@@ -17554,6 +17571,12 @@ void TFTView_320x240::updateNodesFiltered(bool reset)
  */
 void TFTView_320x240::updateLastHeard(uint32_t nodeNum)
 {
+    // ⚠️ PRIME SUSPECT for the 15-second stalls. This runs on EVERY packet and reorders a
+    // 229-entry list by hand, which also dirties the container and makes LVGL redraw it -
+    // over the same SPI bus this task is holding the lock for. The code already carries a
+    // scar from this path (see the _lv_ll_move_before note above). Broken into pieces so the
+    // freeze record says which part, rather than just naming the function.
+    tdeck_tft_where = "lh-retract";
     retractOnNodeHeard(nodeNum); // they are demonstrably in range this second - best chance we get
     auto it = nodes.find(nodeNum);
     if (it != nodes.end() && it->second) {
@@ -17563,10 +17586,12 @@ void TFTView_320x240::updateLastHeard(uint32_t nodeNum)
         if (it->first != ownNode) {
             if (lastHeard > 0 && curtime - lastHeard >= secs_until_offline) {
                 nodesOnline++;
+                tdeck_tft_where = "lh-filter";
                 applyNodesFilter(nodeNum);
                 updateNodesStatus();
             }
             // move to top position
+            tdeck_tft_where = "lh-reorder";
             lv_obj_move_to_index(it->second, 1);
 
             // re-arrange the group linked list i.e. move the node after the top position
@@ -17828,15 +17853,23 @@ void TFTView_320x240::updateFreeMem(void)
 
 void TFTView_320x240::task_handler(void)
 {
+    tdeck_tft_where = "mui";
     MeshtasticView::task_handler();
 
     if (screensInitialised) {
         // exactly ONE map may pump its redraws at a time (MapPanel::redraw() keeps
         // function-local statics), so gate each on its screen actually being visible
-        if (map && activePanel == objects.map_panel && lv_screen_active() == objects.main_screen)
+        // ⚠️ PRIME SUSPECTS. Both of these load map tiles from the SD card - which is on the
+        // very SPI bus this task is holding the lock for - so a card that stalls stalls
+        // everything behind it.
+        if (map && activePanel == objects.map_panel && lv_screen_active() == objects.main_screen) {
+            tdeck_tft_where = "map-tiles";
             map->task_handler();
-        if (userMap && maps_screen && lv_screen_active() == maps_screen)
+        }
+        if (userMap && maps_screen && lv_screen_active() == maps_screen) {
+            tdeck_tft_where = "usermap-tiles";
             userMap->task_handler();
+        }
 
         if (curtime - lastrun1 >= 1) { // call every 1s
             if (map) {
@@ -17845,6 +17878,7 @@ void TFTView_320x240::task_handler(void)
 
             lastrun1 = curtime;
             actTime++;
+            tdeck_tft_where = "1s-tick";
             updateTime();
 
             if (curtime - lastrun5 >= 5) { // call every 5s
@@ -17893,6 +17927,7 @@ void TFTView_320x240::task_handler(void)
             }
         }
         if (processingFilter || nodesChanged) {
+            tdeck_tft_where = "node-filter";
             updateNodesFiltered(nodesChanged);
         }
     }

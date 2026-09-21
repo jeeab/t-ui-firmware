@@ -51,6 +51,8 @@ void ViewController::init(MeshtasticView *gui, IClientBase *_client)
  * @brief runOnce need to be called periodically to process send/receive queues
  *
  */
+extern volatile const char *tdeck_tft_where; // freeze breadcrumb (TFTView_320x240.cpp)
+
 void ViewController::runOnce(void)
 {
     if (client) {
@@ -58,11 +60,14 @@ void ViewController::runOnce(void)
             (view->getState() >= MeshtasticView::eBootScreenDone && requestConfigRequired))
             requestConfig();
 
-        if (configCompleted && !messagesRestored)
+        if (configCompleted && !messagesRestored) {
+            tdeck_tft_where = "pkt-restore"; // reads the message log off the card
             restoreTextMessages();
-        else {
-            if (myNodeNum == 0 || view->getState() != MeshtasticView::eProgrammingMode)
+        } else {
+            if (myNodeNum == 0 || view->getState() != MeshtasticView::eProgrammingMode) {
+                tdeck_tft_where = "pkt-recv";
                 receive();
+            }
         }
 
         // executed every 10s:
@@ -82,6 +87,7 @@ void ViewController::runOnce(void)
         // executed every 1s:
         if (curtime - lastrun1 >= 1) {
             lastrun1 = curtime;
+            tdeck_tft_where = "pkt-client";
             client->task_handler();
         }
     }
@@ -605,6 +611,12 @@ bool ViewController::receive(void)
         do {
             meshtastic_FromRadio from = client->receive();
             if (from.which_payload_variant) {
+                // Which KIND of packet. A node-info update walks the whole node list; a text
+                // message does almost nothing. Written into a small static so the breadcrumb
+                // can carry a number without formatting anything on this path.
+                static char vbuf[16];
+                snprintf(vbuf, sizeof(vbuf), "pkt-v%u", (unsigned)from.which_payload_variant);
+                tdeck_tft_where = vbuf;
                 handleFromRadio(from);
             }
             gotPacket = from.which_payload_variant != 0;
