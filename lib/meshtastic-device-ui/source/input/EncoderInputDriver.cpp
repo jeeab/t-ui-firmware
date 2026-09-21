@@ -19,6 +19,7 @@ volatile int tb_nav_rows = 0;
 // Settings -> Trackball navigation (src/TDeckTrackball.cpp). Default OFF, so a device that
 // has never touched the setting behaves exactly as before: rolls do nothing at all.
 extern "C" bool tdeck_trackball_nav_enabled(void);
+extern "C" bool tdeck_on_home_screen(void); // hold-to-lock, see the hold gesture below
 // Settings -> Trackball click selects. Separate switch; HOLDING for Home is always on.
 extern "C" bool tdeck_trackball_click_enabled(void);
 // True while the PIN screen is up - see TFTView_320x240.cpp.
@@ -46,6 +47,43 @@ static int16_t tbX = 160, tbY = 120; // starts in the middle
 static bool tbTapNow = false;        // deliver one press on the next read
 static uint32_t tbLastMoveMs = 0;
 static uint32_t tbLastStepMs = 0;
+
+// ---- raw roll events, straight from the interrupts -------------------------------------
+// The two axes count SEPARATELY, and that is the whole reason diagonals work now. The old
+// code had every interrupt write one shared `action`, so a diagonal roll - which really does
+// pulse both axes - lost whichever pulse landed first. A variable holding one direction
+// cannot express two.
+//
+// Incremented from interrupt context with a plain ++, deliberately: the four pins share one
+// GPIO interrupt service on one core, so these handlers cannot preempt each other and the
+// read-modify-write is safe. (__atomic_fetch_add would have been the textbook answer and is
+// the WRONG one here - it can call into libatomic, which is not guaranteed to be resident in
+// RAM, and a flash access from an interrupt is a crash.) The consumer drains with an atomic
+// exchange from task context, where that is free, so the worst case is losing a single pulse
+// in a one-instruction window.
+static volatile int32_t tbRawX = 0, tbRawY = 0;
+
+// ---- the motion itself ------------------------------------------------------------------
+// Sub-pixel position, and velocity in pixels per 16ms sub-step. The ball adds velocity and
+// friction takes it away, which is what makes a flick glide to a stop instead of landing in
+// one jump.
+static float tbFx = 160.0f, tbFy = 120.0f;
+static float tbVx = 0.0f, tbVy = 0.0f;
+static uint32_t tbIntegMs = 0; // last integration, for real elapsed time
+static uint32_t tbCarryMs = 0; // leftover ms not yet turned into a sub-step
+
+// ---- the deadzone -----------------------------------------------------------------------
+// "then if i accidentally touch the ball it moves". Pulses are held back until enough arrive
+// close together to be a deliberate roll; a single stray pulse from a brushed ball is thrown
+// away instead of becoming a jump. Once moving, every pulse counts - the bar is only there
+// to START.
+static int tbArmCount = 0;
+static int32_t tbPendX = 0, tbPendY = 0;
+static uint32_t tbArmFirstMs = 0;
+static bool tbArmed = false;
+static const int kArmEvents = 2;          // pulses needed to believe it
+static const uint32_t kArmWindowMs = 400; // ...within this long
+static const uint32_t kDisarmMs = 500;    // silence after which we ask again
 static const uint32_t kCursorIdleHideMs = 6000;
 
 static void tbCursorShow(bool on)
@@ -137,65 +175,217 @@ extern "C" void tdeck_trackball_cursor_restyle(void)
 
 // Rolled into an edge with nowhere left to go: that overflow becomes scroll. Consumed by
 // the UI timer (tdeck_trackball_take_scroll), never acted on here.
-static int tbScrollDx = 0, tbScrollDy = 0;
+//
+// FLOAT, deliberately. These accumulate sub-pixel amounts every 16ms and are read every 60ms,
+// so truncating on the way IN threw away most of the movement - at the Slow setting every
+// single contribution was below 1.0 and (int) turned the whole feature off. The fraction is
+// now carried until it adds up to a whole pixel.
+static float tbScrollDx = 0.0f, tbScrollDy = 0.0f;
 
-// One roll step. It accelerates, so a fast roll crosses the screen while a single nudge moves
-// a few pixels; the Settings speed scales the whole thing.
-static void tbMove(int dx, int dy)
+// Scrolling covers more ground than pointing does - a list is long and the page is one
+// screenful - so the same roll is worth half again as much when it is pushing the page
+// instead of the arrow. Still proportional to the speed setting, so Slow stays slow.
+static const float kScrollBoost = 1.5f;
+
+// Pixels of velocity one roll pulse is worth. Multiply by 1/(1-friction) = 8.3 for the
+// distance it actually travels: about 3, 6, 12, 20 and 30 pixels across the five settings.
+// Jake wanted the range in Settings because a ball in a 3D-printed case rolls nothing like a
+// bare one - his is stiff, somebody else's is loose, and one number cannot suit both.
+static float tbGain(void)
 {
-    const uint32_t now = millis();
-    const uint32_t gap = now - tbLastStepMs;
-    tbLastStepMs = now;
-    int step = (gap < 70) ? 16 : (gap < 160 ? 8 : 4);
-    // The multiplier, not a tweak: this ball emits very few events per flick, so a step has
-    // to cover real distance. What used to be the top speed is index 1 here.
-    static const int kMul[5] = {1, 2, 4, 8, 14};
+    static const float kGain[5] = {0.36f, 0.72f, 1.44f, 2.40f, 3.60f};
     int sp = tdeck_trackball_speed();
     if (sp < 0 || sp > 4)
         sp = 2;
-    step *= kMul[sp];
+    return kGain[sp];
+}
 
-    int nx = tbX + dx * step, ny = tbY + dy * step;
-    // ⚠️ Only the part of the roll that CANNOT move the cursor becomes scroll. Sitting at an
-    // edge therefore does nothing; you have to keep rolling into it. And the page moves by
-    // however much you rolled, so it stops dead when you do.
-    if (nx < 2) {
-        tbScrollDx += nx - 2;
-        nx = 2;
-    } else if (nx > 317) {
-        tbScrollDx += nx - 317;
-        nx = 317;
+// One frame of motion. Called from the pointer read callback, so it runs exactly when LVGL is
+// about to use the position - roughly every 30ms.
+//
+// The model is deliberately physical: each pulse adds a fixed amount of VELOCITY, and each
+// sub-step moves by the current velocity then scales it down. A pulse therefore travels
+// kGain / (1 - kFriction) pixels in total, spread over about eighteen sub-steps instead of
+// arriving at once, and a fast roll is fast because its pulses stack up - so there is no
+// separate acceleration rule, and no gap-timing to get wrong.
+static void tbIntegrate(void)
+{
+    const uint32_t now = millis();
+
+    // ⛔ THE OFF SWITCH. This has to be HERE, not at the event dispatch, because the dispatch
+    // no longer moves anything - it only creates the cursor. Leaving the check there meant a
+    // switched-off trackball still rolled the arrow around while the click was correctly
+    // ignored, which is the half-working state Jake found. Pulses that arrived while it was
+    // off are thrown away rather than banked, so switching on does not fire a stored flick.
+    if (!tdeck_trackball_nav_enabled()) {
+        tbRawX = tbRawY = 0;
+        tbVx = tbVy = 0.0f;
+        tbScrollDx = tbScrollDy = 0.0f;
+        tbArmed = false;
+        tbArmCount = 0;
+        tbPendX = tbPendY = 0;
+        if (tbCursorObj && !lv_obj_has_flag(tbCursorObj, LV_OBJ_FLAG_HIDDEN))
+            tbCursorShow(false);
+        return;
     }
-    if (ny < 2) {
-        tbScrollDy += ny - 2;
-        ny = 2;
-    } else if (ny > 237) {
-        tbScrollDy += ny - 237;
-        ny = 237;
+
+    // Drain both axes together. Everything that arrived since the last frame is ONE movement,
+    // so a diagonal roll - pulses on both axes in the same frame - simply comes out diagonal.
+    const int32_t ex = __atomic_exchange_n(&tbRawX, 0, __ATOMIC_RELAXED);
+    const int32_t ey = __atomic_exchange_n(&tbRawY, 0, __ATOMIC_RELAXED);
+    const int32_t events = (ex < 0 ? -ex : ex) + (ey < 0 ? -ey : ey);
+
+    if (events) {
+        if (tbArmed) {
+            tbArmFirstMs = now;
+        } else {
+            // Not moving yet: hold these and see whether more follow. A brush gives one pulse
+            // and nothing after it, so it times out below and is discarded.
+            if (!tbArmCount || now - tbArmFirstMs > kArmWindowMs) {
+                tbArmCount = 0;
+                tbPendX = tbPendY = 0;
+                tbArmFirstMs = now;
+            }
+            tbArmCount += (int)events;
+            tbPendX += ex;
+            tbPendY += ey;
+            if (tbArmCount >= kArmEvents) {
+                // Deliberate. Release everything held back, so nothing is lost from the start
+                // of a real roll - the deadzone costs a frame of latency, never distance.
+                tbArmed = true;
+                tbVx += (float)tbPendX * tbGain();
+                tbVy += (float)tbPendY * tbGain();
+                tbArmCount = 0;
+                tbPendX = tbPendY = 0;
+            }
+        }
+        if (tbArmed) {
+            tbVx += (float)ex * tbGain();
+            tbVy += (float)ey * tbGain();
+        }
+    } else if (tbArmed && now - tbArmFirstMs > kDisarmMs) {
+        tbArmed = false; // gone quiet: ask again before the next movement
+    } else if (!tbArmed && tbArmCount && now - tbArmFirstMs > kArmWindowMs) {
+        tbArmCount = 0; // a lone pulse, never followed up - that was the accidental touch
+        tbPendX = tbPendY = 0;
     }
-    tbX = (int16_t)nx;
-    tbY = (int16_t)ny;
-    tbLastMoveMs = now;
-    tbCursorShow(true);
+
+    // ⚠️ THE CEILING IS THE SCREEN, not the maths. LV_DEF_REFR_PERIOD is 40ms, so the panel
+    // draws 25 times a second and a frame is ~2.5 of these 16ms sub-steps. The old flat clamp
+    // of 22 therefore allowed 55 pixels between two DRAWN frames - perfectly smooth in the
+    // model, visibly steppy in the hand, which is what Jake still saw at Max.
+    //
+    // So the clamp is per speed and sized in what a frame can show: v * 2.5 px per frame.
+    //   Slow 6 . Normal 10 . Fast 15 . Faster 20 . Max 25 px per frame
+    // Max is deliberately at the edge of what 25fps can render smoothly (~625 px/sec). Going
+    // faster than that is not a tuning choice - there is simply nothing to draw in between.
+    static const float kVmax[5] = {2.5f, 4.0f, 6.0f, 8.0f, 10.0f};
+    int spc = tdeck_trackball_speed();
+    if (spc < 0 || spc > 4)
+        spc = 2;
+    const float vmax = kVmax[spc];
+    if (tbVx > vmax) tbVx = vmax; else if (tbVx < -vmax) tbVx = -vmax;
+    if (tbVy > vmax) tbVy = vmax; else if (tbVy < -vmax) tbVy = -vmax;
+
+    if (tbVx == 0.0f && tbVy == 0.0f) {
+        tbIntegMs = now;
+        tbCarryMs = 0;
+        return;
+    }
+
+    // Fixed 16ms sub-steps off the REAL clock, so the feel does not change with frame rate:
+    // the UI task is busy on the map and idle in Settings, and the cursor must not speed up
+    // just because the screen got cheaper to draw. Capped so a stall cannot fling it.
+    uint32_t dt = tbIntegMs ? (now - tbIntegMs) : 16;
+    tbIntegMs = now;
+    if (dt > 200)
+        dt = 200;
+    tbCarryMs += dt;
+    int steps = (int)(tbCarryMs / 16);
+    if (steps > 12)
+        steps = 12;
+    tbCarryMs -= (uint32_t)steps * 16;
+
+    // A stalled UI hands us a big dt and therefore many sub-steps at once. Integrating all of
+    // them is correct but looks like a teleport, and this device demonstrably stalls for
+    // seconds at a time - so one call may never move further than a single frame's worth.
+    const float kMaxPerCall = vmax * 3.0f;
+    float movedX = 0.0f, movedY = 0.0f;
+
+    const float kFriction = 0.88f;
+    for (int i = 0; i < steps; i++) {
+        if (movedX > kMaxPerCall || movedX < -kMaxPerCall || movedY > kMaxPerCall || movedY < -kMaxPerCall)
+            break;
+        movedX += tbVx;
+        movedY += tbVy;
+        tbFx += tbVx;
+        tbFy += tbVy;
+        // Only the part of the roll that CANNOT move the cursor becomes scroll. Sitting at an
+        // edge therefore does nothing; you have to keep rolling into it, and the page stops
+        // the moment you do. Velocity dies on that axis so it cannot rebound off the wall
+        // when the roll ends.
+        // ⚠️ The POSITION is clamped; the VELOCITY is not touched. Zeroing it here is what made
+        // scrolling useless - the cursor cannot leave the edge either way, because the clamp
+        // below runs every sub-step, so all the velocity decides is how much overflow there is
+        // to scroll with. Killing it meant one pulse bought one sub-step of scroll and nothing
+        // else. Friction still stops the page about a third of a second after the roll does.
+        if (tbFx < 2.0f) {
+            tbScrollDx += (tbFx - 2.0f) * kScrollBoost;
+            tbFx = 2.0f;
+        } else if (tbFx > 317.0f) {
+            tbScrollDx += (tbFx - 317.0f) * kScrollBoost;
+            tbFx = 317.0f;
+        }
+        if (tbFy < 2.0f) {
+            tbScrollDy += (tbFy - 2.0f) * kScrollBoost;
+            tbFy = 2.0f;
+        } else if (tbFy > 237.0f) {
+            tbScrollDy += (tbFy - 237.0f) * kScrollBoost;
+            tbFy = 237.0f;
+        }
+        tbVx *= kFriction;
+        tbVy *= kFriction;
+    }
+    // Stop dead once the glide is worth less than a pixel in total, so the cursor settles
+    // instead of creeping. It has to be well UNDER the smallest gain (0.36): at 0.33 it was
+    // larger than a whole Slow pulse, so Slow zeroed itself immediately and moved 0.4px per
+    // roll instead of 3 - the setting existed but did nothing.
+    if (tbVx < 0.06f && tbVx > -0.06f)
+        tbVx = 0.0f;
+    if (tbVy < 0.06f && tbVy > -0.06f)
+        tbVy = 0.0f;
+
+    const int16_t nx = (int16_t)(tbFx + 0.5f), ny = (int16_t)(tbFy + 0.5f);
+    if (nx != tbX || ny != tbY) {
+        tbX = nx;
+        tbY = ny;
+        tbLastMoveMs = now;
+        tbCursorShow(true);
+    }
 }
 
 // Hand the pending scroll to the caller and clear it. Returns false when there is nothing,
 // which is almost always.
 extern "C" bool tdeck_trackball_take_scroll(int *dx, int *dy)
 {
-    if (!tbScrollDx && !tbScrollDy)
+    // Whole pixels out, the fraction stays behind for next time. LVGL cannot scroll by 0.4 of
+    // a pixel, but four frames of 0.4 are a pixel and a half of real movement - dropping them
+    // is what made the slower settings feel dead.
+    const int wx = (int)tbScrollDx, wy = (int)tbScrollDy;
+    if (!wx && !wy)
         return false;
     if (dx)
-        *dx = tbScrollDx;
+        *dx = wx;
     if (dy)
-        *dy = tbScrollDy;
-    tbScrollDx = 0;
-    tbScrollDy = 0;
+        *dy = wy;
+    tbScrollDx -= (float)wx;
+    tbScrollDy -= (float)wy;
     return true;
 }
 
 static void tb_pointer_read(lv_indev_t *, lv_indev_data_t *data)
 {
+    tbIntegrate(); // advance the motion for this frame before LVGL reads the position
     data->point.x = tbX;
     data->point.y = tbY;
     // One read pressed, then straight back up: a tap. A HELD button must never become a long
@@ -358,11 +548,16 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
             // work with the cursor on as well. Nothing here ever holds a press down on what
             // the cursor is over (the pointer emits a one-read tap), so there is no conflict.
             //
-            // The one exception is a dark screen, where Back is useless: there, a hold wakes.
-            if (tdeck_input_gated)
-                tb_home_request = true; // asleep -> wake
+            // Two exceptions, both because Back has nothing to do:
+            //   dark screen -> wake
+            //   already on Home -> LOCK. Jake: "holding home wont lock it anymore either,
+            //   just double click". Making hold mean Back everywhere was his call and it is
+            //   right everywhere except Home, where there is nowhere to go back TO - so the
+            //   gesture was simply doing nothing there. Now both of his routes to lock work.
+            if (tdeck_input_gated || tdeck_on_home_screen())
+                tb_home_request = true; // asleep -> wake, on Home -> lock
             else
-                tdeck_back_request = true; // awake -> Back
+                tdeck_back_request = true; // awake, somewhere else -> Back
             longFired = true;
         } else if (!btnDown && btnWasDown && !longFired) {
             // A quick click. What it MEANS is decided in the block below: either a select, or
@@ -444,14 +639,10 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
             // Rolling moves the cursor, when the user has asked for it.
             if (tdeck_trackball_nav_enabled() && action != TB_ACTION_PRESSED &&
                 action != TB_ACTION_NONE) {
+                // Only bring the cursor into existence. The pulses themselves were already
+                // counted by the interrupts and get integrated once per frame - reacting to
+                // them HERE is exactly what made every single event a jump.
                 tbCursorInit();
-                switch (action) {
-                case TB_ACTION_LEFT:  tbMove(-1, 0); break;
-                case TB_ACTION_RIGHT: tbMove(1, 0);  break;
-                case TB_ACTION_UP:    tbMove(0, -1); break;
-                case TB_ACTION_DOWN:  tbMove(0, 1);  break;
-                default: break;
-                }
             }
             // Roll stays inert otherwise, and the stored flags are deliberately NOT consulted.
             // The switches are gone from Settings, so anyone who had turned them on would
@@ -508,6 +699,9 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
     }
 }
 
+// Each axis keeps its OWN count. `action` is still written because the click handling reads
+// it, but it is no longer what moves the cursor: a shared one-slot variable cannot carry a
+// diagonal, which is why rolling on the angle never worked.
 void EncoderInputDriver::intPressHandler()
 {
     action = TB_ACTION_PRESSED;
@@ -516,21 +710,25 @@ void EncoderInputDriver::intPressHandler()
 void EncoderInputDriver::intDownHandler()
 {
     action = TB_ACTION_DOWN;
+    tbRawY++;
 }
 
 void EncoderInputDriver::intUpHandler()
 {
     action = TB_ACTION_UP;
+    tbRawY--;
 }
 
 void EncoderInputDriver::intLeftHandler()
 {
     action = TB_ACTION_LEFT;
+    tbRawX--;
 }
 
 void EncoderInputDriver::intRightHandler()
 {
     action = TB_ACTION_RIGHT;
+    tbRawX++;
 }
 
 #endif
