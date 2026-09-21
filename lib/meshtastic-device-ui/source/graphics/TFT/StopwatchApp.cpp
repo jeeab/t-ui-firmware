@@ -24,15 +24,25 @@ void playBeep();                          // short blip (~1/16 note)
 void playLongBeep();                      // clear 1-second tone
 extern "C" void tdeck_beep_gain(float g); // set audio loudness (0.2 default; timer cranks to ~1.0)
 
+// The alarm itself lives in src/TDeckAlarm.cpp and is serviced from loop(), NOT from this app.
+// An alarm that only runs while its own screen is open is not an alarm - the whole point is
+// 6am with the device locked, dark and face-down. This screen only sets it.
+extern "C" void tdeck_alarm_get(int *h, int *m, bool *on);
+extern "C" void tdeck_alarm_set(int h, int m, bool on);
+extern "C" bool tdeck_alarm_ringing(void);
+extern "C" void tdeck_alarm_dismiss(void);
+
 namespace
 {
-enum Mode { MODE_STOPWATCH, MODE_TIMER };
+enum Mode { MODE_STOPWATCH, MODE_TIMER, MODE_ALARM };
 
 lv_obj_t *screen = nullptr;
 lv_obj_t *timeLbl = nullptr;
 lv_obj_t *startBtnLbl = nullptr;
 lv_obj_t *swModeBtn = nullptr;
 lv_obj_t *tmModeBtn = nullptr;
+lv_obj_t *alModeBtn = nullptr;
+lv_obj_t *resetBtnRef = nullptr;
 lv_obj_t *minusBtn = nullptr;
 lv_obj_t *plusBtn = nullptr;
 lv_obj_t *hintLbl = nullptr;
@@ -67,6 +77,16 @@ void paint(void)
     uint32_t secs = (ms / 1000) % 60;
     uint32_t mins = (ms / 60000) % 100;
     char buf[16];
+    if (mode == MODE_ALARM) {
+        // The alarm shows the time it will RING at, not an elapsed count - it is a setting
+        // being edited, not a clock running.
+        int h = 7, m = 0;
+        bool on = false;
+        tdeck_alarm_get(&h, &m, &on);
+        snprintf(buf, sizeof(buf), "%02d:%02d", h, m);
+        lv_label_set_text(timeLbl, buf);
+        return;
+    }
     if (mode == MODE_STOPWATCH)
         snprintf(buf, sizeof(buf), "%02u:%02u.%u", (unsigned)mins, (unsigned)secs, (unsigned)tenths);
     else
@@ -94,6 +114,8 @@ void refreshModeButtons(void)
     // brighter fill = selected mode
     lv_obj_set_style_bg_color(swModeBtn, lv_color_hex(mode == MODE_STOPWATCH ? 0x0a84ff : 0x2c2c2e), LV_PART_MAIN);
     lv_obj_set_style_bg_color(tmModeBtn, lv_color_hex(mode == MODE_TIMER ? 0x0a84ff : 0x2c2c2e), LV_PART_MAIN);
+    if (alModeBtn)
+        lv_obj_set_style_bg_color(alModeBtn, lv_color_hex(mode == MODE_ALARM ? 0x0a84ff : 0x2c2c2e), LV_PART_MAIN);
 }
 
 void stopAndReset(void)
@@ -108,16 +130,50 @@ void stopAndReset(void)
     paint();
 }
 
+// What the Start button says, and whether Reset means anything, both depend on the mode.
+void refreshAlarmUi(void)
+{
+    if (mode != MODE_ALARM)
+        return;
+    int h = 7, m = 0;
+    bool on = false;
+    tdeck_alarm_get(&h, &m, &on);
+    lv_label_set_text(startBtnLbl, tdeck_alarm_ringing() ? "Dismiss" : (on ? "On" : "Off"));
+    setReadoutColor(on ? 0x30d158 : 0xffffff); // green = armed, so the state is readable at a glance
+    lv_label_set_text(hintLbl, tdeck_alarm_ringing() ? "Alarm!" : (on ? "" : "Alarm is off"));
+    paint();
+}
+
 void setMode(Mode m)
 {
     mode = m;
     stopAndReset();
-    showAdjust(m == MODE_TIMER);
+    // The alarm uses the same - / + buttons to set its time, so they show for it too.
+    showAdjust(m == MODE_TIMER || m == MODE_ALARM);
+    // Reset means nothing for an alarm - there is no running count to zero.
+    if (resetBtnRef) {
+        if (m == MODE_ALARM)
+            lv_obj_add_flag(resetBtnRef, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_remove_flag(resetBtnRef, LV_OBJ_FLAG_HIDDEN);
+    }
     refreshModeButtons();
+    refreshAlarmUi();
 }
 
 void onStartStop(lv_event_t *)
 {
+    if (mode == MODE_ALARM) {
+        int h = 7, m = 0;
+        bool on = false;
+        tdeck_alarm_get(&h, &m, &on);
+        if (tdeck_alarm_ringing())
+            tdeck_alarm_dismiss(); // ringing: the button is the snooze-less "stop"
+        else
+            tdeck_alarm_set(h, m, !on);
+        refreshAlarmUi();
+        return;
+    }
     if (mode == MODE_TIMER && timerDone)
         return; // must Reset after a finished timer
     if (mode == MODE_TIMER && !running && timerSetMs == 0)
@@ -144,6 +200,20 @@ void onReset(lv_event_t *)
 
 void adjustTimer(int deltaMs)
 {
+    if (mode == MODE_ALARM) {
+        // 15-minute steps, wrapping through midnight. Fine enough for a wake-up and quick
+        // enough to cross the dial without forty taps.
+        int h = 7, m = 0;
+        bool on = false;
+        tdeck_alarm_get(&h, &m, &on);
+        int total = h * 60 + m + (deltaMs > 0 ? 15 : -15);
+        while (total < 0)
+            total += 24 * 60;
+        total %= 24 * 60;
+        tdeck_alarm_set(total / 60, total % 60, on);
+        refreshAlarmUi();
+        return;
+    }
     if (mode != MODE_TIMER || running || timerDone)
         return;
     long v = (long)timerSetMs + deltaMs;
@@ -225,12 +295,17 @@ void buildScreen(void)
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // mode selector (top): Stopwatch | Timer
-    swModeBtn = makeButton(screen, "Stopwatch", 0x0a84ff, [](lv_event_t *) { setMode(MODE_STOPWATCH); }, nullptr);
-    lv_obj_set_size(swModeBtn, 150, 40);
-    lv_obj_align(swModeBtn, LV_ALIGN_TOP_LEFT, 8, 6);
+    // Three modes across the top now, so 150 no longer fits: 6 + 100 + 4 + 100 + 4 + 100 + 6
+    // is exactly the 320 available.
+    swModeBtn = makeButton(screen, "Watch", 0x0a84ff, [](lv_event_t *) { setMode(MODE_STOPWATCH); }, nullptr);
+    lv_obj_set_size(swModeBtn, 100, 40);
+    lv_obj_align(swModeBtn, LV_ALIGN_TOP_LEFT, 6, 6);
     tmModeBtn = makeButton(screen, "Timer", 0x2c2c2e, [](lv_event_t *) { setMode(MODE_TIMER); }, nullptr);
-    lv_obj_set_size(tmModeBtn, 150, 40);
-    lv_obj_align(tmModeBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_set_size(tmModeBtn, 100, 40);
+    lv_obj_align(tmModeBtn, LV_ALIGN_TOP_MID, 0, 6);
+    alModeBtn = makeButton(screen, "Alarm", 0x2c2c2e, [](lv_event_t *) { setMode(MODE_ALARM); }, nullptr);
+    lv_obj_set_size(alModeBtn, 100, 40);
+    lv_obj_align(alModeBtn, LV_ALIGN_TOP_RIGHT, -6, 6);
 
     // big readout, with − / + adjust buttons flanking it (timer mode only)
     timeLbl = lv_label_create(screen);
@@ -253,6 +328,7 @@ void buildScreen(void)
     lv_obj_set_size(startBtn, 130, 52);
     lv_obj_align(startBtn, LV_ALIGN_BOTTOM_LEFT, 16, -14);
     lv_obj_t *resetBtn = makeButton(screen, "Reset", 0x3a3a3c, onReset, nullptr);
+    resetBtnRef = resetBtn; // hidden in Alarm mode - there is no count to reset
     lv_obj_set_size(resetBtn, 130, 52);
     lv_obj_align(resetBtn, LV_ALIGN_BOTTOM_RIGHT, -16, -14);
 

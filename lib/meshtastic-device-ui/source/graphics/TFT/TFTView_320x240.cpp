@@ -695,7 +695,9 @@ static const LauncherApp kApps[] = {
     // Flashlight = full-white screen at max backlight (its own action).
     {"Flashlight", &img_nodes_button_image, 0xffd60a, nullptr, nullptr, nullptr, &TFTView_320x240::openFlashlightAction},
     // Stopwatch = self-contained count-up timer module (StopwatchApp.cpp).
-    {"Stopwatch", &img_messages_button_image, 0x64d2ff, nullptr, nullptr, nullptr, &stopwatch_open},
+    // Renamed from "Stopwatch": it is a stopwatch, a countdown and now an alarm, and Jake's
+    // call on t-ui#9 was "we can add to the timer app and rename it clock".
+    {"Clock", &img_messages_button_image, 0x64d2ff, nullptr, nullptr, nullptr, &stopwatch_open},
     // Nodes = our own node list (NodesApp.cpp), with a star on each row. Deliberately
     // NOT the Mesh app's node panel: keeping it separate is what makes a device-ui
     // update a clean merge.
@@ -834,7 +836,7 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         lv_obj_set_style_transform_pivot_x(rf, 17, LV_PART_MAIN);
         lv_obj_set_style_transform_pivot_y(rf, 2, LV_PART_MAIN);
         lv_obj_set_style_transform_rotation(rf, -200, LV_PART_MAIN);
-    } else if (!strcmp(name, "Stopwatch")) { // ring + top button + hand
+    } else if (!strcmp(name, "Clock")) { // ring + top button + hand
         icRing(ic, 10, 8, 26, color, 3);
         icBox(ic, 20, 2, 6, 6, color, 1);
         icBox(ic, 22, 15, 2, 9, color, 1);
