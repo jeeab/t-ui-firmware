@@ -174,6 +174,33 @@ static const int kNetMaxBody = 8192; // app responses are small (weather JSON ~1
 
 // net.fetch(url) -> bool. Starts a fetch. false if one's already running, the URL is
 // empty, or no Wi-Fi network is saved (the app should then tell the user to set Wi-Fi up).
+extern "C" bool tdeck_net_fetch(const char *url); // defined below; the POST wrapper queues through it
+
+// A POST body, when one has been set. Owned here and freed after the request, because the
+// caller (Gemini) builds it on the UI task and the request runs on the net task.
+static char *s_postBody = nullptr;
+static char s_postType[48] = {0};
+static int s_httpCode = 0; // last HTTP status, so a caller can tell 404 from 429
+
+// Queue a POST instead of a GET. Same state machine, same TLS reserve, same client - see the
+// note in the fetch below about why there must not be a second TLS path on this device.
+extern "C" bool tdeck_net_post(const char *url, const char *body, const char *contentType)
+{
+    if (!url || !body)
+        return false;
+    if (s_postBody) {
+        free(s_postBody);
+        s_postBody = nullptr;
+    }
+    const size_t n = strlen(body);
+    s_postBody = (char *)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (!s_postBody)
+        return false;
+    memcpy(s_postBody, body, n + 1);
+    snprintf(s_postType, sizeof(s_postType), "%s", contentType ? contentType : "application/json");
+    return tdeck_net_fetch(url);
+}
+
 extern "C" bool tdeck_net_fetch(const char *url)
 {
 #if HAS_WIFI
@@ -237,6 +264,11 @@ extern "C" int tdeck_net_result(char *buf, int cap)
 }
 
 // Clear an error/done state without reading (so the app can retry).
+extern "C" int tdeck_net_http_code(void)
+{
+    return s_httpCode;
+}
+
 extern "C" void tdeck_net_reset(void)
 {
 #if HAS_WIFI
@@ -278,12 +310,27 @@ static bool netHttpGet(const char *url)
         LOG_INFO("net: http.begin() failed");
         return false;
     }
-    int code = http.GET();
+    int code;
+    if (s_postBody) {
+        http.addHeader("Content-Type", s_postType);
+        http.setTimeout(20000); // Gemini takes a few seconds to think; 6s would time out mid-answer
+        LOG_INFO("net: POST %d bytes", (int)strlen(s_postBody));
+        code = http.POST((uint8_t *)s_postBody, strlen(s_postBody));
+        free(s_postBody);
+        s_postBody = nullptr;
+    } else {
+        code = http.GET();
+    }
     if (code != HTTP_CODE_OK) {
-        LOG_INFO("net: GET failed, code=%d", code);
+        // The BODY of a failed request is worth keeping: Gemini explains a rejected key or a
+        // retired model in it, and "it failed" alone would leave that unfixable from the device.
+        String err = http.getString();
+        LOG_INFO("net: request failed, code=%d body=%.120s", code, err.c_str());
+        s_httpCode = code;
         http.end();
         return false;
     }
+    s_httpCode = code;
     // Read the body. Open-Meteo (and many APIs) send it CHUNKED with no Content-Length header,
     // so http.getSize() returns -1 — that's WHY the first version failed, it treated -1 as empty.
     // getString() reads and de-chunks the whole body cleanly; our JSON responses are small.

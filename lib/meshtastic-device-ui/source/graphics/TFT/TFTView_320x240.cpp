@@ -219,6 +219,7 @@ extern "C" void favorites_open(void);
 extern "C" void channels_open(void);
 // Notes module (NotesApp.cpp) — .txt notes on the SD card.
 extern "C" void notes_open(void);
+extern "C" void gemini_open(void); // GeminiApp.cpp - ask Gemini a question over wi-fi
 extern "C" void notes_open_file(const char *path); // Files app opens .txt files with this
 // Calculator module (CalculatorApp.cpp).
 extern "C" void calculator_open(void);
@@ -674,6 +675,9 @@ static const LauncherApp kApps[] = {
     {"Mesh", &img_home_button_image, 0xbf5af2, &objects.home_button, &objects.home_panel, &objects.top_panel, nullptr},
     // Notes = self-contained module (NotesApp.cpp), .txt files in /notes on SD.
     {"Notes", &img_messages_button_image, 0xffd60a, nullptr, nullptr, nullptr, &notes_open},
+    // Jake's ask. ⚠️ Using it drops Bluetooth until the next reboot (one antenna); the app says
+    // so on screen rather than letting a lost phone link look like a bug.
+    {"Gemini", &img_messages_button_image, 0x30d158, nullptr, nullptr, nullptr, &gemini_open},
     // Calculator = self-contained module (CalculatorApp.cpp).
     {"Calculator", &img_nodes_button_image, 0xff9f0a, nullptr, nullptr, nullptr, &calculator_open},
     // Breakout = a Lua GAME loaded from /apps/breakout/main.lua on the SD card.
@@ -860,6 +864,10 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
     } else if (!strcmp(name, "Files")) { // folder
         icBox(ic, 8, 7, 15, 5, color, 1);
         icBox(ic, 6, 11, 34, 24, color, 3);
+    } else if (!strcmp(name, "Gemini")) { // a four-pointed spark, drawn like the rest
+        icBox(ic, 19, 2, 6, 38, color, 3);  // vertical
+        icBox(ic, 2, 19, 40, 6, color, 3);  // horizontal
+        icBox(ic, 33, 5, 5, 5, color, LV_RADIUS_CIRCLE); // small spark off the shoulder
     } else if (!strcmp(name, "Notes")) { // page with lines
         icBox(ic, 11, 3, 24, 34, 0xf2f2f2, 3);
         icBox(ic, 15, 10, 16, 2, 0x8e8e93, 1);
