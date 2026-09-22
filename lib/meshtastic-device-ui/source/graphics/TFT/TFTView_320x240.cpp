@@ -11165,6 +11165,13 @@ void TFTView_320x240::ui_event_NodesButton(lv_event_t *e)
             return;
         }
         THIS->ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
+        // The list was not being updated while it was hidden (see updateAllLastHeard), so catch
+        // it up now that it can actually be read.
+        if (THIS->lastHeardStale) {
+            THIS->lastHeardCursor = 0;
+            THIS->onlineAccum = 0;
+            THIS->updateAllLastHeard();
+        }
         if (filterNeedsUpdate) {
             THIS->updateNodesFiltered(true);
             THIS->updateNodesStatus();
@@ -17667,11 +17674,36 @@ void TFTView_320x240::updateLastHeard(uint32_t nodeNum)
  * @brief update last heard display for all nodes; also update nodes online
  *
  */
+// ⭐ THE FREEZE LIVED HERE. See the commit: 229 nodes x lv_label_set_text + a full re-filter,
+// every 60 s, on the tft task, holding spiLock the whole time. The device's own breadcrumb
+// caught it as a 73-second stall with ui=r - running flat out, not blocked.
+//
+// Two rules now:
+//   * If the Nodes list is not on screen, do NOTHING. These labels are only ever read from that
+//     panel, so updating them while it is hidden paints nothing anyone can see. The list is
+//     marked stale and refreshed when it is actually opened.
+//   * When it IS on screen, do a slice per pass instead of all of them, so the longest stall is
+//     a fraction of a second rather than tens of seconds.
 void TFTView_320x240::updateAllLastHeard(void)
 {
+    if (activePanel != objects.nodes_panel) {
+        lastHeardStale = true; // catch up when the panel is opened - nobody can see it until then
+        return;
+    }
+    lastHeardStale = false;
+
     uint16_t online = 0;
     time_t lastHeard;
+    // Where the last pass stopped. Walking a slice per second keeps the readings live without
+    // ever handing the panel a multi-second block of work.
+    size_t idx = 0;
+    size_t done = 0;
     for (auto it : nodes) {
+        if (idx++ < lastHeardCursor)
+            continue;
+        if (done >= kNodesPerPass)
+            break;
+        done++;
         char buf[32];
         if (it.first == ownNode) { // own node is always now, so do update
             lastHeard = curtime;
@@ -17686,9 +17718,18 @@ void TFTView_320x240::updateAllLastHeard(void)
                 online++;
         }
     }
-    nodesOnline = online;
-    updateNodesFiltered(true);
-    updateNodesStatus();
+    // ⚠️ The online count is only meaningful once a whole sweep has been made, so it is only
+    // published at the end of one. A count from a partial slice would flicker every second.
+    if (lastHeardCursor + done >= nodes.size()) {
+        lastHeardCursor = 0;
+        nodesOnline = onlineAccum + online;
+        onlineAccum = 0;
+        updateNodesFiltered(true); // the expensive re-filter: once per sweep, not once per slice
+        updateNodesStatus();
+    } else {
+        lastHeardCursor += done;
+        onlineAccum += online;
+    }
 }
 
 void TFTView_320x240::updateUnreadMessages(void)

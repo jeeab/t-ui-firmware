@@ -188,6 +188,12 @@ class TFTView_320x240 : public MeshtasticView
     virtual void updateLastHeard(uint32_t nodeNum);
     // update last heard value on all node panels
     virtual void updateAllLastHeard(void);
+    // The freeze fix. updateAllLastHeard used to walk all 229 nodes every 60 s while holding
+    // spiLock; it now does a slice per pass, and nothing at all while the list is hidden.
+    bool lastHeardStale = false;   // hidden list needs catching up when it is next opened
+    size_t lastHeardCursor = 0;    // how far through the node map the sweep has got
+    uint16_t onlineAccum = 0;      // online count so far this sweep; published only when it ends
+    static constexpr size_t kNodesPerPass = 24;
     // update image and unread messages on home screen
     virtual void updateUnreadMessages(void);
     // update time display on home screen
