@@ -40,6 +40,8 @@
 #include "configuration.h"
 #include "TDeckMail.h" // @@mail / @@inbox
 #include "TDeckCoverage.h" // @@cov
+#include <lvgl.h> // @@refr needs the refresh timer
+extern "C" void tdeck_fps_set(bool on); // @@fps - LGFXDriver.h
 #include "chess/chess.h"  // @@chess - benchmark the engine on the real chip
 #include "chess/search.h"
 #include <Arduino.h>
@@ -106,6 +108,28 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                          swT ? (unsigned)(uxTaskGetStackHighWaterMark(swT) * sizeof(StackType_t)) : 0u,
                          (unsigned)tdeck_pktq_depth(), (unsigned)tdeck_pktq_peak(), (unsigned)tdeck_pktq_cap(),
                          (unsigned)tdeck_pktq_itemsz());
+            } else if (!strncmp(s_line, "refr", 4)) {
+                // Set LVGL's refresh period at RUNTIME so candidate values can be measured in one
+                // build instead of one build each. Dropping it from 40 to 25 made frames LESS
+                // frequent (38ms gap -> 67ms), which is the opposite of the intent and not
+                // something to keep guessing at across five-minute rebuilds.
+                int ms = atoi(s_line + 4);
+                if (ms < 8 || ms > 200)
+                    ms = 40;
+                lv_timer_t *t = lv_display_get_refr_timer(lv_display_get_default());
+                if (t) {
+                    lv_timer_set_period(t, (uint32_t)ms);
+                    LOG_INFO("@@ok refr period=%d ms", ms);
+                } else {
+                    LOG_INFO("@@err refr no refresh timer");
+                }
+            } else if (!strncmp(s_line, "fps", 3)) {
+                const char *a = s_line + 3;
+                while (*a == ' ')
+                    a++;
+                bool on = strncmp(a, "off", 3) != 0;
+                tdeck_fps_set(on);
+                LOG_INFO("@@ok fps probe %s", on ? "ON" : "off");
             } else if (!strncmp(s_line, "chess", 5)) {
                 // Measure the engine on the real chip. Optional argument = milliseconds.
                 int ms = atoi(s_line + 5);

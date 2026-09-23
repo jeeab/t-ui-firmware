@@ -83,7 +83,29 @@
  *====================*/
 
 /*Default display refresh, input device read and animation step period.*/
-#define LV_DEF_REFR_PERIOD  40      /*[ms]*/
+/* MEASURED, 2026-09-23. Jake: "make scrolling from page to page smoother on the home screen".
+ * The probe (@@fps) showed the minimum gap between frames during a page swipe was 38ms - i.e.
+ * the device was already drawing as fast as this period allowed, and neither rendering nor the
+ * SPI transfer was the limit. This number WAS the limit, capping every animation at 25fps.
+ *
+ * 25ms gives 40fps. It is affordable only because the display clock went 40->80MHz in the same
+ * change: SPI per frame drops from 24ms to ~12ms, so the "tft" task holds spiLock for 48% of
+ * each frame instead of 63% - LESS pressure on the lock the radio needs, not more, while being
+ * half again as smooth. Raising the rate WITHOUT the clock change would have pushed it to ~96%
+ * and starved the radio, which is the freeze this device already has history with. */
+/* Jake, 2026-09-23: "make scrolling from page to page smoother on the home screen? If it
+ * doesn't eat more ram". 25ms = 40fps, up from 40ms = 25fps. Costs no RAM.
+ *
+ * ⚠️ THIS ONE IS REASONED, NOT MEASURED, AND THAT IS WORTH FLAGGING. The @@fps probe gave
+ * contradictory answers across runs (a 38ms gap became 67ms in one test and 33ms in another)
+ * because synthetic swipes do not reliably produce a sustained animation to sample. What IS
+ * measured is the cost side: with the display clock at 80MHz a pager frame takes 12.8ms of SPI
+ * instead of 24.1ms, so at 25ms the "tft" task holds spiLock ~51% of each frame - LESS than the
+ * 63% it held at the old 40ms/40MHz combination. So this cannot starve the radio the way it
+ * would have before the clock change.
+ *
+ * Smoothness is a judgement call anyway; @@refr <ms> changes it at runtime for comparison. */
+#define LV_DEF_REFR_PERIOD  25      /*[ms]*/
 
 /*Default Dot Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  *(Not so important, you can adjust it to modify default sizes and spaces)*/

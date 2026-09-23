@@ -4,6 +4,11 @@
 #include "util/ILog.h"
 #include <LovyanGFX.hpp>
 
+// The DISPLAY's clock, deliberately separate from the board-wide SPI_FREQUENCY so raising it
+// cannot affect the SD card or the radio. See the note at cfg.freq_write below.
+#ifndef TDECK_TFT_FREQ
+#define TDECK_TFT_FREQ 80000000
+#endif
 #ifndef SPI_FREQUENCY
 #define SPI_FREQUENCY 80000000
 #endif
@@ -318,7 +323,16 @@ class LGFX_TDECK : public lgfx::LGFX_Device
             // SPI
             cfg.spi_host = SPI2_HOST;
             cfg.spi_mode = 0;
-            cfg.freq_write = SPI_FREQUENCY; // SPI clock for transmission (up to 80MHz, rounded to
+            // MEASURED, 2026-09-23: pushing the launcher pager costs 24ms of SPI per frame at
+            // 40MHz, which is 63% of a 38ms frame - and that is time the "tft" task spends
+            // HOLDING spiLock, which the radio also needs. Halving it is what makes a higher
+            // frame rate affordable at all.
+            //
+            // variant.h sets SPI_FREQUENCY to 40MHz; this file's own default is 80MHz, so the
+            // board override was halving it. The SD card on this same bus already runs at 75MHz
+            // (SD_SPI_FREQUENCY), so the traces plainly handle it - 40MHz reads as an inherited
+            // default rather than a board limit. Display only: SD and LoRa are untouched.
+            cfg.freq_write = TDECK_TFT_FREQ; // SPI clock for transmission (up to 80MHz, rounded to
                                             // the value obtained by dividing 80MHz by an integer)
             cfg.freq_read = 16000000;       // SPI clock when receiving
             cfg.spi_3wire = false;

@@ -129,7 +129,7 @@ extern "C" void tdeck_lock_set_unlock_key(int k);
 extern "C" bool tdeck_battlog_sample(int *mv, int *pct, int *usb, int *charging);
 extern "C" void tdeck_lock_set_wx_minutes(uint32_t mins);
 // Screenshot (src/TDeckScreenshot.cpp): arm it, then ask what happened.
-extern "C" void tdeck_shot_begin(void);
+extern "C" bool tdeck_shot_begin(void);
 extern "C" bool tdeck_shot_capturing(void);
 extern "C" const char *tdeck_shot_last_path(void);
 extern "C" bool tdeck_shot_failed(void);
@@ -227,6 +227,8 @@ extern "C" void channels_open(void);
 // Notes module (NotesApp.cpp) — .txt notes on the SD card.
 extern "C" void notes_open(void);
 extern "C" void gemini_open(void); // GeminiApp.cpp - ask Gemini a question over wi-fi
+extern "C" void mail_open(void);       // MailApp.cpp - Gmail setup form + inbox count
+extern "C" void mail_service_ui(void); // polls the inbox check while that screen is up
 extern "C" void notes_open_file(const char *path); // Files app opens .txt files with this
 // Calculator module (CalculatorApp.cpp).
 extern "C" void calculator_open(void);
@@ -685,6 +687,7 @@ static const LauncherApp kApps[] = {
     // Jake's ask. ⚠️ Using it drops Bluetooth until the next reboot (one antenna); the app says
     // so on screen rather than letting a lost phone link look like a bug.
     {"Gemini", &img_messages_button_image, 0x30d158, nullptr, nullptr, nullptr, &gemini_open},
+    {"Mail", &img_messages_button_image, 0xff9f0a, nullptr, nullptr, nullptr, &mail_open},
     // Calculator = self-contained module (CalculatorApp.cpp).
     {"Calculator", &img_nodes_button_image, 0xff9f0a, nullptr, nullptr, nullptr, &calculator_open},
     // Breakout = a Lua GAME loaded from /apps/breakout/main.lua on the SD card.
@@ -1537,6 +1540,8 @@ void TFTView_320x240::createLauncher(void)
                        lv_display_get_inactive_time(NULL) > kLockPadIdleMs) {
                 THIS->lockDevice();
             }
+
+            mail_service_ui(); // no-op unless the Mail screen is up and a check is running
 
             // Coverage overlay: self-throttled by its own change check, so calling it on every
             // pass costs a handful of comparisons when nothing has moved.
@@ -9591,13 +9596,16 @@ void TFTView_320x240::remoteService(void)
         tdeck_remote_reply(buf);
         break;
     }
-    case 4: // shot
-        tdeck_shot_begin();
-        if (lv_screen_active())
-            lv_obj_invalidate(lv_screen_active());
-        lv_obj_invalidate(lv_layer_top());
-        tdeck_remote_reply("shot armed");
+    case 4: { // shot
+        const bool armed = tdeck_shot_begin(); // may refuse - see the note on that function
+        if (armed) {
+            if (lv_screen_active())
+                lv_obj_invalidate(lv_screen_active());
+            lv_obj_invalidate(lv_layer_top());
+        }
+        tdeck_remote_reply(armed ? "shot armed" : "shot REFUSED - see the log line above");
         break;
+    }
     case 3: // back
         THIS->handleBackGesture();
         tdeck_remote_reply("back");

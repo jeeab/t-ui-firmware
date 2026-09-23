@@ -280,6 +280,14 @@ done:
 
 // ---- app-facing, called from the UI task: record intent, read results -----------------------
 
+// The setup form just rewrote /gmail.txt, so the cached copy is stale. Also the safe thing to
+// call after a failed login: it forces a fresh read rather than retrying the same wrong pair.
+extern "C" void tdeck_mail_forget_creds(void)
+{
+    memset(s_user, 0, sizeof(s_user));
+    memset(s_pass, 0, sizeof(s_pass)); // wiped, not just marked empty
+}
+
 extern "C" bool tdeck_mail_check(void)
 {
     if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
@@ -379,6 +387,7 @@ extern "C" void tdeck_mail_service(void)
 #else // !HAS_WIFI
 extern "C" bool tdeck_mail_check(void) { return false; }
 extern "C" bool tdeck_mail_connect_test(void) { return false; }
+extern "C" void tdeck_mail_forget_creds(void) {}
 extern "C" int tdeck_mail_poll(void) { return -1; }
 extern "C" void tdeck_mail_counts(int *t, int *u)
 {

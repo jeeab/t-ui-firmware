@@ -19,6 +19,10 @@ bool tdeck_mail_check(void);
 // is wrong" apart from "login is wrong", which otherwise look identical from the device.
 bool tdeck_mail_connect_test(void);
 
+// Drop the cached address/password so /gmail.txt is read again. Called by the setup form after
+// it writes the file.
+void tdeck_mail_forget_creds(void);
+
 // 0 = still working, 1 = done, -1 = failed (see tdeck_mail_error()).
 int tdeck_mail_poll(void);
 

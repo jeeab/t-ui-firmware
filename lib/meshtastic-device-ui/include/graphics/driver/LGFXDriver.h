@@ -189,6 +189,27 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
 
 #if 1
 // Display flushing not using DMA */
+// ---- frame-rate probe (@@fps) ------------------------------------------------------------
+// Off by default; one bool test per flush when it is. Reports the three numbers that decide
+// whether the UI can be made smoother for free: frames per second, how many bytes those frames
+// pushed, and how much of the time went into the SPI transfer itself. If the transfer is most
+// of the frame the clock is the limit; if it is a small part, the refresh period is.
+volatile bool tdeck_fps_probe = false;
+static uint32_t s_fpsFrames = 0, s_fpsBytes = 0, s_fpsPushUs = 0, s_fpsWindow = 0;
+// â  FRAMES-PER-SECOND IS THE WRONG NUMBER for judging an animation. A second holding one
+// swipe and 800ms of idle reports a low rate that says nothing about how the swipe looked.
+// The MINIMUM gap between consecutive frames is what the animation actually ran at.
+static uint32_t s_fpsLastFrame = 0, s_fpsMinGap = 0xFFFFFFFF;
+
+extern "C" void tdeck_fps_set(bool on)
+{
+    tdeck_fps_probe = on;
+    s_fpsFrames = s_fpsBytes = s_fpsPushUs = 0;
+    s_fpsMinGap = 0xFFFFFFFF;
+    s_fpsLastFrame = 0;
+    s_fpsWindow = millis();
+}
+
 template <class LGFX> void LGFXDriver<LGFX>::display_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     uint32_t w = lv_area_get_width(area);
@@ -197,9 +218,37 @@ template <class LGFX> void LGFXDriver<LGFX>::display_flush(lv_display_t *disp, c
     // captured is plain native RGB565. Costs a branch per flush when not capturing.
     tdeck_shot_capture_area(area->x1, area->y1, area->x2, area->y2, (const uint16_t *)px_map);
     lv_draw_sw_rgb565_swap(px_map, w * h);
+    uint32_t t0 = tdeck_fps_probe ? micros() : 0;
     lgfx->pushImage(area->x1, area->y1, w, h, (uint16_t *)px_map);
-    if (lv_display_flush_is_last(disp))
+    if (tdeck_fps_probe) {
+        s_fpsPushUs += micros() - t0;
+        s_fpsBytes += w * h * 2;
+    }
+    if (lv_display_flush_is_last(disp)) {
         tdeck_shot_frame_done(); // a whole frame has now gone past: the buffer is complete
+        if (tdeck_fps_probe) {
+            s_fpsFrames++;
+            uint32_t now = millis();
+            if (s_fpsLastFrame) {
+                uint32_t gap = now - s_fpsLastFrame;
+                if (gap < s_fpsMinGap)
+                    s_fpsMinGap = gap;
+            }
+            s_fpsLastFrame = now;
+            if (now - s_fpsWindow >= 1000) {
+                // Only log while something is actually moving - an idle UI draws nothing and a
+                // stream of "0 fps" lines would bury the numbers that matter.
+                if (s_fpsFrames > 1)
+                    ILOG_INFO("@@fps %u frames/s, %u KB/s, %u ms/s SPI, %u us/frame push, MIN GAP %u ms",
+                              (unsigned)s_fpsFrames, (unsigned)(s_fpsBytes / 1024), (unsigned)(s_fpsPushUs / 1000),
+                              (unsigned)(s_fpsPushUs / s_fpsFrames),
+                              (unsigned)(s_fpsMinGap == 0xFFFFFFFF ? 0 : s_fpsMinGap));
+                s_fpsFrames = s_fpsBytes = s_fpsPushUs = 0;
+                s_fpsMinGap = 0xFFFFFFFF;
+                s_fpsWindow = now;
+            }
+        }
+    }
     lv_display_flush_ready(disp);
 }
 #else

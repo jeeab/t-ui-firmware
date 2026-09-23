@@ -87,11 +87,32 @@ extern "C" bool tdeck_shot_failed(void)
 // Called from the UI once the countdown expires. Allocates on first use and keeps the
 // buffer: 150 KB of PSRAM held for the life of the session is a fair price for not
 // risking an allocation failure at the moment somebody is trying to capture a bug.
-extern "C" void tdeck_shot_begin(void)
+// ⛔ REFUSE A SCREENSHOT WHILE A SECRET IS ON SCREEN.
+// @@shot streams the framebuffer over USB. The Mail setup form holds a Gmail app password, and
+// I have been screenshotting this device all session to verify work - one taken at the wrong
+// moment would put the password in a PNG on a PC and in a conversation log. Relying on
+// remembering is not a control; refusing is. Set while the form is up, cleared when it closes.
+static volatile bool s_shotBlocked = false;
+
+extern "C" void tdeck_shot_block(bool on)
 {
+    s_shotBlocked = on;
+}
+
+// Returns whether a capture was actually armed. ⛔ THE CALLER MUST REPORT THIS. It used to
+// return void and the remote handler replied "shot armed" unconditionally, so a REFUSED
+// screenshot - including one refused because a password is on screen - looked like a success,
+// and only surfaced later as "no capture in memory". A guard that reports success when it
+// blocks something is worse than no guard: it teaches you to trust the wrong message.
+extern "C" bool tdeck_shot_begin(void)
+{
+    if (s_shotBlocked) {
+        LOG_INFO("@@err shot refused - a password field is on screen");
+        return false;
+    }
 #if SHOT_HAVE_FS
     if (s_capturing || s_ready)
-        return;
+        return false;
 
     // ⚠️ REFUSE WHEN INTERNAL RAM IS TIGHT. 2026-09-19: Jake turned Wi-Fi on, and a
     // screenshot stream while Wi-Fi was negotiating took the device down -
@@ -109,13 +130,13 @@ extern "C" void tdeck_shot_begin(void)
         LOG_INFO("@@err internal heap only %u bytes free - refusing screenshot (Wi-Fi on?)",
                  (unsigned)freeInternal);
         s_failed = true;
-        return;
+        return false;
     }
     if (!s_buf) {
         s_buf = (uint16_t *)heap_caps_malloc((size_t)kShotW * kShotH * 2, MALLOC_CAP_SPIRAM);
         if (!s_buf) {
             s_failed = true;
-            return;
+            return false;
         }
     }
     memset(s_buf, 0, (size_t)kShotW * kShotH * 2);
@@ -123,6 +144,9 @@ extern "C" void tdeck_shot_begin(void)
     s_armedAtMs = millis();
     s_covered = 0;
     s_capturing = true;
+    return true;
+#else
+    return false; // no filesystem, no screenshots
 #endif
 }
 
