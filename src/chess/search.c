@@ -181,6 +181,11 @@ static uint32_t s_ttCount = 0;
 // largest task stack is 16KB. One flat allocation indexed by ply costs the same memory once
 // instead of once per level, and it goes in PSRAM where there is room for it.
 static Move *s_moveStack = NULL;
+
+// ⛔ 64KB AS A PLAIN STATIC - by far the biggest single piece of the 91KB that stopped the
+// device booting properly. Allocated from the same PSRAM block as everything else now.
+static int16_t (*s_history)[128]; // [128][128], int16 is ample for a move-ordering score
+
 #define PLY_LIST(ply) (s_moveStack + (size_t)(ply) * MAX_MOVES)
 
 void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes)
@@ -209,6 +214,12 @@ void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes
     const size_t plies = MAX_PLY + 8;
     s_moveStack = (Move *)(allocFn ? allocFn((unsigned long)(plies * MAX_MOVES * sizeof(Move)))
                                    : calloc(plies * MAX_MOVES, sizeof(Move)));
+    s_history = (int16_t(*)[128])(allocFn ? allocFn(128UL * 128UL * sizeof(int16_t))
+                                          : calloc(128UL * 128UL, sizeof(int16_t)));
+    if (s_history)
+        memset(s_history, 0, 128UL * 128UL * sizeof(int16_t));
+    // The rules half needs an allocator too, for its Zobrist tables.
+    chess_set_alloc(allocFn);
 }
 
 // ---- search state ----------------------------------------------------------------------------
@@ -218,7 +229,6 @@ static volatile bool s_abort;
 static bool s_timeUp;
 static SearchInfo s_info;
 static Move s_killers[MAX_PLY][2];
-static int s_history[128][128];
 static uint64_t s_gameHist[512];
 static int s_gameHistN = 0;
 
@@ -284,7 +294,7 @@ static void scoreMoves(const Board *b, Move *list, int n, int ply, const Move *t
                                      (s_killers[ply][1].from == m->from && s_killers[ply][1].to == m->to))) {
             m->score = 18000; // quiet moves that caused a cutoff at this depth before
         } else {
-            int h = s_history[m->from][m->to];
+            int h = s_history ? s_history[m->from][m->to] : 0;
             m->score = (int16_t)(h > 17000 ? 17000 : h);
         }
     }
@@ -431,7 +441,10 @@ static int negamax(Board *b, int depth, int alpha, int beta, int ply)
             if (!(list[i].flags & MOVE_CAPTURE) && ply < MAX_PLY) {
                 s_killers[ply][1] = s_killers[ply][0];
                 s_killers[ply][0] = list[i];
-                s_history[list[i].from][list[i].to] += depth * depth;
+                if (s_history) {
+                    int h = s_history[list[i].from][list[i].to] + depth * depth;
+                    s_history[list[i].from][list[i].to] = (int16_t)(h > 30000 ? 30000 : h); // no overflow
+                }
             }
             break;
         }
@@ -521,21 +534,22 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     s_abort = false;
     s_timeUp = false;
     memset(s_killers, 0, sizeof(s_killers));
-    memset(s_history, 0, sizeof(s_history));
+    if (s_history)
+        memset(s_history, 0, 128UL * 128UL * sizeof(int16_t));
     uint32_t start = NOW_MS();
     uint32_t budget = msBudget ? msBudget : cfg->ms;
     s_deadline = start + budget;
 
     // Root scores are kept so the weak levels can choose a slightly-worse move on purpose.
-    static int rootScore[MAX_MOVES];
-    static Move rootMove[MAX_MOVES]; // static for the same reason as scores[] below
+    static int16_t rootScore[MAX_MOVES]; // int16: a centipawn score never needs more
+    Move *rootMove = PLY_LIST(MAX_PLY + 5); // borrow a reserved slot rather than 1.5KB of .bss
     int rootN = 0;
     int completedDepth = 0, bestScore = 0;
 
     for (int depth = 1; depth <= cfg->depth; depth++) {
         int alpha = -INF, localBest = -INF;
         Move localBestMove = list[0];
-        static int scores[MAX_MOVES]; // static, not stack: 1KB is not worth a stack frame here
+        static int16_t scores[MAX_MOVES];
         Move *order = PLY_LIST(MAX_PLY + 7);
         int m = chess_gen_moves(b, order);
         scoreMoves(b, order, m, 0, completedDepth ? &rootMove[0] : NULL);
@@ -552,7 +566,7 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
                 finished = false;
                 break;
             }
-            scores[i] = sc;
+            scores[i] = (int16_t)sc;
             if (sc > localBest) {
                 localBest = sc;
                 localBestMove = order[i];
@@ -583,7 +597,7 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     // random among moves within `spread` of the best produces the inconsistency a human beginner
     // has, instead of a machine that is flawless to depth 2 and blind at depth 3.
     if (cfg->spread > 0 && rootN > 1) {
-        static Move pool[MAX_MOVES];
+        Move *pool = PLY_LIST(MAX_PLY + 6);
         int pn = 0;
         for (int i = 0; i < rootN; i++)
             if (rootScore[i] >= bestScore - cfg->spread)

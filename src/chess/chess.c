@@ -20,11 +20,19 @@ static const int kRookOff[4] = {16, -16, 1, -1};
 // ---- Zobrist ---------------------------------------------------------------------------
 // Fixed seed, so a position always hashes the same across runs and across the PC and device.
 // That matters: the opening book and any saved game are keyed by this.
-static uint64_t zPiece[16][128];
+// ⛔ POINTERS, NOT ARRAYS. As plain statics these are 17KB of internal RAM that the device
+// cannot spare - see the header note on chess_set_alloc. Allocated once on first use.
+static uint64_t (*zPiece)[128]; // [16][128]
+static uint64_t *zEp;           // [128]
 static uint64_t zSide;
-static uint64_t zCastle[16];
-static uint64_t zEp[128];
+static uint64_t zCastle[16]; // 128 bytes; small enough to stay put
 static bool zInit = false;
+static void *(*s_alloc)(unsigned long) = NULL;
+
+void chess_set_alloc(void *(*fn)(unsigned long bytes))
+{
+    s_alloc = fn;
+}
 
 static uint64_t rng64(uint64_t *s)
 {
@@ -39,6 +47,13 @@ static void zobristInit(void)
 {
     if (zInit)
         return;
+    if (!zPiece) {
+        zPiece = (uint64_t(*)[128])(s_alloc ? s_alloc(16UL * 128UL * sizeof(uint64_t))
+                                            : calloc(16UL * 128UL, sizeof(uint64_t)));
+        zEp = (uint64_t *)(s_alloc ? s_alloc(128UL * sizeof(uint64_t)) : calloc(128UL, sizeof(uint64_t)));
+    }
+    if (!zPiece || !zEp)
+        return; // leaves zInit false; chess_set_fen reports the failure rather than corrupting
     uint64_t s = 0x9E3779B97F4A7C15ULL;
     for (int p = 0; p < 16; p++)
         for (int q = 0; q < 128; q++)
@@ -73,6 +88,8 @@ static uint64_t hashBoard(const Board *b)
 bool chess_set_fen(Board *b, const char *fen)
 {
     zobristInit();
+    if (!zInit)
+        return false; // could not allocate the hash tables; better to say so than to play wrongly
     memset(b, 0, sizeof(*b));
     b->ep = NO_EP;
     b->king[WHITE] = b->king[BLACK] = 0xFF;

@@ -68,6 +68,14 @@ typedef struct {
 #define NO_EP 0x7F
 #define MAX_MOVES 256
 
+// Supply the allocator the engine uses for its big cold tables (Zobrist keys here, the history
+// table and move stack in search.c). Call before chess_init. Default is malloc.
+//
+// ⛔ ON THE DEVICE THIS MUST RETURN PSRAM. Left on the default these tables sit in internal
+// static RAM and take 91KB of it, which is more than the whole device has spare - it boots and
+// then cannot allocate. See the note at the top of chess.c.
+void chess_set_alloc(void *(*fn)(unsigned long bytes));
+
 // Set up the standard opening position.
 void chess_init(Board *b);
 
