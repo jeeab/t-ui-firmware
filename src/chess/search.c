@@ -176,6 +176,13 @@ typedef struct {
 static TTEntry *s_tt = NULL;
 static uint32_t s_ttCount = 0;
 
+// ⛔ THE MOVE LISTS LIVE HERE, NOT ON THE CALL STACK. See the note in chess.c: at 1536 bytes a
+// list and 22+ plies of depth, keeping them as locals cost ~66KB of stack on a device whose
+// largest task stack is 16KB. One flat allocation indexed by ply costs the same memory once
+// instead of once per level, and it goes in PSRAM where there is room for it.
+static Move *s_moveStack = NULL;
+#define PLY_LIST(ply) (s_moveStack + (size_t)(ply) * MAX_MOVES)
+
 void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes)
 {
     if (s_tt)
@@ -195,6 +202,13 @@ void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes
     }
     memset(s_tt, 0, (size_t)p * sizeof(TTEntry));
     s_ttCount = p;
+
+    // One list per ply, plus a margin: quiescence can extend past MAX_PLY in a wild position and
+    // running off the end of this would corrupt whatever follows it rather than simply playing
+    // badly. The depth guard in quiesce() is the real limit; this is the belt.
+    const size_t plies = MAX_PLY + 8;
+    s_moveStack = (Move *)(allocFn ? allocFn((unsigned long)(plies * MAX_MOVES * sizeof(Move)))
+                                   : calloc(plies * MAX_MOVES, sizeof(Move)));
 }
 
 // ---- search state ----------------------------------------------------------------------------
@@ -294,10 +308,14 @@ static void pickMove(Move *list, int n, int i)
 // Quiescence: at the leaves, keep searching captures only. Without this the engine stops
 // counting mid-exchange and believes it is a queen up when the recapture is one ply away -
 // the single biggest source of nonsense moves in a naive alpha-beta.
-static int quiesce(Board *b, int alpha, int beta)
+static int quiesce(Board *b, int alpha, int beta, int ply)
 {
     if (outOfTime())
         return 0;
+    // Hard ceiling. A quiescence search in a position full of recaptures can run a long way, and
+    // it must never index past the end of the move stack.
+    if (ply >= MAX_PLY + 6)
+        return eval_position(b);
     s_nodes++;
     int stand = eval_position(b);
     if (stand >= beta)
@@ -305,14 +323,14 @@ static int quiesce(Board *b, int alpha, int beta)
     if (stand > alpha)
         alpha = stand;
 
-    Move list[MAX_MOVES];
+    Move *list = PLY_LIST(ply);
     int n = chess_gen_captures(b, list);
     scoreMoves(b, list, n, 0, NULL);
     Undo u;
     for (int i = 0; i < n; i++) {
         pickMove(list, n, i);
         chess_make(b, &list[i], &u);
-        int score = -quiesce(b, -beta, -alpha);
+        int score = -quiesce(b, -beta, -alpha, ply + 1);
         chess_unmake(b, &u);
         if (s_timeUp)
             return 0;
@@ -370,10 +388,10 @@ static int negamax(Board *b, int depth, int alpha, int beta, int ply)
         depth++; // never stop searching in the middle of a forcing sequence
 
     if (depth <= 0)
-        return quiesce(b, alpha, beta);
+        return quiesce(b, alpha, beta, ply);
 
     s_nodes++;
-    Move list[MAX_MOVES];
+    Move *list = PLY_LIST(ply);
     int n = chess_gen_moves(b, list);
     if (n == 0)
         return inCheck ? -MATE + ply : 0; // mated here, or stalemate
@@ -483,7 +501,12 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
         lv = CHESS_CLUB;
     const LevelCfg *cfg = &kLevels[lv];
 
-    Move list[MAX_MOVES];
+    if (!s_moveStack)
+        search_init(NULL, 1024UL * 1024UL); // never search without the stack allocated
+    if (!s_moveStack)
+        return false;
+    // The root uses the two slots the recursive search never reaches (it starts at ply 1).
+    Move *list = PLY_LIST(0);
     int n = chess_gen_moves(b, list);
     if (n == 0)
         return false;
@@ -504,16 +527,16 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     s_deadline = start + budget;
 
     // Root scores are kept so the weak levels can choose a slightly-worse move on purpose.
-    int rootScore[MAX_MOVES];
-    Move rootMove[MAX_MOVES];
+    static int rootScore[MAX_MOVES];
+    static Move rootMove[MAX_MOVES]; // static for the same reason as scores[] below
     int rootN = 0;
     int completedDepth = 0, bestScore = 0;
 
     for (int depth = 1; depth <= cfg->depth; depth++) {
         int alpha = -INF, localBest = -INF;
         Move localBestMove = list[0];
-        int scores[MAX_MOVES];
-        Move order[MAX_MOVES];
+        static int scores[MAX_MOVES]; // static, not stack: 1KB is not worth a stack frame here
+        Move *order = PLY_LIST(MAX_PLY + 7);
         int m = chess_gen_moves(b, order);
         scoreMoves(b, order, m, 0, completedDepth ? &rootMove[0] : NULL);
         Undo u;
@@ -560,7 +583,7 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     // random among moves within `spread` of the best produces the inconsistency a human beginner
     // has, instead of a machine that is flawless to depth 2 and blind at depth 3.
     if (cfg->spread > 0 && rootN > 1) {
-        Move pool[MAX_MOVES];
+        static Move pool[MAX_MOVES];
         int pn = 0;
         for (int i = 0; i < rootN; i++)
             if (rootScore[i] >= bestScore - cfg->spread)

@@ -40,6 +40,8 @@
 #include "configuration.h"
 #include "TDeckMail.h" // @@mail / @@inbox
 #include "TDeckCoverage.h" // @@cov
+#include "chess/chess.h"  // @@chess - benchmark the engine on the real chip
+#include "chess/search.h"
 #include <Arduino.h>
 #include <cstdio>
 #include <cstring>
@@ -104,6 +106,29 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                          swT ? (unsigned)(uxTaskGetStackHighWaterMark(swT) * sizeof(StackType_t)) : 0u,
                          (unsigned)tdeck_pktq_depth(), (unsigned)tdeck_pktq_peak(), (unsigned)tdeck_pktq_cap(),
                          (unsigned)tdeck_pktq_itemsz());
+            } else if (!strncmp(s_line, "chess", 5)) {
+                // Measure the engine on the real chip. Optional argument = milliseconds.
+                int ms = atoi(s_line + 5);
+                if (ms < 200 || ms > 8000)
+                    ms = 2000;
+                // The transposition table lives in PSRAM: it is big, cold, and internal RAM is
+                // the scarce thing here (largest free block measured at 20KB). 1MB = 64k entries.
+                search_init([](unsigned long n) -> void * { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); },
+                            1024UL * 1024UL);
+                Board b;
+                chess_init(&b);
+                search_history_clear();
+                Move mv;
+                uint32_t t0 = millis();
+                bool ok = search_best_move(&b, CHESS_MAX, (uint32_t)ms, &mv);
+                uint32_t took = millis() - t0;
+                SearchInfo in;
+                search_last_info(&in);
+                char mbuf[8] = "----";
+                if (ok)
+                    chess_move_str(&mv, mbuf);
+                LOG_INFO("@@ok chess depth=%d nodes=%u ms=%u knps=%u best=%s score=%d", in.depth,
+                         (unsigned)in.nodes, (unsigned)took, (unsigned)(took ? in.nodes / took : 0), mbuf, in.score);
             } else if (!strncmp(s_line, "cov", 3)) {
                 // @@cov on | off | clear | stat - drive the coverage mapper over the cable, so
                 // it can be tested without walking around tapping the screen.

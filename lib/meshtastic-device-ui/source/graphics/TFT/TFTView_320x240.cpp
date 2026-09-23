@@ -84,6 +84,12 @@ extern "C" uint32_t tdeck_gps_num_sats(void);
 extern "C" bool tdeck_gps_has_lock(void);
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
 extern "C" void tdeck_coverage_sample(uint32_t fromNode, int32_t rssi, float snr); // TDeckCoverage.cpp
+extern "C" bool tdeck_coverage_enabled(void);
+extern "C" void tdeck_coverage_set_enabled(bool on);
+extern "C" int tdeck_coverage_count(void);
+extern "C" bool tdeck_coverage_cell(int i, int32_t *lat, int32_t *lon, int *snrQ, int *rssi, int *n);
+extern "C" void tdeck_coverage_clear(void);
+extern "C" void tdeck_coverage_load(void);
 // Node bridge (src/TDeckNodesBridge.cpp), so the pins search can find people too.
 extern "C" int tdeck_nodes_list(uint32_t *out, int maxN);
 extern "C" const char *tdeck_node_name(uint32_t num);
@@ -1531,6 +1537,11 @@ void TFTView_320x240::createLauncher(void)
                        lv_display_get_inactive_time(NULL) > kLockPadIdleMs) {
                 THIS->lockDevice();
             }
+
+            // Coverage overlay: self-throttled by its own change check, so calling it on every
+            // pass costs a handful of comparisons when nothing has moved.
+            if (THIS->maps_screen && lv_screen_active() == THIS->maps_screen)
+                THIS->refreshCoverageOverlay();
 
             // Keep the glance honest while it is up: its clock would otherwise be frozen at
             // whatever time it was built, and a message arriving would not appear. Cheap -
@@ -4383,6 +4394,115 @@ void mapdlWriteMeta(void)
 // Switch the Maps app to a tile style (a folder under /maps). Reads the style's
 // optional .format (jpg/png, default png) and .url (browse-fill server) files, so a
 // downloaded style Just Works. persist=true remembers it across reboots.
+// ---------------------------------------------------------------------------------------
+// COVERAGE HEATMAP OVERLAY
+//
+// One translucent square per recorded grid cell, coloured by the best signal seen there. Green
+// where the mesh is strong, red where it barely reaches, and nothing at all where no packet has
+// ever been heard - which is itself the answer to "does it reach here".
+//
+// ⭐ A FIXED POOL OF PLAIN RECTANGLES, NOT ONE OBJECT PER CELL. The grid holds up to 6000 cells
+// and LVGL will not thank you for 6000 objects - the node markers needed a layer of their own at
+// 121. At most kCovPool are ever on screen and cells past that are skipped, because a heatmap of
+// 120 squares instead of 130 reads identically and one that stutters does not. The rectangles
+// are created once and reused, so panning re-positions instead of reallocating.
+//
+// ⚠ REFRESHED FROM THE POLL WITH A CHANGE CHECK, NOT FROM THE REDRAW CALL SITES. At least
+// seven places move or redraw this map; hooking them is how you get an overlay that is right on
+// six and quietly stale on the seventh. Comparing centre, zoom and cell count costs nothing and
+// cannot be forgotten.
+static const int kCovPool = 120;
+
+void TFTView_320x240::refreshCoverageOverlay(void)
+{
+    if (!map || !maps_marker_layer)
+        return;
+
+    const int cells = tdeck_coverage_count();
+    float clat = 0, clon = 0;
+    map->getCenter(clat, clon);
+    const uint8_t zoom = MapTileSettings::getZoomLevel();
+
+    static float lastLat = 1e9f, lastLon = 1e9f;
+    static uint8_t lastZoom = 255;
+    static int lastCells = -1;
+    static bool lastShown = false;
+    const bool show = coverage_overlay_on && cells > 0;
+    if (show == lastShown && clat == lastLat && clon == lastLon && zoom == lastZoom && cells == lastCells)
+        return; // nothing moved and nothing new arrived
+    lastLat = clat;
+    lastLon = clon;
+    lastZoom = zoom;
+    lastCells = cells;
+    lastShown = show;
+
+    if (!coverage_cells[0] && show) {
+        for (int i = 0; i < kCovPool; i++) {
+            lv_obj_t *r = lv_obj_create(maps_marker_layer);
+            lv_obj_remove_style_all(r);
+            lv_obj_clear_flag(r, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+            lv_obj_set_style_bg_opa(r, 110, LV_PART_MAIN); // see the map through it
+            lv_obj_add_flag(r, LV_OBJ_FLAG_HIDDEN);
+            coverage_cells[i] = r;
+        }
+    }
+    if (!coverage_cells[0])
+        return;
+    if (!show) {
+        for (int i = 0; i < kCovPool; i++)
+            lv_obj_add_flag(coverage_cells[i], LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    // How big is one grid cell on screen at this zoom? MEASURED, not derived: ask the map where
+    // two points one cell apart land. That stays correct through the Mercator stretch and
+    // through any future change to the cell size, which a hand-computed constant would not.
+    const int32_t kCellUnits = 4096; // must match kCellShift in TDeckCoverage.cpp (1 << 12)
+    int16_t ax = 0, ay = 0, bx = 0, by = 0;
+    map->geoToScreen(clat, clon, ax, ay);
+    map->geoToScreen(clat - kCellUnits / 1e7f, clon + kCellUnits / 1e7f, bx, by);
+    int w = bx - ax, h = by - ay;
+    if (w < 2)
+        w = 2;
+    if (h < 2)
+        h = 2;
+    if (w > 120)
+        w = 120;
+    if (h > 120)
+        h = 120;
+
+    int used = 0;
+    for (int i = 0; i < cells && used < kCovPool; i++) {
+        int32_t la = 0, lo = 0;
+        int q = 0, rssi = 0, n = 0;
+        if (!tdeck_coverage_cell(i, &la, &lo, &q, &rssi, &n))
+            continue;
+        int16_t x = 0, y = 0;
+        if (!map->geoToScreen(la / 1e7f, lo / 1e7f, x, y))
+            continue; // off screen
+        const float snr = q / 4.0f;
+        // LoRa SNR runs from roughly -20 (barely decodable) to +10 (right beside it).
+        uint32_t colour;
+        if (snr >= 5)
+            colour = 0x30d158; // green: strong
+        else if (snr >= 0)
+            colour = 0x9ede3a;
+        else if (snr >= -5)
+            colour = 0xffd60a; // yellow
+        else if (snr >= -10)
+            colour = 0xff9f0a; // orange
+        else
+            colour = 0xff453a; // red: marginal
+        lv_obj_t *r = coverage_cells[used++];
+        lv_obj_set_pos(r, x - w / 2, y - h / 2);
+        lv_obj_set_size(r, w, h);
+        lv_obj_set_style_bg_color(r, lv_color_hex(colour), LV_PART_MAIN);
+        lv_obj_clear_flag(r, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = used; i < kCovPool; i++)
+        lv_obj_add_flag(coverage_cells[i], LV_OBJ_FLAG_HIDDEN);
+}
+
 void TFTView_320x240::mapsApplyStyle(const char *style, bool persist)
 {
     MapTileSettings::setTileStyle(style);
@@ -4534,6 +4654,36 @@ void TFTView_320x240::openMapsMenu(void)
         lv_obj_t *none = lv_label_create(maps_style_ovl);
         lv_label_set_text(none, "no styles found on card");
         lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    }
+
+    // Coverage mapper. Two rows, deliberately separate: you want to record on a drive without
+    // the overlay cluttering the map, and to study it afterwards without still recording.
+    {
+        char cbuf[48];
+        snprintf(cbuf, sizeof(cbuf), "Record coverage: %s", tdeck_coverage_enabled() ? "ON" : "off");
+        row(cbuf, tdeck_coverage_enabled() ? 0x30d158 : 0x8e8e93,
+            [](lv_event_t *) {
+                tdeck_coverage_set_enabled(!tdeck_coverage_enabled());
+                THIS->closeMapsMenu();
+                // ⛔ REOPEN ASYNC. Closing inside the callback is what every other row here
+                // does, but reopening as well would build a NEW overlay while LVGL is still
+                // inside the deleted one's event handler. lv_async_call runs it after the
+                // event finishes - the same rule that stopped a tap freezing the device in
+                // the Nodes/Favorites apps.
+                lv_async_call([](void *) { THIS->openMapsMenu(); }, nullptr);
+            },
+            NULL);
+        snprintf(cbuf, sizeof(cbuf), "Show coverage (%d): %s", tdeck_coverage_count(),
+                 THIS->coverage_overlay_on ? "ON" : "off");
+        row(cbuf, THIS->coverage_overlay_on ? 0x30d158 : 0x8e8e93,
+            [](lv_event_t *) {
+                THIS->coverage_overlay_on = !THIS->coverage_overlay_on;
+                if (THIS->coverage_overlay_on)
+                    tdeck_coverage_load(); // a survey may be on the card from a previous session
+                THIS->closeMapsMenu();
+                lv_async_call([](void *) { THIS->openMapsMenu(); }, nullptr); // see the row above
+            },
+            NULL);
     }
 
     row(mapdl_running ? "Download progress..." : "Download this area...", 0x30d158,

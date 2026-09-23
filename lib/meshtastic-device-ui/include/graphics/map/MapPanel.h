@@ -48,6 +48,11 @@ class MapPanel
     void moveCurrent(void);
     // convert a panel pixel (x,y) to a geographic lat/lon (inverse of the object placement)
     void screenToGeo(int16_t x, int16_t y, float &lat, float &lon);
+    // The inverse: where on the panel does this coordinate land? Returns false when it falls
+    // outside the visible panel, so a caller drawing an overlay can skip it cheaply.
+    // Deliberately does NOT consult the tile cache - it works off the same centre point
+    // screenToGeo uses, so it is correct even for a coordinate whose tile has not loaded.
+    bool geoToScreen(float lat, float lon, int16_t &x, int16_t &y);
     // current map center + last known GPS location
     void getCenter(float &lat, float &lon) const { lat = scrolled.latitude; lon = scrolled.longitude; }
     void getGpsLocation(float &lat, float &lon) const { lat = current.latitude; lon = current.longitude; }

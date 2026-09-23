@@ -514,36 +514,37 @@ void chess_unmake(Board *b, const Undo *u)
     }
 }
 
-int chess_gen_moves(Board *b, Move *list)
+// ⛔ GENERATES INTO THE CALLER'S LIST AND FILTERS IN PLACE - no scratch array.
+// The obvious version keeps a local Move pseudo[MAX_MOVES] and copies the legal ones out. That
+// is 1536 bytes of stack per ply, and with the search's own list it made a deep search cost 66KB
+// of stack on a device whose biggest task stack is 16KB. Compacting in place is safe because the
+// write index n can never overtake the read index i: n only advances when i does.
+static int genLegal(Board *b, Move *list, bool capturesOnly)
 {
-    Move pseudo[MAX_MOVES];
-    int np = genPseudo(b, pseudo, false);
+    int np = genPseudo(b, list, capturesOnly);
     int n = 0;
     Undo u;
     for (int i = 0; i < np; i++) {
-        chess_make(b, &pseudo[i], &u);
+        const Move m = list[i]; // by value: the slot may be overwritten below
+        chess_make(b, &m, &u);
         // After make, side has flipped - so "did WE leave our king attacked" is a question
         // about the side that just moved, i.e. b->side ^ 1.
-        if (!chess_in_check(b, (uint8_t)(b->side ^ 1)))
-            list[n++] = pseudo[i];
+        const bool legal = !chess_in_check(b, (uint8_t)(b->side ^ 1));
         chess_unmake(b, &u);
+        if (legal)
+            list[n++] = m;
     }
     return n;
 }
 
+int chess_gen_moves(Board *b, Move *list)
+{
+    return genLegal(b, list, false);
+}
+
 int chess_gen_captures(Board *b, Move *list)
 {
-    Move pseudo[MAX_MOVES];
-    int np = genPseudo(b, pseudo, true);
-    int n = 0;
-    Undo u;
-    for (int i = 0; i < np; i++) {
-        chess_make(b, &pseudo[i], &u);
-        if (!chess_in_check(b, (uint8_t)(b->side ^ 1)))
-            list[n++] = pseudo[i];
-        chess_unmake(b, &u);
-    }
-    return n;
+    return genLegal(b, list, true);
 }
 
 uint64_t chess_perft(Board *b, int depth)

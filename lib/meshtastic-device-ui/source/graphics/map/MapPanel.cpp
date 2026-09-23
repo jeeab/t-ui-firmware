@@ -502,6 +502,28 @@ void MapPanel::screenToGeo(int16_t x, int16_t y, float &lat, float &lon)
     lon = p.longitude;
 }
 
+bool MapPanel::geoToScreen(float lat, float lon, int16_t &x, int16_t &y)
+{
+    // A GeoPoint's absolute pixel position at this zoom is xTile*tileSize + xPos. `scrolled`
+    // sits at the panel centre, so the difference between the two absolute positions IS the
+    // offset from the centre of the screen. No tile lookup, no projection maths repeated.
+    const int32_t size = MapTileSettings::getTileSize();
+    GeoPoint p(lat, lon, MapTileSettings::getZoomLevel());
+    const int64_t px = (int64_t)p.xTile * size + p.xPos;
+    const int64_t py = (int64_t)p.yTile * size + p.yPos;
+    const int64_t cx = (int64_t)scrolled.xTile * size + scrolled.xPos;
+    const int64_t cy = (int64_t)scrolled.yTile * size + scrolled.yPos;
+    const int64_t sx = (int64_t)(widthPixel / 2) + (px - cx);
+    const int64_t sy = (int64_t)(heightPixel / 2) + (py - cy);
+    // Clamp into int16 before assigning, or a far-away point wraps and paints itself right in
+    // the middle of the map - which looks like real data and is not.
+    if (sx < -32000 || sx > 32000 || sy < -32000 || sy > 32000)
+        return false;
+    x = (int16_t)sx;
+    y = (int16_t)sy;
+    return sx >= 0 && sx < widthPixel && sy >= 0 && sy < heightPixel;
+}
+
 void MapPanel::add(uint32_t id, float lat, float lon, DrawCallback drawCB)
 {
     auto it = mapObjects.find(id);

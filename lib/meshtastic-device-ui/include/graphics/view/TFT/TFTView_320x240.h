@@ -619,6 +619,9 @@ class TFTView_320x240 : public MeshtasticView
     uint32_t stayOnBoostUntil = 0;
     uint32_t stayOnDriftMs = 0;
     uint8_t stayOnDriftIdx = 0;
+    void refreshCoverageOverlay(void);         // heatmap of where the mesh reaches
+    bool coverage_overlay_on = false;          // showing it is separate from RECORDING it
+    lv_obj_t *coverage_cells[120] = {nullptr}; // fixed pool; see refreshCoverageOverlay()
     void showLockGlance(void);
     void armLockGlance(void); // set up "kept lit" - dim floor, fade time, stay window
     void glanceNotifRow(lv_obj_t *parent, const char *who, const char *text, const char *age);
