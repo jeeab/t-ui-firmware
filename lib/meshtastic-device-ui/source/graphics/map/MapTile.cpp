@@ -56,7 +56,54 @@ bool MapTile::load(lv_obj_t *p, int16_t posx, int16_t posy, const lv_image_dsc_t
     // use configured TileService
     if (!result) {
         result = osm->load(*this, img);
-        if (!result) {
+    }
+
+#if LV_USE_FS_ARDUINO_SD
+    // ⭐ OVERZOOM. Jake: "when you have no more map tiles at that zone. Could it like zoom in on
+    // the actual map tile from the previous? It would be blurry but at least a bit better than
+    // nothing right?" - yes, and it is what every map renderer does. USGS stops around z16 and
+    // past that this drew a grey placeholder, which is worse than a blurry map: blurry still
+    // shows the shape of the valley and where the track runs.
+    //
+    // Tile (z,x,y) lives inside tile (z-1, x/2, y/2), in the quadrant picked by the low bit of
+    // each coordinate. Load the parent, scale 2x, shift so that quadrant fills the box. If the
+    // parent is missing too, go up again at 4x - each level doubles the blur, so it stops at
+    // kMaxOverzoom, past which the picture tells you nothing the grey square did not.
+    if (!result) {
+        const int tileSize = MapTileSettings::getTileSize();
+        constexpr int kMaxOverzoom = 3;
+        for (int up = 1; up <= kMaxOverzoom && !result; up++) {
+            const int pz = zoomLevel - up;
+            if (pz < 0)
+                break;
+            const int px = xTile >> up, py = yTile >> up;
+            char pf[128];
+            pf[0] = LV_FS_ARDUINO_SD_LETTER;
+            sprintf(&pf[1], ":%s/%s%d/%d/%d.%s", MapTileSettings::getPrefix(), MapTileSettings::getTileStyle(), pz, px,
+                    py, MapTileSettings::getTileFormat());
+            lv_image_set_src(img, pf);
+            if (!lv_image_get_src((lv_obj_t *)img))
+                continue; // that ancestor is missing too - try one further up
+            const int factor = 1 << up; // 2x, 4x, 8x
+            // ⚠️ THE OFFSET IS IN SOURCE PIXELS. lv_image_set_offset_* shifts the source before
+            // scaling, so one quadrant is tileSize/factor of SOURCE, not a whole tile on screen.
+            // Getting this wrong lands you in the wrong quarter of the world - which looks
+            // perfectly plausible and is completely wrong.
+            const int subX = xTile & (factor - 1);
+            const int subY = yTile & (factor - 1);
+            lv_image_set_inner_align(img, LV_IMAGE_ALIGN_TOP_LEFT);
+            lv_image_set_offset_x(img, -(subX * tileSize) / factor);
+            lv_image_set_offset_y(img, -(subY * tileSize) / factor);
+            lv_image_set_scale(img, 256 * factor); // 256 = 1:1 in LVGL
+            lv_obj_set_style_opa(img, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+            ILOG_DEBUG("overzoom %d/%d/%d from parent %d/%d/%d (%dx)", zoomLevel, xTile, yTile, pz, px, py, factor);
+            result = true;
+        }
+    }
+#endif
+
+    if (!result) {
+        {
             if (img_src) {
                 // ILOG_DEBUG("set no-tile-image (%d/%d/%d)", MapTileSettings::getZoomLevel(), xTile, yTile);
                 lv_image_set_src((lv_obj_t *)img, img_src);

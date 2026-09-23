@@ -9798,7 +9798,10 @@ void TFTView_320x240::openLockSettings(void)
             THIS->updateLockPageLabels();
         });
         y += 42;
-        lockpage_dim_row = lockPageRow(lockpage_screen, "Dim level", y, "15%", &lockpage_dim_label,
+        lockpage_dim_row = // "Dim level: 60%" reads like "dimmed BY 60%", i.e. darker - Jake asked "so a higher
+        // percent means brighter?", which is the question a bad label produces. Higher IS
+        // brighter (the value becomes a brightness floor), so name it that way.
+        lockPageRow(lockpage_screen, "Lock brightness", y, "15%", &lockpage_dim_label,
                                        [](lv_event_t *) {
                                            // Jake asked for brighter options. 80 and 100 matter outdoors: at 60% the glance is still
                                            // hard to read in daylight, and "keep the screen on" is
