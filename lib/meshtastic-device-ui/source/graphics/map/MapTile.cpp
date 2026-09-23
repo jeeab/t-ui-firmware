@@ -24,6 +24,7 @@ bool MapTile::load(lv_obj_t *p, int16_t posx, int16_t posy, const lv_image_dsc_t
 {
     x = posx;
     y = posy;
+    ozdx = ozdy = 0; // a fresh load is not overzoomed until the block below says so
     if (!p)
         return false;
     removeImage();
@@ -58,49 +59,53 @@ bool MapTile::load(lv_obj_t *p, int16_t posx, int16_t posy, const lv_image_dsc_t
         result = osm->load(*this, img);
     }
 
-#if LV_USE_FS_ARDUINO_SD
     // ⭐ OVERZOOM. Jake: "when you have no more map tiles at that zone. Could it like zoom in on
     // the actual map tile from the previous? It would be blurry but at least a bit better than
     // nothing right?" - yes, and it is what every map renderer does. USGS stops around z16 and
     // past that this drew a grey placeholder, which is worse than a blurry map: blurry still
     // shows the shape of the valley and where the track runs.
     //
-    // Tile (z,x,y) lives inside tile (z-1, x/2, y/2), in the quadrant picked by the low bit of
-    // each coordinate. Load the parent, scale 2x, shift so that quadrant fills the box. If the
-    // parent is missing too, go up again at 4x - each level doubles the blur, so it stops at
-    // kMaxOverzoom, past which the picture tells you nothing the grey square did not.
+    // ⛔ THIS MUST GO THROUGH osm->load(), NOT the lv_fs path above it. LV_USE_FS_ARDUINO_SD is
+    // 0 in our lv_conf.h, so that block is dead code - the first version of this feature copied
+    // its #if and was therefore never compiled in at all. Jake: "the extra zoom thing on the
+    // maps isnt working. it just shows the 'no tile' placeholder still."
+    //
+    // Tile (z,x,y) lives inside (z-up, x>>up, y>>up). Rather than offset the source - which is
+    // not what lv_image_set_offset_* does; it moves an unscaled rect in WIDGET pixels, before
+    // lv_draw_image applies the scale - grow the object to the whole magnified parent and slide
+    // it so our quadrant lands on our slot. pivot (0,0) keeps source (0,0) at the object's
+    // top-left so it magnifies right and down.
+    //
+    // ⭐ THE OVERLAP IS HARMLESS, and that is the trick. This object now covers its siblings'
+    // slots, but every child of the same parent computes (pos - sub*tileSize) from a pos that
+    // differs by exactly tileSize per unit of sub, so they all land on the SAME rect and draw
+    // the SAME magnified parent. Siblings paint identical pixels. No clipping container needed.
     if (!result) {
         const int tileSize = MapTileSettings::getTileSize();
-        constexpr int kMaxOverzoom = 3;
+        constexpr int kMaxOverzoom = 3; // 2x, 4x, 8x - past that it tells you nothing
         for (int up = 1; up <= kMaxOverzoom && !result; up++) {
-            const int pz = zoomLevel - up;
-            if (pz < 0)
+            if ((int)zoomLevel - up < 0)
                 break;
-            const int px = xTile >> up, py = yTile >> up;
-            char pf[128];
-            pf[0] = LV_FS_ARDUINO_SD_LETTER;
-            sprintf(&pf[1], ":%s/%s%d/%d/%d.%s", MapTileSettings::getPrefix(), MapTileSettings::getTileStyle(), pz, px,
-                    py, MapTileSettings::getTileFormat());
-            lv_image_set_src(img, pf);
-            if (!lv_image_get_src((lv_obj_t *)img))
+            OSMTiles<lv_obj_t>::Tile parent((uint32_t)(xTile >> up), (uint32_t)(yTile >> up), (uint8_t)(zoomLevel - up));
+            if (!osm->load(parent, img))
                 continue; // that ancestor is missing too - try one further up
-            const int factor = 1 << up; // 2x, 4x, 8x
-            // ⚠️ THE OFFSET IS IN SOURCE PIXELS. lv_image_set_offset_* shifts the source before
-            // scaling, so one quadrant is tileSize/factor of SOURCE, not a whole tile on screen.
-            // Getting this wrong lands you in the wrong quarter of the world - which looks
-            // perfectly plausible and is completely wrong.
-            const int subX = xTile & (factor - 1);
-            const int subY = yTile & (factor - 1);
+            const int factor = 1 << up;
+            const int subX = (int)(xTile & (uint32_t)(factor - 1));
+            const int subY = (int)(yTile & (uint32_t)(factor - 1));
+            ozdx = (int16_t)(-subX * tileSize);
+            ozdy = (int16_t)(-subY * tileSize);
+            lv_obj_set_size(img, tileSize * factor, tileSize * factor);
+            lv_obj_set_pos(img, x + ozdx, y + ozdy);
             lv_image_set_inner_align(img, LV_IMAGE_ALIGN_TOP_LEFT);
-            lv_image_set_offset_x(img, -(subX * tileSize) / factor);
-            lv_image_set_offset_y(img, -(subY * tileSize) / factor);
-            lv_image_set_scale(img, 256 * factor); // 256 = 1:1 in LVGL
+            lv_image_set_pivot(img, 0, 0);
+            lv_image_set_scale(img, LV_SCALE_NONE * factor);
+            lv_image_set_antialias(img, false); // a blown-up tile: nearest-neighbour is honest and cheap
             lv_obj_set_style_opa(img, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-            ILOG_DEBUG("overzoom %d/%d/%d from parent %d/%d/%d (%dx)", zoomLevel, xTile, yTile, pz, px, py, factor);
+            ILOG_DEBUG("overzoom %d/%d/%d from parent %d/%d/%d (%dx)", zoomLevel, xTile, yTile, (int)zoomLevel - up,
+                       xTile >> up, yTile >> up, factor);
             result = true;
         }
     }
-#endif
 
     if (!result) {
         {
@@ -126,8 +131,11 @@ bool MapTile::move(int16_t posx, int16_t posy)
 {
     x += posx;
     y += posy;
+    // ozdx/ozdy are 0 for a normal tile. For an overzoomed one they are where the magnified
+    // parent has to sit for OUR quadrant to land on OUR slot - drop them and panning tears the
+    // alignment apart one step at a time.
     if (img)
-        lv_obj_set_pos(img, x, y);
+        lv_obj_set_pos(img, x + ozdx, y + ozdy);
     if (MapTileSettings::getDebug()) {
         lv_label_set_text_fmt(lbl, "(%d/%d/%d) -> %d,%d", MapTileSettings::getZoomLevel(), xTile, yTile, x, y);
     }

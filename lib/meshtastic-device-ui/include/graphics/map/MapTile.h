@@ -22,6 +22,8 @@ class MapTile : public OSMTiles<lv_obj_t>::Tile
   protected:
     int16_t x;     // x-pos in parent panel
     int16_t y;     // y-pos in parent panel
+    int16_t ozdx = 0; // overzoom: how far the blown-up parent is shifted off this tile's slot,
+    int16_t ozdy = 0; // in panel pixels. 0 when the tile loaded normally. move() must reapply it.
     lv_obj_t *img; // lvgl tile image
     lv_obj_t *lbl; // debug label
 };
