@@ -620,6 +620,7 @@ class TFTView_320x240 : public MeshtasticView
     uint32_t stayOnDriftMs = 0;
     uint8_t stayOnDriftIdx = 0;
     void showLockGlance(void);
+    void armLockGlance(void); // set up "kept lit" - dim floor, fade time, stay window
     void glanceNotifRow(lv_obj_t *parent, const char *who, const char *text, const char *age);
     void glanceWidgetCard(lv_obj_t *parent, const struct LockWidgetText &w);               // the iPod-style glance: clock, who messaged, slide to unlock
     void remoteInit(void);                   // second LVGL pointer device, for injected taps

@@ -9041,6 +9041,37 @@ void TFTView_320x240::stayOnBoost(void)
     stayOnBoostUntil = lv_tick_get() + 3000;
 }
 
+// Put the glance into its "kept lit" state. This MUST run wherever the glance is shown, not
+// just where it is locked from: the wake path clears stayOnSinceMs and the dim floor on its
+// way out of the dark (rightly - it is waking) and then shows the glance, and for want of
+// this call that glance faded to black on the general screen timeout with the 3-second
+// brighten switched off. Jake: "it waits till screen timeout length ... then it dims".
+void TFTView_320x240::armLockGlance(void)
+{
+    const int stay = tdeck_lock_stayon_mins();
+    if (stay == 0) {
+        // "Keep lit" is off: the glance is meant to fade all the way out on the normal
+        // timeout, so leave the floor at 0 and do not touch the user's timeout.
+        stayOnSinceMs = 0;
+        stayOnBoostUntil = 0;
+        tdeck_dim_floor = 0;
+        return;
+    }
+    stayOnSinceMs = lv_tick_get();
+    stayOnBoostUntil = 0;
+    // The user's value is SAVED, not overwritten - it comes back on unlock, so Settings >
+    // Screen Timeout still means what it says for the unlocked device.
+    if (!stayOnSavedTimeout) {
+        stayOnSavedTimeout = (int32_t)db.uiConfig.screen_timeout + 1; // +1: 0 is a real value
+        displaydriver->setScreenTimeout(kLockFadeSecs);
+    }
+    // 0% would be indistinguishable from off, so the floor never goes below 1.
+    const int pct = tdeck_lock_dim_pct();
+    tdeck_dim_floor = (uint8_t)(pct <= 0 ? 1 : (pct * 255) / 100);
+    tdeck_hold_dark = false;
+    LOG_INFO("lock glance armed: floor=%d fade=%us stay=%d", (int)tdeck_dim_floor, (unsigned)kLockFadeSecs, stay);
+}
+
 void TFTView_320x240::lockDevice(void)
 {
     // ⛔ THERE IS NO SEPARATE SCREENSAVER, AND THAT IS DELIBERATE.
@@ -9060,27 +9091,17 @@ void TFTView_320x240::lockDevice(void)
         lockDigits[0] = 0;
         if (lockedAtMs == 0)
             lockedAtMs = lv_tick_get();
-        stayOnSinceMs = lv_tick_get();
-        stayOnBoostUntil = 0;
-        showLockGlance();
+        showLockGlance(); // arms itself - see armLockGlance()
         // ⭐ THE LOCK SCREEN OWNS ITS OWN DIMMING while it is being kept lit. Jake: "the screen
         // keep awake in the general settings vs the lock screen settings seem to fight each
         // other" - and they did, because Settings > Screen Timeout drives the FADE while this
         // page only sets the floor the fade stops at. With the timeout off, the driver never
         // faded at all and the lock screen sat at full brightness with "Keep screen on"
         // apparently doing nothing; with it short, the page dimmed on a schedule that had
-        // nothing to do with the minutes chosen here.
+        // nothing to do with the minutes chosen here. That setup now lives in armLockGlance(),
+        // called from showLockGlance(), because the WAKE path shows this same screen and was
+        // getting none of it.
         //
-        // The user's value is SAVED, not overwritten - it comes back on unlock, so the general
-        // setting still means what it says for the unlocked device.
-        if (!stayOnSavedTimeout) {
-            stayOnSavedTimeout = (int32_t)db.uiConfig.screen_timeout + 1; // +1: 0 is a real value
-            displaydriver->setScreenTimeout(kLockFadeSecs);
-        }
-        // 0% would be indistinguishable from off, so the floor never goes below 1.
-        const int pct = tdeck_lock_dim_pct();
-        tdeck_dim_floor = (uint8_t)(pct <= 0 ? 1 : (pct * 255) / 100);
-        tdeck_hold_dark = false;
         // ⛔ NOT GATED, whatever the unlock key is. This screen shows a slider and a caption
         // saying "slide to unlock", so the slide has to work - a visible control that ignores
         // you is worse than no control. tdeck_input_gated is not a keyboard gate, it gates
@@ -9878,6 +9899,7 @@ void TFTView_320x240::showLockGlance(void)
     lockState = LOCK_GLANCE;
     lockLen = 0;
     lockDigits[0] = 0;
+    armLockGlance(); // whoever is showing it, it is a kept-lit lock screen from here on
 
     if (!lockglance_screen) {
         lockglance_screen = lv_obj_create(NULL);
