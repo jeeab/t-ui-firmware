@@ -1453,6 +1453,12 @@ void TFTView_320x240::createLauncher(void)
             // If we booted locked, keep the PIN pad up (don't let config-sync reveal the UI);
             // otherwise settle on the launcher grid.
             lv_obj_t *want = THIS->launcher_screen;
+            // A finger on the glance brightens it for three seconds, exactly as a key does.
+            // Jake: "it doesn't light up if I touch the screen" - the boost was requested from
+            // the keyboard and trackball drivers only, which on a touchscreen showing a
+            // "slide to unlock" control is the one input it ignored.
+            if (THIS->lockState == LOCK_GLANCE)
+                tdeck_stayon_boost_request = true;
             if (THIS->lockState == LOCK_GLANCE && THIS->lockglance_screen)
                 want = THIS->lockglance_screen;
             else if (THIS->lockState != LOCK_NONE && THIS->lockpad_screen)
@@ -10257,6 +10263,12 @@ void TFTView_320x240::lockGlanceUnlocked(void)
     stayOnSinceMs = 0;
     stayOnBoostUntil = 0;
     tdeck_dim_floor = 0;
+    // ⛔ CLEARING THE FLOOR IS NOT RESTORING THE BRIGHTNESS. The floor is only the level the
+    // fade may stop at; the panel is already down at it, and clearing it just permits going
+    // lower. Jake: "I had the dim set to 5 percent, slid to unlock, and the whole TDeck
+    // remained at 5 percent brightness." Put the user's own setting back explicitly.
+    tdeck_hold_dark = false;
+    setBrightness(db.uiConfig.screen_brightness);
     for (lv_obj_t *o : {glance_clock_label, glance_date_label, glance_list}) {
         if (!o)
             continue;
@@ -10428,6 +10440,10 @@ void TFTView_320x240::submitLockPad(void)
         lockedAtMs = 0; // unlocked for real: the next lock starts a fresh grace window
         tdeck_hold_dark = false;
         tdeck_input_gated = false;
+        // Same restore as the slide path: the PIN pad can also be reached from a dimmed glance,
+        // and leaving through it must not strand the device at the lock brightness.
+        tdeck_dim_floor = 0;
+        setBrightness(db.uiConfig.screen_brightness);
         lv_display_trigger_activity(NULL);
         if (launcher_screen)
             lv_screen_load_anim(launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
@@ -15050,6 +15066,14 @@ void TFTView_320x240::addNode(uint32_t nodeNum, uint8_t ch, const char *userShor
             churnCount++;
         }
     }
+    // ⏱ TIME IT. pkt-v4 (node_info) showed up in two 30-second freeze records, and addNode
+    // builds a whole LVGL panel - object, labels, images - per node, with 229 of them arriving
+    // in one burst during a config sync. That is a plausible cause and NOT yet a proven one:
+    // the breadcrumb persists after the last packet, so the stall could equally be after it.
+    // The same trap already produced one wrong answer today (1s-tick actually covered a 60s
+    // block), so this measures instead of assuming.
+    const uint32_t addStart = millis();
+
     while (nodeCount >= MAX_NUM_NODES_VIEW) {
         purgeNode(nodeNum);
     }
@@ -15247,6 +15271,10 @@ void TFTView_320x240::addNode(uint32_t nodeNum, uint8_t ch, const char *userShor
         applyNodesFilter(nodeNum);
         updateNodesStatus();
     }
+
+    const uint32_t addMs = millis() - addStart;
+    if (addMs > 60)
+        ILOG_WARN("addNode SLOW: %lums for 0x%08x (%d nodes)", (unsigned long)addMs, nodeNum, nodeCount);
 }
 
 void TFTView_320x240::setMyInfo(uint32_t nodeNum)
