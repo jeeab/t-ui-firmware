@@ -83,6 +83,7 @@ extern "C" bool tdeck_get_mesh_enabled(void);
 extern "C" uint32_t tdeck_gps_num_sats(void);
 extern "C" bool tdeck_gps_has_lock(void);
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
+extern "C" void tdeck_coverage_sample(uint32_t fromNode, int32_t rssi, float snr); // TDeckCoverage.cpp
 // Node bridge (src/TDeckNodesBridge.cpp), so the pins search can find people too.
 extern "C" int tdeck_nodes_list(uint32_t *out, int maxN);
 extern "C" const char *tdeck_node_name(uint32_t num);
@@ -16302,6 +16303,10 @@ void TFTView_320x240::packetReceived(const meshtastic_MeshPacket &p)
     }
     if (p.from != ownNode) {
         updateSignalStrength(p.rx_rssi, p.rx_snr);
+        // Coverage mapper: every packet the radio HEARD is one data point about where the mesh
+        // reaches. Cheap by construction - a hash insert, no SD, no logging - because this is
+        // the tft task holding spiLock. It does nothing at all unless recording is switched on.
+        tdeck_coverage_sample(p.from, p.rx_rssi, p.rx_snr);
     }
     updateStatistics(p);
 }

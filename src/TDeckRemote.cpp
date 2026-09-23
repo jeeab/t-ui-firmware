@@ -38,6 +38,8 @@
 // launcher bridges; see the notes in TDeckPop.cpp.
 // -----------------------------------------------------------------------------
 #include "configuration.h"
+#include "TDeckMail.h" // @@mail / @@inbox
+#include "TDeckCoverage.h" // @@cov
 #include <Arduino.h>
 #include <cstdio>
 #include <cstring>
@@ -102,6 +104,49 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                          swT ? (unsigned)(uxTaskGetStackHighWaterMark(swT) * sizeof(StackType_t)) : 0u,
                          (unsigned)tdeck_pktq_depth(), (unsigned)tdeck_pktq_peak(), (unsigned)tdeck_pktq_cap(),
                          (unsigned)tdeck_pktq_itemsz());
+            } else if (!strncmp(s_line, "cov", 3)) {
+                // @@cov on | off | clear | stat - drive the coverage mapper over the cable, so
+                // it can be tested without walking around tapping the screen.
+                const char *a = s_line + 3;
+                while (*a == ' ')
+                    a++;
+                if (!strncmp(a, "on", 2))
+                    tdeck_coverage_set_enabled(true);
+                else if (!strncmp(a, "off", 3))
+                    tdeck_coverage_set_enabled(false);
+                else if (!strncmp(a, "clear", 5))
+                    tdeck_coverage_clear();
+                int32_t la = 0, lo = 0;
+                int q = 0, rs = 0, n = 0;
+                bool any = tdeck_coverage_cell(0, &la, &lo, &q, &rs, &n);
+                LOG_INFO("@@ok cov rec=%d cells=%d first=%ld,%ld snr=%.2f rssi=%d n=%d",
+                         (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
+                         (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
+            } else if (!strncmp(s_line, "mailtest", 8)) {
+                // ⚠️ BEFORE "mail", or the shorter prefix swallows it - the same trap the
+                // lockpad/lock pair hit in @@open.
+                if (tdeck_mail_connect_test())
+                    LOG_INFO("@@ok mailtest connecting");
+                else
+                    LOG_INFO("@@err mailtest busy");
+            } else if (!strncmp(s_line, "mail", 4)) {
+                // Kick an inbox check and report the counts when they land. Straight on the
+                // main loop: tdeck_mail_check() only records the intent, and the session itself
+                // runs in tdeck_mail_service() on this same thread a moment later.
+                if (tdeck_mail_check())
+                    LOG_INFO("@@ok mail checking");
+                else
+                    LOG_INFO("@@err mail busy");
+            } else if (!strncmp(s_line, "inbox", 5)) {
+                // Read the result of the last @@mail without starting another one.
+                int st = tdeck_mail_poll(), tot = -1, uns = -1;
+                tdeck_mail_counts(&tot, &uns);
+                if (st == 1)
+                    LOG_INFO("@@ok inbox total=%d unseen=%d", tot, uns);
+                else if (st < 0)
+                    LOG_INFO("@@err inbox %s", tdeck_mail_error());
+                else
+                    LOG_INFO("@@ok inbox working");
             } else if (!strncmp(s_line, "shot", 4)) {
                 s_cmd = 4;
             } else if (!strncmp(s_line, "get", 3)) {

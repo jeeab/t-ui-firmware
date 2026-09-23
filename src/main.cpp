@@ -1309,6 +1309,12 @@ extern "C" void tdeck_alarm_service(void); // wake-up alarm, src/TDeckAlarm.cpp
 // T-Deck launcher "internet door" for Lua apps: runs an app's Wi-Fi fetch (BT teardown, join,
 // HTTP) as a non-blocking state machine on this safe thread. Defined in src/TDeckNet.cpp.
 extern "C" void tdeck_net_service(void);
+// Gmail over IMAP. Same rule and the same thread as the door above: a blocking socket
+// read on the UI task would hold spiLock and freeze the screen. See src/TDeckMail.cpp.
+extern "C" void tdeck_mail_service(void);
+// Mesh coverage mapper: the SD write half. The sampling half runs on the UI task and is
+// deliberately a hash insert and nothing more. See src/TDeckCoverage.cpp.
+extern "C" void tdeck_coverage_service(void);
 
 // DIAGNOSTIC ONLY - comment out for anything that ships.
 // Runs the app internet door exactly the way the Weather app does: two fetches back to back
@@ -1409,6 +1415,8 @@ void loop()
     tdeckgemini::service();
     tdeck_alarm_service();
     tdeck_net_service();
+    tdeck_mail_service();
+    tdeck_coverage_service();
 #ifdef NETDOOR_SELFTEST
     netDoorSelfTest();
 #endif
