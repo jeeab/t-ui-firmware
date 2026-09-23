@@ -9800,13 +9800,19 @@ void TFTView_320x240::openLockSettings(void)
         y += 42;
         lockpage_dim_row = lockPageRow(lockpage_screen, "Dim level", y, "15%", &lockpage_dim_label,
                                        [](lv_event_t *) {
-                                           static const int kPct[] = {5, 10, 15, 25, 40, 60};
+                                           // Jake asked for brighter options. 80 and 100 matter outdoors: at 60% the glance is still
+                                           // hard to read in daylight, and "keep the screen on" is
+                                           // worth little if you cannot see it.
+                                           static const int kPct[] = {5, 10, 15, 25, 40, 60, 80, 100};
                                            const int cur = tdeck_lock_dim_pct();
                                            int at = 2;
-                                           for (int i = 0; i < 6; i++)
+                                           // ⚠️ Bound by the ARRAY, not a literal. Adding 80 and
+                                           // 100 while this still said 6 meant those two were
+                                           // never matched, so the cycle jumped back to 25%.
+                                           for (int i = 0; i < (int)(sizeof(kPct) / sizeof(kPct[0])); i++)
                                                if (kPct[i] == cur)
                                                    at = i;
-                                           tdeck_lock_set_dim_pct(kPct[(at + 1) % 6]);
+                                           tdeck_lock_set_dim_pct(kPct[(at + 1) % (int)(sizeof(kPct) / sizeof(kPct[0]))]);
                                            THIS->updateLockPageLabels();
                                        });
         y += 42;
