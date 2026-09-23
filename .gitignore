@@ -83,3 +83,5 @@ platformio_local*.ini
 # local build/flash logs and scratch patches
 *.log
 *.patch
+src/chess/*.exe
+src/chess/probe.c

@@ -1,0 +1,582 @@
+#include "search.h"
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef ARDUINO
+#include <Arduino.h>
+#define NOW_MS() ((uint32_t)millis())
+#else
+#include <time.h>
+static uint32_t NOW_MS(void) { return (uint32_t)(clock() * 1000ULL / CLOCKS_PER_SEC); }
+#endif
+
+// ---------------------------------------------------------------------------------------
+// Alpha-beta search with iterative deepening, a transposition table, quiescence search and
+// the usual move-ordering heuristics. Plain C, no device dependencies, so the same code runs
+// on the PC - which is how its strength gets MEASURED rather than claimed.
+// ---------------------------------------------------------------------------------------
+
+#define INF 30000
+#define MATE 29000
+#define MAX_PLY 64
+
+// ---- evaluation --------------------------------------------------------------------------
+// Centipawns. A pawn is 100. These are ordinary values; the piece-square tables matter more to
+// how it PLAYS than the exact material numbers do.
+static const int kMat[7] = {0, 100, 320, 330, 500, 900, 0};
+
+// Piece-square tables, from White's point of view, rank 1 first. Black reads them mirrored.
+// They encode the handful of ideas that stop an engine playing like a calculator: knights
+// belong in the middle, bishops on long diagonals, rooks on the 7th, pawns want to advance,
+// and the king wants a corner in the middlegame and the centre in the endgame.
+static const int kPst[7][64] = {
+    {0},
+    {// pawn
+     0,  0,  0,  0,  0,  0,  0,  0,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5,  5, 10, 25, 25, 10,  5,  5,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    50, 50, 50, 50, 50, 50, 50, 50,
+     0,  0,  0,  0,  0,  0,  0,  0},
+    {// knight
+   -50,-40,-30,-30,-30,-30,-40,-50,
+   -40,-20,  0,  5,  5,  0,-20,-40,
+   -30,  5, 10, 15, 15, 10,  5,-30,
+   -30,  0, 15, 20, 20, 15,  0,-30,
+   -30,  5, 15, 20, 20, 15,  5,-30,
+   -30,  0, 10, 15, 15, 10,  0,-30,
+   -40,-20,  0,  0,  0,  0,-20,-40,
+   -50,-40,-30,-30,-30,-30,-40,-50},
+    {// bishop
+   -20,-10,-10,-10,-10,-10,-10,-20,
+   -10,  5,  0,  0,  0,  0,  5,-10,
+   -10, 10, 10, 10, 10, 10, 10,-10,
+   -10,  0, 10, 10, 10, 10,  0,-10,
+   -10,  5,  5, 10, 10,  5,  5,-10,
+   -10,  0,  5, 10, 10,  5,  0,-10,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -20,-10,-10,-10,-10,-10,-10,-20},
+    {// rook
+     0,  0,  5, 10, 10,  5,  0,  0,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+     5, 10, 10, 10, 10, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0},
+    {// queen
+   -20,-10,-10, -5, -5,-10,-10,-20,
+   -10,  0,  5,  0,  0,  0,  0,-10,
+   -10,  5,  5,  5,  5,  5,  0,-10,
+     0,  0,  5,  5,  5,  5,  0, -5,
+    -5,  0,  5,  5,  5,  5,  0, -5,
+   -10,  0,  5,  5,  5,  5,  0,-10,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -20,-10,-10, -5, -5,-10,-10,-20},
+    {// king, middlegame: stay tucked away
+    20, 30, 10,  0,  0, 10, 30, 20,
+    20, 20,  0,  0,  0,  0, 20, 20,
+   -10,-20,-20,-20,-20,-20,-20,-10,
+   -20,-30,-30,-40,-40,-30,-30,-20,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30},
+};
+
+// In the endgame the king is a strong piece and belongs in the middle. Using the middlegame
+// table all the way through is why naive engines shuffle their king on the back rank in a king
+// and pawn ending and fail to win it.
+static const int kKingEnd[64] = {
+   -50,-30,-30,-30,-30,-30,-30,-50,
+   -30,-30,  0,  0,  0,  0,-30,-30,
+   -30,-10, 20, 30, 30, 20,-10,-30,
+   -30,-10, 30, 40, 40, 30,-10,-30,
+   -30,-10, 30, 40, 40, 30,-10,-30,
+   -30,-10, 20, 30, 30, 20,-10,-30,
+   -30,-20,-10,  0,  0,-10,-20,-30,
+   -50,-40,-30,-20,-20,-30,-40,-50};
+
+#define SQ64(sq) (((sq) >> 4) * 8 + ((sq) & 7))
+#define MIRROR(i) ((i) ^ 56) // flip rank for Black
+
+int eval_position(const Board *b)
+{
+    int mg[2] = {0, 0};
+    int material[2] = {0, 0};
+    int bishops[2] = {0, 0};
+    int pawnsOnFile[2][8];
+    memset(pawnsOnFile, 0, sizeof(pawnsOnFile));
+    int pieceCount = 0;
+
+    for (int sq = 0; sq < 128; sq++) {
+        if (sq & 0x88)
+            continue;
+        uint8_t pc = b->board[sq];
+        if (!pc)
+            continue;
+        uint8_t c = PCOLOUR(pc), t = PTYPE(pc);
+        material[c] += kMat[t];
+        if (t != PAWN && t != KING)
+            pieceCount++;
+        if (t == BISHOP)
+            bishops[c]++;
+        if (t == PAWN)
+            pawnsOnFile[c][sq & 7]++;
+        int idx = SQ64(sq);
+        if (c == BLACK)
+            idx = MIRROR(idx);
+        mg[c] += kPst[t][idx];
+    }
+
+    // Endgame weighting. Sliding between the two king tables rather than switching at a
+    // threshold avoids the engine changing its mind about where its king belongs because a
+    // single piece came off.
+    int phase = pieceCount > 12 ? 12 : pieceCount; // 12 = full board of pieces
+    for (int c = 0; c < 2; c++) {
+        int ksq = SQ64(b->king[c]);
+        if (c == BLACK)
+            ksq = MIRROR(ksq);
+        int mgK = kPst[KING][ksq], egK = kKingEnd[ksq];
+        mg[c] += (mgK * phase + egK * (12 - phase)) / 12;
+    }
+
+    for (int c = 0; c < 2; c++) {
+        if (bishops[c] >= 2)
+            mg[c] += 30; // the bishop pair is worth about half a pawn
+        for (int f = 0; f < 8; f++) {
+            if (pawnsOnFile[c][f] > 1)
+                mg[c] -= 15 * (pawnsOnFile[c][f] - 1); // doubled
+            if (pawnsOnFile[c][f]) {
+                bool left = f > 0 && pawnsOnFile[c][f - 1];
+                bool right = f < 7 && pawnsOnFile[c][f + 1];
+                if (!left && !right)
+                    mg[c] -= 12; // isolated
+            }
+        }
+    }
+
+    int score = (material[WHITE] + mg[WHITE]) - (material[BLACK] + mg[BLACK]);
+    return b->side == WHITE ? score : -score;
+}
+
+// ---- transposition table --------------------------------------------------------------------
+enum { TT_EXACT = 0, TT_ALPHA = 1, TT_BETA = 2 };
+typedef struct {
+    uint64_t key;
+    int16_t score;
+    uint8_t depth;
+    uint8_t flag;
+    uint8_t from, to, promo, pad;
+} TTEntry;
+
+static TTEntry *s_tt = NULL;
+static uint32_t s_ttCount = 0;
+
+void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes)
+{
+    if (s_tt)
+        return;
+    if (tableBytes < sizeof(TTEntry) * 1024)
+        tableBytes = sizeof(TTEntry) * 1024;
+    uint32_t n = (uint32_t)(tableBytes / sizeof(TTEntry));
+    // Round DOWN to a power of two so the index is a mask, not a modulo. This is on the hot
+    // path of every node; a 64-bit division there is genuinely expensive on this chip.
+    uint32_t p = 1;
+    while (p * 2 <= n)
+        p *= 2;
+    s_tt = (TTEntry *)(allocFn ? allocFn((unsigned long)p * sizeof(TTEntry)) : calloc(p, sizeof(TTEntry)));
+    if (!s_tt) {
+        s_ttCount = 0;
+        return;
+    }
+    memset(s_tt, 0, (size_t)p * sizeof(TTEntry));
+    s_ttCount = p;
+}
+
+// ---- search state ----------------------------------------------------------------------------
+static uint32_t s_nodes;
+static uint32_t s_deadline;
+static volatile bool s_abort;
+static bool s_timeUp;
+static SearchInfo s_info;
+static Move s_killers[MAX_PLY][2];
+static int s_history[128][128];
+static uint64_t s_gameHist[512];
+static int s_gameHistN = 0;
+
+void search_stop(void) { s_abort = true; }
+void search_history_clear(void) { s_gameHistN = 0; }
+void search_history_push(uint64_t h)
+{
+    if (s_gameHistN < 512)
+        s_gameHist[s_gameHistN++] = h;
+}
+void search_history_pop(void)
+{
+    if (s_gameHistN)
+        s_gameHistN--;
+}
+
+static bool isRepetition(const Board *b)
+{
+    // Twofold inside the search is treated as a draw. Engines do this deliberately: waiting for
+    // a true threefold means the search cannot see that a line is going nowhere until far too
+    // late, and it lets a losing side walk into a repetition it should have spotted.
+    //
+    // ⛔ START AT N-2, NOT N-1. The caller pushes the hash immediately after making the move, so
+    // the LAST entry IS the position being asked about - comparing against it matches instantly
+    // and every node returns "draw" before searching anything.
+    // Caught by the search test: it reported depth 30 reached with ZERO nodes searched, and the
+    // engine playing the first move in the list every time. A plausible-looking off-by-one that
+    // silently turned the whole search off.
+    for (int i = s_gameHistN - 2; i >= 0 && i >= s_gameHistN - b->halfmove - 1; i--)
+        if (s_gameHist[i] == b->hash)
+            return true;
+    return false;
+}
+
+static bool outOfTime(void)
+{
+    if (s_abort)
+        return true;
+    // Checking the clock on every node is itself measurable, so only every 2048.
+    if ((s_nodes & 2047) == 0 && s_deadline && (int32_t)(NOW_MS() - s_deadline) > 0)
+        s_timeUp = true;
+    return s_timeUp;
+}
+
+// MVV-LVA: try capturing the most valuable victim with the least valuable attacker first. Good
+// move ordering is worth more to a search than almost any evaluation term - it is what keeps the
+// effective branching factor near 3 instead of near 35.
+static void scoreMoves(const Board *b, Move *list, int n, int ply, const Move *ttMove)
+{
+    for (int i = 0; i < n; i++) {
+        Move *m = &list[i];
+        if (ttMove && m->from == ttMove->from && m->to == ttMove->to && m->promo == ttMove->promo) {
+            m->score = 30000; // the table's move first, always
+            continue;
+        }
+        if (m->flags & MOVE_CAPTURE) {
+            uint8_t victim = PTYPE(b->board[m->to]);
+            uint8_t attacker = PTYPE(b->board[m->from]);
+            m->score = (int16_t)(20000 + kMat[victim] * 10 - kMat[attacker]);
+        } else if (m->flags & MOVE_PROMO) {
+            m->score = (int16_t)(19000 + kMat[m->promo]);
+        } else if (ply < MAX_PLY && ((s_killers[ply][0].from == m->from && s_killers[ply][0].to == m->to) ||
+                                     (s_killers[ply][1].from == m->from && s_killers[ply][1].to == m->to))) {
+            m->score = 18000; // quiet moves that caused a cutoff at this depth before
+        } else {
+            int h = s_history[m->from][m->to];
+            m->score = (int16_t)(h > 17000 ? 17000 : h);
+        }
+    }
+}
+
+// Selection sort one move at a time: with a beta cutoff usually happening in the first few
+// moves, fully sorting the list is wasted work.
+static void pickMove(Move *list, int n, int i)
+{
+    int best = i;
+    for (int j = i + 1; j < n; j++)
+        if (list[j].score > list[best].score)
+            best = j;
+    if (best != i) {
+        Move t = list[i];
+        list[i] = list[best];
+        list[best] = t;
+    }
+}
+
+// Quiescence: at the leaves, keep searching captures only. Without this the engine stops
+// counting mid-exchange and believes it is a queen up when the recapture is one ply away -
+// the single biggest source of nonsense moves in a naive alpha-beta.
+static int quiesce(Board *b, int alpha, int beta)
+{
+    if (outOfTime())
+        return 0;
+    s_nodes++;
+    int stand = eval_position(b);
+    if (stand >= beta)
+        return beta;
+    if (stand > alpha)
+        alpha = stand;
+
+    Move list[MAX_MOVES];
+    int n = chess_gen_captures(b, list);
+    scoreMoves(b, list, n, 0, NULL);
+    Undo u;
+    for (int i = 0; i < n; i++) {
+        pickMove(list, n, i);
+        chess_make(b, &list[i], &u);
+        int score = -quiesce(b, -beta, -alpha);
+        chess_unmake(b, &u);
+        if (s_timeUp)
+            return 0;
+        if (score >= beta)
+            return beta;
+        if (score > alpha)
+            alpha = score;
+    }
+    return alpha;
+}
+
+static int negamax(Board *b, int depth, int alpha, int beta, int ply)
+{
+    if (outOfTime())
+        return 0;
+    if (ply > 0 && isRepetition(b))
+        return 0;
+    if (b->halfmove >= 100)
+        return 0;
+
+    const int alphaOrig = alpha;
+    TTEntry *e = NULL;
+    Move ttMove, *ttMovePtr = NULL;
+    if (s_ttCount) {
+        e = &s_tt[b->hash & (s_ttCount - 1)];
+        if (e->key == b->hash) {
+            ttMove.from = e->from;
+            ttMove.to = e->to;
+            ttMove.promo = e->promo;
+            ttMove.flags = 0;
+            ttMove.score = 0;
+            ttMovePtr = &ttMove;
+            if (ply > 0 && e->depth >= depth) {
+                // ⛔ MATE SCORES MUST BE RE-BASED ON THE WAY OUT. A mate score means "mate in N
+                // plies FROM THIS NODE", so storing it raw makes it wrong everywhere else the
+                // same position appears at a different distance from the root - the engine then
+                // reports nonsense mate distances and can prefer a slower mate over a faster one.
+                int sc = e->score;
+                if (sc > MATE - 1000)
+                    sc -= ply;
+                else if (sc < -MATE + 1000)
+                    sc += ply;
+                if (e->flag == TT_EXACT)
+                    return sc;
+                if (e->flag == TT_ALPHA && sc <= alpha)
+                    return alpha;
+                if (e->flag == TT_BETA && sc >= beta)
+                    return beta;
+            }
+        }
+    }
+
+    const bool inCheck = chess_in_check(b, b->side);
+    if (inCheck)
+        depth++; // never stop searching in the middle of a forcing sequence
+
+    if (depth <= 0)
+        return quiesce(b, alpha, beta);
+
+    s_nodes++;
+    Move list[MAX_MOVES];
+    int n = chess_gen_moves(b, list);
+    if (n == 0)
+        return inCheck ? -MATE + ply : 0; // mated here, or stalemate
+
+    scoreMoves(b, list, n, ply, ttMovePtr);
+    Undo u;
+    Move best = list[0];
+    int bestScore = -INF;
+
+    for (int i = 0; i < n; i++) {
+        pickMove(list, n, i);
+        chess_make(b, &list[i], &u);
+        search_history_push(b->hash);
+        int score;
+        if (i == 0) {
+            score = -negamax(b, depth - 1, -beta, -alpha, ply + 1);
+        } else {
+            // Late move reductions: after the first few moves, and with good ordering, the rest
+            // are probably bad. Search them shallower and only re-search if one surprises us.
+            int reduce = (depth >= 3 && i >= 4 && !(list[i].flags & (MOVE_CAPTURE | MOVE_PROMO)) && !inCheck) ? 1 : 0;
+            score = -negamax(b, depth - 1 - reduce, -alpha - 1, -alpha, ply + 1);
+            if (score > alpha && score < beta)
+                score = -negamax(b, depth - 1, -beta, -alpha, ply + 1);
+        }
+        search_history_pop();
+        chess_unmake(b, &u);
+        if (s_timeUp)
+            return 0;
+
+        if (score > bestScore) {
+            bestScore = score;
+            best = list[i];
+        }
+        if (score > alpha)
+            alpha = score;
+        if (alpha >= beta) {
+            if (!(list[i].flags & MOVE_CAPTURE) && ply < MAX_PLY) {
+                s_killers[ply][1] = s_killers[ply][0];
+                s_killers[ply][0] = list[i];
+                s_history[list[i].from][list[i].to] += depth * depth;
+            }
+            break;
+        }
+    }
+
+    if (s_ttCount && e && !s_timeUp) {
+        // Always replace. Depth-preferred replacement is better in a long search; in one this
+        // short the table mostly holds this search's own nodes, and always-replace keeps the
+        // most recent - which is what the next iteration of the deepening will ask for.
+        e->key = b->hash;
+        // The matching half of the re-basing above: store the distance from THIS node.
+        int store = bestScore;
+        if (store > MATE - 1000)
+            store += ply;
+        else if (store < -MATE + 1000)
+            store -= ply;
+        e->score = (int16_t)store;
+        e->depth = (uint8_t)(depth > 255 ? 255 : depth);
+        e->flag = (uint8_t)(bestScore <= alphaOrig ? TT_ALPHA : (bestScore >= beta ? TT_BETA : TT_EXACT));
+        e->from = best.from;
+        e->to = best.to;
+        e->promo = best.promo;
+    }
+    return bestScore;
+}
+
+// ---- difficulty ----------------------------------------------------------------------------
+typedef struct {
+    const char *name;
+    int depth;
+    uint32_t ms;
+    int spread; // centipawns: how far below best a move may be and still get picked
+} LevelCfg;
+
+static const LevelCfg kLevels[CHESS_LEVELS] = {
+    {"Beginner", 2, 300, 150}, // will hang things, like a beginner does
+    {"Casual", 3, 700, 70},
+    {"Club", 5, 2000, 0},
+    {"Strong", 7, 3500, 0},
+    {"Expert", 9, 8000, 0},
+    {"Max", 30, 15000, 0}, // depth is effectively unlimited; the clock decides
+};
+
+const char *chess_level_name(ChessLevel lv)
+{
+    return (lv >= 0 && lv < CHESS_LEVELS) ? kLevels[lv].name : "?";
+}
+
+static uint32_t s_rand = 0x2545F491;
+static uint32_t nextRand(void)
+{
+    s_rand ^= s_rand << 13;
+    s_rand ^= s_rand >> 17;
+    s_rand ^= s_rand << 5;
+    return s_rand;
+}
+
+void search_last_info(SearchInfo *info)
+{
+    if (info)
+        *info = s_info;
+}
+
+bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
+{
+    if (lv < 0 || lv >= CHESS_LEVELS)
+        lv = CHESS_CLUB;
+    const LevelCfg *cfg = &kLevels[lv];
+
+    Move list[MAX_MOVES];
+    int n = chess_gen_moves(b, list);
+    if (n == 0)
+        return false;
+    *out = list[0];
+    if (n == 1) {
+        memset(&s_info, 0, sizeof(s_info));
+        s_info.depth = 1;
+        return true; // no point thinking about a forced move
+    }
+
+    s_nodes = 0;
+    s_abort = false;
+    s_timeUp = false;
+    memset(s_killers, 0, sizeof(s_killers));
+    memset(s_history, 0, sizeof(s_history));
+    uint32_t start = NOW_MS();
+    uint32_t budget = msBudget ? msBudget : cfg->ms;
+    s_deadline = start + budget;
+
+    // Root scores are kept so the weak levels can choose a slightly-worse move on purpose.
+    int rootScore[MAX_MOVES];
+    Move rootMove[MAX_MOVES];
+    int rootN = 0;
+    int completedDepth = 0, bestScore = 0;
+
+    for (int depth = 1; depth <= cfg->depth; depth++) {
+        int alpha = -INF, localBest = -INF;
+        Move localBestMove = list[0];
+        int scores[MAX_MOVES];
+        Move order[MAX_MOVES];
+        int m = chess_gen_moves(b, order);
+        scoreMoves(b, order, m, 0, completedDepth ? &rootMove[0] : NULL);
+        Undo u;
+        bool finished = true;
+        for (int i = 0; i < m; i++) {
+            pickMove(order, m, i);
+            chess_make(b, &order[i], &u);
+            search_history_push(b->hash);
+            int sc = -negamax(b, depth - 1, -INF, -alpha, 1);
+            search_history_pop();
+            chess_unmake(b, &u);
+            if (s_timeUp) {
+                finished = false;
+                break;
+            }
+            scores[i] = sc;
+            if (sc > localBest) {
+                localBest = sc;
+                localBestMove = order[i];
+            }
+            if (sc > alpha)
+                alpha = sc;
+        }
+        if (!finished)
+            break; // an incomplete iteration is not trustworthy; keep the last complete one
+        completedDepth = depth;
+        bestScore = localBest;
+        rootN = m;
+        for (int i = 0; i < m; i++) {
+            rootMove[i] = order[i];
+            rootScore[i] = scores[i];
+        }
+        *out = localBestMove;
+        // Found a forced mate - no deeper search can improve on that.
+        if (localBest > MATE - 100 || localBest < -MATE + 100)
+            break;
+        // Do not start an iteration there is clearly no time to finish. Each one costs roughly
+        // 3-4x the last, so with under a third of the budget left it would only be abandoned.
+        if ((int32_t)(NOW_MS() - start) > (int32_t)(budget / 3))
+            break;
+    }
+
+    // ⭐ THE WEAK LEVELS PICK IMPERFECTLY ON PURPOSE - see the note in search.h. Choosing at
+    // random among moves within `spread` of the best produces the inconsistency a human beginner
+    // has, instead of a machine that is flawless to depth 2 and blind at depth 3.
+    if (cfg->spread > 0 && rootN > 1) {
+        Move pool[MAX_MOVES];
+        int pn = 0;
+        for (int i = 0; i < rootN; i++)
+            if (rootScore[i] >= bestScore - cfg->spread)
+                pool[pn++] = rootMove[i];
+        if (pn > 0)
+            *out = pool[nextRand() % (uint32_t)pn];
+    }
+
+    s_info.depth = completedDepth;
+    s_info.score = bestScore;
+    s_info.nodes = s_nodes;
+    s_info.ms = NOW_MS() - start;
+    s_info.mateIn = 0;
+    if (bestScore > MATE - 100)
+        s_info.mateIn = (MATE - bestScore + 1) / 2;
+    else if (bestScore < -MATE + 100)
+        s_info.mateIn = -((MATE + bestScore + 1) / 2);
+    return true;
+}
