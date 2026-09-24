@@ -36,12 +36,18 @@ void tdeck_chess_set_level(int lv);
 const char *tdeck_chess_level_name(void);
 void chess_open(void);
 void chess_idle_check(void);
+void tdeck_chess_release(void);
 }
 
 namespace
 {
-const int kSq = 24;      // square size; 8 x 24 = 192 across
-const int kBoardX = 2;   // leaves 2px either side of the board
+// ⭐ CENTRED. 8 x 24 = 192 on a 320 screen leaves exactly 64 either side, and those margins
+// then carry the two things that used to need a whole side panel: the level on the left and the
+// "space for menu" hint on the right. Jake: "would be nice to center the board".
+// Vertically the content area is 220 (the status bar takes 20 of the 240), so 4 at the top and
+// the status line in the 24 left at the bottom.
+const int kSq = 24;
+const int kBoardX = (320 - 8 * 24) / 2; // 64
 const int kBoardY = 4;
 
 lv_obj_t *screen = nullptr;
@@ -49,6 +55,9 @@ lv_obj_t *sqObj[64] = {nullptr};   // the squares
 lv_obj_t *pcLbl[64] = {nullptr};   // the piece sitting on each, hidden when empty
 lv_obj_t *statusLbl = nullptr;
 lv_obj_t *levelLbl = nullptr;
+lv_obj_t *menuBox = nullptr;   // the spacebar overlay
+lv_obj_t *menuLevelLbl = nullptr;
+lv_obj_t *keyCatcher = nullptr;
 lv_timer_t *tick = nullptr;
 
 int selected = -1;                 // square the player has picked up, or -1
@@ -66,6 +75,9 @@ const uint32_t kLightSel = 0xC9D98A, kDarkSel = 0x8FA85A;
 // piece gets a filled circle behind it in its own colour, with the letter in the contrasting
 // one. That reads unambiguously at 24px and costs one object per piece.
 const char *kLetters = " PNBRQK";
+
+bool menuOpen(void); // defined below; refreshBoard() needs it
+void showMenu(bool on);
 
 int sqAt(int file, int rank) { return rank * 8 + file; }
 
@@ -101,11 +113,43 @@ void refreshBoard(void)
         lv_label_set_text(statusLbl, tdeck_chess_status());
     if (levelLbl)
         lv_label_set_text(levelLbl, tdeck_chess_level_name());
+    if (menuLevelLbl && menuOpen())
+        lv_label_set_text_fmt(menuLevelLbl, "Level: %s", tdeck_chess_level_name());
+}
+
+void showMenu(bool on)
+{
+    if (!menuBox)
+        return;
+    if (on) {
+        if (menuLevelLbl)
+            lv_label_set_text_fmt(menuLevelLbl, "Level: %s", tdeck_chess_level_name());
+        lv_obj_clear_flag(menuBox, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(menuBox);
+    } else {
+        lv_obj_add_flag(menuBox, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+bool menuOpen(void)
+{
+    return menuBox && !lv_obj_has_flag(menuBox, LV_OBJ_FLAG_HIDDEN);
+}
+
+void keyEvent(lv_event_t *e)
+{
+    const uint32_t k = lv_event_get_key(e);
+    // Space opens it, space or Esc closes it. Anything that opens a menu should close it with
+    // the same key - having to hunt for the exit is worse than having no shortcut.
+    if (k == ' ')
+        showMenu(!menuOpen());
+    else if (k == LV_KEY_ESC && menuOpen())
+        showMenu(false);
 }
 
 void onSquare(lv_event_t *e)
 {
-    if (tdeck_chess_thinking() || tdeck_chess_result())
+    if (menuOpen() || tdeck_chess_thinking() || tdeck_chess_result())
         return;
     const int i = (int)(intptr_t)lv_event_get_user_data(e);
     if (selected < 0) {
@@ -137,22 +181,6 @@ void onSquare(lv_event_t *e)
     refreshBoard();
 }
 
-lv_obj_t *sideButton(const char *txt, int y, uint32_t colour, lv_event_cb_t cb, lv_obj_t **lblOut = nullptr)
-{
-    lv_obj_t *b = lv_btn_create(screen);
-    lv_obj_set_size(b, 116, 28);
-    lv_obj_set_pos(b, 200, y);
-    lv_obj_set_style_bg_color(b, lv_color_hex(colour), LV_PART_MAIN);
-    lv_obj_set_style_radius(b, 6, LV_PART_MAIN);
-    lv_obj_t *l = lv_label_create(b);
-    lv_label_set_text(l, txt);
-    lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_center(l);
-    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
-    if (lblOut)
-        *lblOut = l;
-    return b;
-}
 } // namespace
 
 extern "C" void chess_open(void)
@@ -190,42 +218,98 @@ extern "C" void chess_open(void)
             pcLbl[i] = p;
         }
 
-        lv_obj_t *lvlLbl = lv_label_create(screen);
-        lv_obj_set_pos(lvlLbl, 200, 4);
-        lv_obj_set_size(lvlLbl, 116, 14);
-        lv_label_set_long_mode(lvlLbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_font(lvlLbl, &ui_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lvlLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_label_set_text(lvlLbl, "");
-        levelLbl = lvlLbl;
+        // Left margin: which level you are playing.
+        levelLbl = lv_label_create(screen);
+        lv_obj_set_pos(levelLbl, 2, 6);
+        lv_obj_set_size(levelLbl, 58, 30);
+        lv_label_set_long_mode(levelLbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(levelLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(levelLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_label_set_text(levelLbl, "");
 
-        sideButton("Level", 22, 0x3a3a3c, [](lv_event_t *) {
-            tdeck_chess_set_level((tdeck_chess_level() + 1) % 6);
-            refreshBoard();
-        });
-        sideButton("New game", 56, 0x0a84ff, [](lv_event_t *) {
-            tdeck_chess_new_game();
-            selected = -1;
-            destN = 0;
-            refreshBoard();
-        });
-        sideButton("Take back", 90, 0x3a3a3c, [](lv_event_t *) {
-            tdeck_chess_undo();
-            selected = -1;
-            destN = 0;
-            refreshBoard();
-        });
+        // Right margin: the only thing telling you the menu exists, so it is always on screen.
+        lv_obj_t *hint = lv_label_create(screen);
+        lv_obj_set_pos(hint, 260, 6);
+        lv_obj_set_size(hint, 58, 44);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(hint, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x5a5a5e), LV_PART_MAIN);
+        lv_label_set_text(hint, "space for menu");
 
+        // The status line sits under the board in the 24px the centring leaves.
         statusLbl = lv_label_create(screen);
-        lv_obj_set_pos(statusLbl, 200, 126);
+        lv_obj_set_pos(statusLbl, 4, 198);
         // ⛔ Bounded. The status carries engine output of unpredictable length ("e2e4 depth 6
-        // +0.3", "Checkmate - you lose"), and a wrapping label with no height walks over
-        // whatever is below it.
-        lv_obj_set_size(statusLbl, 116, 70);
-        lv_label_set_long_mode(statusLbl, LV_LABEL_LONG_WRAP);
+        // +0.3", "Checkmate - you lose"), and a wrapping label with no height walks off screen.
+        lv_obj_set_size(statusLbl, 312, 20);
+        lv_label_set_long_mode(statusLbl, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(statusLbl, &ui_font_montserrat_12, LV_PART_MAIN);
         lv_obj_set_style_text_color(statusLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_label_set_text(statusLbl, "");
+
+        // ---------- the spacebar menu ----------
+        menuBox = lv_obj_create(screen);
+        lv_obj_set_size(menuBox, 220, 176);
+        lv_obj_align(menuBox, LV_ALIGN_CENTER, 0, -6);
+        lv_obj_set_style_bg_color(menuBox, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+        lv_obj_set_style_border_color(menuBox, lv_color_hex(0x48484a), LV_PART_MAIN);
+        lv_obj_set_style_border_width(menuBox, 1, LV_PART_MAIN);
+        lv_obj_set_style_radius(menuBox, 10, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(menuBox, 8, LV_PART_MAIN);
+        lv_obj_clear_flag(menuBox, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(menuBox, LV_OBJ_FLAG_HIDDEN);
+        {
+            auto row = [&](const char *txt, int y, uint32_t colour, lv_event_cb_t cb, lv_obj_t **out) {
+                lv_obj_t *b = lv_btn_create(menuBox);
+                lv_obj_set_size(b, 200, 34);
+                lv_obj_set_pos(b, 0, y);
+                lv_obj_set_style_bg_color(b, lv_color_hex(colour), LV_PART_MAIN);
+                lv_obj_set_style_radius(b, 6, LV_PART_MAIN);
+                lv_obj_t *l = lv_label_create(b);
+                lv_label_set_text(l, txt);
+                lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
+                lv_obj_center(l);
+                lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+                if (out)
+                    *out = l;
+            };
+            row("Level", 0, 0x3a3a3c,
+                [](lv_event_t *) {
+                    tdeck_chess_set_level((tdeck_chess_level() + 1) % 6);
+                    if (menuLevelLbl)
+                        lv_label_set_text_fmt(menuLevelLbl, "Level: %s", tdeck_chess_level_name());
+                    refreshBoard();
+                },
+                &menuLevelLbl);
+            row("New game", 38, 0x0a84ff,
+                [](lv_event_t *) {
+                    tdeck_chess_new_game();
+                    selected = -1;
+                    destN = 0;
+                    showMenu(false);
+                    refreshBoard();
+                },
+                nullptr);
+            row("Take back", 76, 0x3a3a3c,
+                [](lv_event_t *) {
+                    tdeck_chess_undo();
+                    selected = -1;
+                    destN = 0;
+                    showMenu(false);
+                    refreshBoard();
+                },
+                nullptr);
+            row("Close", 114, 0x2c2c2e, [](lv_event_t *) { showMenu(false); }, nullptr);
+        }
+
+        // Invisible key sink in the input group, so the spacebar reaches this screen. Same
+        // pattern as SnakeGame and the calculator.
+        keyCatcher = lv_obj_create(screen);
+        lv_obj_remove_style_all(keyCatcher);
+        lv_obj_set_size(keyCatcher, 1, 1);
+        lv_obj_add_event_cb(keyCatcher, keyEvent, LV_EVENT_KEY, nullptr);
+        if (lv_group_get_default())
+            lv_group_add_obj(lv_group_get_default(), keyCatcher);
 
         // Repaint when the engine finishes. It moves on the main loop, so the UI has to notice
         // rather than be told - polling four times a second is cheap and cannot miss it.
@@ -236,13 +320,25 @@ extern "C" void chess_open(void)
                     wasThinking = t;
                     refreshBoard();
                 }
+                // Hold onto keyboard focus while this screen is up, or the spacebar stops
+                // working the moment anything else takes it.
+                if (keyCatcher && lv_screen_active() == screen && lv_group_get_default() &&
+                    lv_group_get_focused(lv_group_get_default()) != keyCatcher)
+                    lv_group_focus_obj(keyCatcher);
             },
             250, nullptr);
     }
     selected = -1;
     destN = 0;
+    showMenu(false);
     refreshBoard();
     lv_screen_load(screen);
+    // ⛔ ADDING THE SINK TO THE GROUP IS NOT ENOUGH - LVGL delivers keys to the FOCUSED object,
+    // and without this the spacebar went to whatever was focused on some other screen. The tick
+    // below re-takes focus too, because TFTView's poll has its own focus keeper that repoints
+    // the group at the active screen and would quietly take it back.
+    if (keyCatcher && lv_group_get_default())
+        lv_group_focus_obj(keyCatcher);
 }
 
 // Hand the board's memory back once it has been left alone, exactly as Gemini does. 64 squares
@@ -269,9 +365,10 @@ extern "C" void chess_idle_check(void)
     }
     lv_obj_delete(screen); // takes the squares and piece labels with it
     screen = nullptr;
-    statusLbl = levelLbl = nullptr;
+    statusLbl = levelLbl = menuBox = menuLevelLbl = keyCatcher = nullptr;
     memset(sqObj, 0, sizeof(sqObj));
     memset(pcLbl, 0, sizeof(pcLbl));
+    tdeck_chess_release(); // and the 10KB thinking task with them
     // ⭐ The GAME is not reset - only the screen. Come back and the position is exactly as you
     // left it, which is the whole point of a chess game you play across a day.
 }

@@ -249,6 +249,11 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 else if (!strncmp(a, "maps", 4))     which = 9;
                 else if (!strncmp(a, "pins", 4))     which = 10; // the pins list, i.e. the search
                 else if (!strncmp(a, "getapps", 7))  which = 11;
+                // ⭐ Added after losing a lot of time to blind taps: reaching an app by
+                // tapping a tile depends on which launcher PAGE happens to be showing, and
+                // @@tap can register as a long press and open "Arrange apps" instead.
+                else if (!strncmp(a, "chess", 5))    which = 13;
+                else if (!strncmp(a, "mail", 4))     which = 14;
                 if (which > 0) {
                     s_x = which;
                     s_cmd = 9;

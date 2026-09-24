@@ -9664,6 +9664,8 @@ void TFTView_320x240::remoteService(void)
                 case 10: THIS->openMaps(); lv_async_call([](void *) { THIS->openPinsList(); }, nullptr); break;
                 case 11: THIS->openGetApps(); break;
                 case 12: THIS->showLockPad(false); break;
+                case 13: chess_open(); break;
+                case 14: mail_open(); break;
                 default: break;
                 }
             },

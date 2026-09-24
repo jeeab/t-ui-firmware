@@ -5,27 +5,44 @@
 #include "chess/search.h"
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <string.h>
+
+#include "graphics/common/SdCard.h"
 
 // -----------------------------------------------------------------------------------------
 // The chess game. Jake, 2026-09-22: "local chess with a chess ai kinda thing with difficulty
 // settings up to master".
 //
-// ⛔ THE SEARCH RUNS HERE, ON THE MAIN LOOP, NEVER ON THE UI TASK. Measured on this chip: the
-// engine does ~16-20 thousand positions a second, so Club level is about two seconds of
-// thinking. The UI task holds spiLock for as long as it runs, so two seconds of searching there
-// would freeze the screen and stall the radio at the same time. The UI sets a flag; this does
-// the work and leaves the answer behind.
+// ⛔ THE SEARCH RUNS ON ITS OWN TASK, not the UI task and not the main loop. Measured on this
+// chip the engine does ~16-20 thousand positions a second, so a deep think is many seconds. The
+// UI task holds spiLock while it runs, so searching there would freeze the screen and stall the
+// radio together; the main loop is where Meshtastic services the radio, so searching THERE stops
+// packets being drained on a device that hears 248 nodes. A separate low-priority task blocks
+// neither. Jake: "I don't mind if it takes 10 seconds of chess doesn't freeze anything."
 //
-// Even on the main loop a two-second think blocks mesh servicing, so the time budget is kept
-// modest and the whole thing is deliberately turn-based - nothing here runs unless the player
-// has just moved.
+// ⭐ AND IT SEARCHES A COPY OF THE BOARD. Alpha-beta makes and unmakes moves as it goes, so the
+// position is transiently wrong for the whole search - and the UI reads the real one to draw.
 // -----------------------------------------------------------------------------------------
 
 static Board s_board;
 static bool s_ready = false;
-static volatile bool s_wantMove = false;
 static volatile bool s_thinking = false;
+
+// ⭐ THE ENGINE SEARCHES A COPY, NEVER THE LIVE BOARD. Alpha-beta makes and unmakes moves as it
+// goes, so the position it is working on is transiently wrong throughout - and the UI reads the
+// real one to draw the screen. Only the move it settles on is applied.
+static Board s_searchBoard;
+static Move s_result;
+static volatile bool s_applyPending = false;
+
+// Its own task, so ten seconds of thinking blocks nothing: not the screen, not the radio, not
+// the main loop. Priority 1 - the same as the UI task and below the loop - so it yields to both.
+static TaskHandle_t s_task = nullptr;
+static SemaphoreHandle_t s_go = nullptr;
+static const uint32_t kThinkMs = 10000; // Jake: "I don't mind if it takes 10 seconds"
 static int s_level = CHESS_CLUB;
 static char s_status[64] = "Your move";
 static uint8_t s_lastFrom = 0xFF, s_lastTo = 0xFF; // the engine's reply, for highlighting
@@ -42,6 +59,46 @@ static void *psram(unsigned long n)
     return p ? p : malloc(n);
 }
 
+// ⭐ ONE LINE OF FEN. The standard way to write a position down, and chess_get_fen/set_fen
+// already exist for the perft tests. Written after every move - a game is a handful of moves an
+// hour, so the SD cost is nothing, and the alternative is losing the game to a flat battery.
+static const char *kSaveFile = "/chess.fen";
+
+static void saveGame(void)
+{
+    char fen[100];
+    chess_get_fen(&s_board, fen, sizeof(fen));
+    FsFile f = SDFs.open(kSaveFile, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!f)
+        return; // no card, or the bus is busy: the game simply is not saved this move
+    f.println(fen);
+    f.close();
+}
+
+static bool loadGame(void)
+{
+    FsFile f = SDFs.open(kSaveFile, O_RDONLY);
+    if (!f)
+        return false;
+    char fen[100] = {0};
+    const int n = f.fgets(fen, sizeof(fen));
+    f.close();
+    if (n < 10)
+        return false;
+    for (char *p = fen; *p; p++)
+        if (*p == '\n' || *p == '\r') {
+            *p = 0;
+            break;
+        }
+    // ⛔ A REJECTED FEN MUST NOT LEAVE A HALF-PARSED BOARD. chess_set_fen writes as it goes, so
+    // parse into a scratch board and only adopt it if the whole thing was valid.
+    Board tmp;
+    if (!chess_set_fen(&tmp, fen))
+        return false;
+    s_board = tmp;
+    return true;
+}
+
 static void ensureInit(void)
 {
     if (s_ready)
@@ -51,6 +108,8 @@ static void ensureInit(void)
     // the note in search.c - this was learned the hard way.
     search_init(psram, 1024UL * 1024UL);
     chess_init(&s_board);
+    if (loadGame())
+        strncpy(s_status, s_board.side == WHITE ? "Your move" : "My move", sizeof(s_status) - 1);
     search_history_clear();
     search_history_push(s_board.hash);
     s_ready = true;
@@ -68,7 +127,8 @@ void tdeck_chess_new_game(void)
     s_undoN = 0;
     s_lastFrom = s_lastTo = 0xFF;
     s_selected = 0xFF;
-    s_wantMove = false;
+    s_applyPending = false;
+    saveGame();
     strncpy(s_status, "Your move", sizeof(s_status) - 1);
 }
 
@@ -132,6 +192,7 @@ bool tdeck_chess_try_move(int from64, int to64)
     s_lastFrom = f;
     s_lastTo = t;
     s_selected = 0xFF;
+    saveGame();
     return true;
 }
 
@@ -146,15 +207,59 @@ bool tdeck_chess_thinking(void)
     return s_thinking;
 }
 
+static void chessTask(void *)
+{
+    for (;;) {
+        xSemaphoreTake(s_go, portMAX_DELAY);
+        Move m;
+        const bool ok = search_best_move(&s_searchBoard, (ChessLevel)s_level, kThinkMs, &m);
+        s_result = m;
+        s_applyPending = ok;
+        s_thinking = false; // the service on the main loop picks it up from here
+        if (!ok)
+            strncpy(s_status, "No move", sizeof(s_status) - 1);
+    }
+}
+
 bool tdeck_chess_request_engine(void)
 {
     ensureInit();
     if (s_thinking || chess_game_over(&s_board))
         return false;
-    s_wantMove = true;
+    if (!s_go) {
+        s_go = xSemaphoreCreateBinary();
+        if (!s_go)
+            return false;
+    }
+    if (!s_task) {
+        // 10KB. The move lists live in PSRAM now (see search.c), so the search itself uses very
+        // little stack - but "very little" is worth measuring rather than assuming, and
+        // tdeck_chess_stack_free() reports the high-water mark.
+        if (xTaskCreate(chessTask, "chess", 10240, nullptr, 1, &s_task) != pdPASS) {
+            s_task = nullptr;
+            return false;
+        }
+    }
+    s_searchBoard = s_board; // the copy it is allowed to scribble on
+    s_applyPending = false;
     s_thinking = true;
     strncpy(s_status, "Thinking...", sizeof(s_status) - 1);
+    xSemaphoreGive(s_go);
     return true;
+}
+
+// Free the thinking task when the app is put away. Only safe when it is idle.
+extern "C" void tdeck_chess_release(void)
+{
+    if (s_thinking || !s_task)
+        return;
+    vTaskDelete(s_task);
+    s_task = nullptr;
+}
+
+extern "C" unsigned tdeck_chess_stack_free(void)
+{
+    return s_task ? (unsigned)(uxTaskGetStackHighWaterMark(s_task) * sizeof(StackType_t)) : 0;
 }
 
 bool tdeck_chess_undo(void)
@@ -170,6 +275,7 @@ bool tdeck_chess_undo(void)
     }
     s_lastFrom = s_lastTo = 0xFF;
     s_selected = 0xFF;
+    saveGame();
     strncpy(s_status, "Took that back", sizeof(s_status) - 1);
     return true;
 }
@@ -222,25 +328,14 @@ static void setEndStatus(void)
 
 void tdeck_chess_service(void)
 {
-    if (!s_wantMove)
+    // The thinking happens on the chess task. All this does is apply the answer, on the main
+    // loop, so the move lands on the real board from one place only.
+    if (!s_applyPending || s_thinking)
         return;
-    s_wantMove = false;
-    if (!s_ready) {
-        s_thinking = false;
+    s_applyPending = false;
+    if (!s_ready)
         return;
-    }
-
-    Move m;
-    // ⚠️ Time budget is capped well below the level's own default. Even here this blocks mesh
-    // servicing for its duration, and a handheld that stops relaying packets for eight seconds
-    // because someone is playing chess is a bad trade. Measured: ~16-20 knps on this chip, so
-    // 2.5s reaches about depth 6.
-    const uint32_t budget = 2500;
-    if (!search_best_move(&s_board, (ChessLevel)s_level, budget, &m)) {
-        s_thinking = false;
-        setEndStatus();
-        return;
-    }
+    const Move m = s_result;
     Undo u;
     if (s_undoN < UNDO_MAX) {
         chess_make(&s_board, &m, &s_undo[s_undoN++]);
@@ -249,6 +344,7 @@ void tdeck_chess_service(void)
         s_lastTo = m.to;
     }
 
+    saveGame();
     SearchInfo in;
     search_last_info(&in);
     char mv[6];
