@@ -172,6 +172,11 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 LOG_INFO("@@ok cov rec=%d cells=%d first=%ld,%ld snr=%.2f rssi=%d n=%d",
                          (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
                          (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
+            } else if (!strncmp(s_line, "mailsend", 8)) {
+                if (tdeck_mail_send_selftest())
+                    LOG_INFO("@@ok mailsend queued (to the signed-in address only)");
+                else
+                    LOG_INFO("@@err mailsend busy, or no account saved");
             } else if (!strncmp(s_line, "mailfile", 8)) {
                 // ⛔ REPORTS SHAPE, NEVER CONTENT. Jake says the app asks for the password every
                 // time it opens, which means haveCreds() is reading false. This says whether the

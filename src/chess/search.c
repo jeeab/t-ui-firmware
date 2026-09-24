@@ -192,6 +192,10 @@ static int16_t (*s_history)[128]; // [128][128], int16 is ample for a move-order
 static uint64_t *s_gameHist = NULL;
 static int s_gameHistN = 0;
 
+// PSRAM with the rest of the search tables: internal RAM is what the TLS handshake
+// needs contiguously, and 768 bytes of it for move ordering is a bad trade.
+static Move (*s_killers)[2];
+
 #define PLY_LIST(ply) (s_moveStack + (size_t)(ply) * MAX_MOVES)
 
 void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes)
@@ -223,6 +227,8 @@ void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes
     s_history = (int16_t(*)[128])(allocFn ? allocFn(128UL * 128UL * sizeof(int16_t))
                                           : calloc(128UL * 128UL, sizeof(int16_t)));
     s_gameHist = (uint64_t *)(allocFn ? allocFn(512UL * sizeof(uint64_t)) : calloc(512UL, sizeof(uint64_t)));
+    s_killers = (Move(*)[2])(allocFn ? allocFn((unsigned long)MAX_PLY * 2 * sizeof(Move))
+                                     : calloc((size_t)MAX_PLY * 2, sizeof(Move)));
     if (s_history)
         memset(s_history, 0, 128UL * 128UL * sizeof(int16_t));
     // The rules half needs an allocator too, for its Zobrist tables.
@@ -235,7 +241,6 @@ static uint32_t s_deadline;
 static volatile bool s_abort;
 static bool s_timeUp;
 static SearchInfo s_info;
-static Move s_killers[MAX_PLY][2];
 
 void search_stop(void) { s_abort = true; }
 void search_history_clear(void) { s_gameHistN = 0; }
@@ -297,8 +302,9 @@ static void scoreMoves(const Board *b, Move *list, int n, int ply, const Move *t
             m->score = (int16_t)(20000 + kMat[victim] * 10 - kMat[attacker]);
         } else if (m->flags & MOVE_PROMO) {
             m->score = (int16_t)(19000 + kMat[m->promo]);
-        } else if (ply < MAX_PLY && ((s_killers[ply][0].from == m->from && s_killers[ply][0].to == m->to) ||
-                                     (s_killers[ply][1].from == m->from && s_killers[ply][1].to == m->to))) {
+        } else if (s_killers && ply < MAX_PLY &&
+                   ((s_killers[ply][0].from == m->from && s_killers[ply][0].to == m->to) ||
+                    (s_killers[ply][1].from == m->from && s_killers[ply][1].to == m->to))) {
             m->score = 18000; // quiet moves that caused a cutoff at this depth before
         } else {
             int h = s_history ? s_history[m->from][m->to] : 0;
@@ -445,7 +451,7 @@ static int negamax(Board *b, int depth, int alpha, int beta, int ply)
         if (score > alpha)
             alpha = score;
         if (alpha >= beta) {
-            if (!(list[i].flags & MOVE_CAPTURE) && ply < MAX_PLY) {
+            if (!(list[i].flags & MOVE_CAPTURE) && ply < MAX_PLY && s_killers) {
                 s_killers[ply][1] = s_killers[ply][0];
                 s_killers[ply][0] = list[i];
                 if (s_history) {
@@ -540,7 +546,8 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     s_nodes = 0;
     s_abort = false;
     s_timeUp = false;
-    memset(s_killers, 0, sizeof(s_killers));
+    if (s_killers)
+        memset(s_killers, 0, (size_t)MAX_PLY * 2 * sizeof(Move));
     if (s_history)
         memset(s_history, 0, 128UL * 128UL * sizeof(int16_t));
     uint32_t start = NOW_MS();

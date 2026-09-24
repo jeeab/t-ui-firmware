@@ -4449,7 +4449,9 @@ void TFTView_320x240::refreshCoverageOverlay(void)
     lastCells = cells;
     lastShown = show;
 
-    if (!coverage_cells[0] && show) {
+    if (!coverage_cells && show)
+        coverage_cells = (lv_obj_t **)heap_caps_calloc(kCovPool, sizeof(lv_obj_t *), MALLOC_CAP_SPIRAM);
+    if (coverage_cells && !coverage_cells[0] && show) {
         for (int i = 0; i < kCovPool; i++) {
             lv_obj_t *r = lv_obj_create(maps_marker_layer);
             lv_obj_remove_style_all(r);
@@ -4459,7 +4461,7 @@ void TFTView_320x240::refreshCoverageOverlay(void)
             coverage_cells[i] = r;
         }
     }
-    if (!coverage_cells[0])
+    if (!coverage_cells || !coverage_cells[0])
         return;
     if (!show) {
         for (int i = 0; i < kCovPool; i++)

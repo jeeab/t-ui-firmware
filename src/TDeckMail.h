@@ -50,6 +50,10 @@ const char *tdeck_mail_body(void);
 // ---- sending ---------------------------------------------------------------------------
 bool tdeck_mail_send(const char *to, const char *subject, const char *body);
 
+// Send a fixed test message to the signed-in account itself. Takes no recipient on
+// purpose - see the note in the .cpp.
+bool tdeck_mail_send_selftest(void);
+
 // Called from loop() in main.cpp, NOT from the UI task.
 void tdeck_mail_service(void);
 

@@ -927,6 +927,32 @@ extern "C" const char *tdeck_mail_body(void)
     return (s_bodyBuf && s_bodyLen) ? s_bodyBuf : "";
 }
 
+// ⭐ SENDS ONLY TO THE SIGNED-IN ACCOUNT'S OWN ADDRESS, and that is deliberate. This exists so
+// the SMTP path can be proven over the cable, and a diagnostic that could send to an arbitrary
+// address would be a way to send mail as the owner from anything that can reach this port.
+// It takes no recipient, so there is nothing to point somewhere else.
+extern "C" bool tdeck_mail_send_selftest(void)
+{
+    if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
+        return false;
+    if (!loadCreds())
+        return false;
+    s_err[0] = 0;
+    s_connectOnly = false;
+    s_op = OP_SEND;
+    strncpy(s_sendTo, s_user, sizeof(s_sendTo) - 1); // to yourself, always
+    s_sendTo[sizeof(s_sendTo) - 1] = 0;
+    strncpy(s_sendSubj, "T-Deck test", sizeof(s_sendSubj) - 1);
+    if (s_sendBody)
+        free(s_sendBody);
+    s_sendBody = strdup("Sent from the T-Deck.\r\n\r\n"
+                        "If you are reading this, sending works: SMTP over TLS to Gmail, "
+                        "authenticated with the app password on the SD card, with the server's "
+                        "certificate checked against Google's own root.\r\n");
+    s_pending = true;
+    return true;
+}
+
 extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char *body)
 {
     if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
@@ -1050,6 +1076,7 @@ extern "C" bool tdeck_mail_item(int, unsigned *, const char **, const char **, c
 extern "C" bool tdeck_mail_read(unsigned) { return false; }
 extern "C" const char *tdeck_mail_body(void) { return ""; }
 extern "C" bool tdeck_mail_send(const char *, const char *, const char *) { return false; }
+extern "C" bool tdeck_mail_send_selftest(void) { return false; }
 extern "C" int tdeck_mail_poll(void) { return -1; }
 extern "C" void tdeck_mail_counts(int *t, int *u)
 {
