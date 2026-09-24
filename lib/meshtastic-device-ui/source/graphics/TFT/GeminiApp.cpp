@@ -34,6 +34,7 @@ const char *reply();
 const char *statusText();
 bool haveConfig();
 void clear();
+void release();
 } // namespace tdeckgemini
 
 namespace
@@ -126,6 +127,46 @@ void tick(lv_timer_t *)
     }
 }
 } // namespace
+
+// ⭐ GIVE THE MEMORY BACK WHEN THE APP IS NOT IN USE. Jake: "preferably Gemini closes and
+// clears ram when not running". The textarea, buttons, scrollable answer box and two timers are
+// INTERNAL RAM - the scarcest thing here - and were being held for the rest of the session after
+// a single visit. gemini_open() already rebuilds everything from scratch, so there is nothing to
+// preserve.
+//
+// ⛔ NOT WHILE A REQUEST IS IN FLIGHT. Deleting the screen mid-request would destroy the label
+// the reply is about to be written into. Five seconds of grace as well, so paging past Gemini
+// on the launcher does not tear it down and immediately rebuild it.
+extern "C" void gemini_idle_check(void)
+{
+    static uint32_t idleSince = 0;
+    if (!screen)
+        return;
+    if (lv_screen_active() == screen || tdeckgemini::state() == tdeckgemini::WORKING) {
+        idleSince = 0;
+        return;
+    }
+    if (!idleSince) {
+        idleSince = lv_tick_get();
+        return;
+    }
+    if (lv_tick_get() - idleSince < 5000)
+        return;
+    idleSince = 0;
+    if (poll) {
+        lv_timer_delete(poll);
+        poll = nullptr;
+    }
+    if (focusGuard) {
+        lv_timer_delete(focusGuard);
+        focusGuard = nullptr;
+    }
+    lv_obj_delete(screen);
+    screen = nullptr;
+    askArea = answerLbl = statusLbl = askBtnLbl = nullptr;
+    lastState = -1;
+    tdeckgemini::release();
+}
 
 extern "C" void gemini_open(void)
 {

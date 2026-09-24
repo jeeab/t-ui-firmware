@@ -43,7 +43,44 @@ char gModel[48] = {0};
 bool gConfigRead = false;
 
 char gPrompt[kMaxPrompt + 1] = {0};
-char gReply[kMaxReply + 1] = {0};
+// ⛔ PSRAM. This is reply TEXT - cold, large, and read only while the Gemini screen is up.
+// In internal RAM it was 1,201 bytes of the very thing a TLS handshake needs contiguously.
+// Allocated on first use; every reader already tolerates an empty string.
+char *gReply = nullptr;
+
+// Give the buffers back. Safe to call repeatedly; the accessors reallocate on next use.
+// ⛔ Caller must ensure no request is in flight - see geminiIdleCheck() in GeminiApp.cpp.
+void release(void);
+
+static char *s_workBuf = nullptr;
+
+static char *geminiWorkBuf(void)
+{
+    if (!s_workBuf) {
+        s_workBuf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+        if (!s_workBuf)
+            s_workBuf = (char *)malloc(4096);
+    }
+    return s_workBuf;
+}
+
+static void geminiReleaseWork(void)
+{
+    if (s_workBuf) {
+        heap_caps_free(s_workBuf);
+        s_workBuf = nullptr;
+    }
+}
+
+static char *replyBuf(void)
+{
+    if (!gReply) {
+        gReply = (char *)heap_caps_calloc(kMaxReply + 1, 1, MALLOC_CAP_SPIRAM);
+        if (!gReply)
+            gReply = (char *)calloc(kMaxReply + 1, 1); // tiny boards / no PSRAM
+    }
+    return gReply;
+}
 char gStatus[96] = {0};
 int gState = IDLE;
 bool gAskPending = false;
@@ -210,7 +247,8 @@ void ask(const char *prompt)
     if (!prompt || !*prompt)
         return;
     snprintf(gPrompt, sizeof(gPrompt), "%s", prompt);
-    gReply[0] = 0;
+    if (replyBuf())
+        gReply[0] = 0;
     gRetryOtherModel = false;
     snprintf(gStatus, sizeof(gStatus), "Connecting...");
     gState = WORKING;
@@ -229,9 +267,19 @@ const char *statusText()
 {
     return gStatus;
 }
+void release(void)
+{
+    if (gReply) {
+        heap_caps_free(gReply);
+        gReply = nullptr;
+    }
+    geminiReleaseWork();
+}
+
 void clear()
 {
-    gReply[0] = 0;
+    if (replyBuf())
+        gReply[0] = 0;
     gStatus[0] = 0;
     gState = IDLE;
     tdeck_net_reset();
@@ -261,7 +309,12 @@ void service()
 
     const int net = tdeck_net_poll();
     if (net == NET_DONE) {
-        static char buf[4096];
+        // ⛔ PSRAM, for the same reason as gReply above: 4KB of internal RAM held permanently
+        // for a buffer used only while a Gemini request is in flight. File scope rather than a
+        // static local so release() can hand it back when the app is closed.
+        char *buf = geminiWorkBuf();
+        if (!buf)
+            return;
         const int n = tdeck_net_result(buf, sizeof(buf));
         tdeck_net_reset();
         if (n <= 0) {
@@ -276,7 +329,8 @@ void service()
             // extractReply puts Gemini's own explanation in gReply when it refused; show that
             // rather than a generic failure, because it is usually actionable.
             snprintf(gStatus, sizeof(gStatus), "%s", gReply[0] ? gReply : "Could not read the answer");
-            gReply[0] = 0;
+            if (replyBuf())
+        gReply[0] = 0;
             gState = FAILED;
         }
         return;

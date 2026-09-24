@@ -227,6 +227,7 @@ extern "C" void channels_open(void);
 // Notes module (NotesApp.cpp) — .txt notes on the SD card.
 extern "C" void notes_open(void);
 extern "C" void gemini_open(void); // GeminiApp.cpp - ask Gemini a question over wi-fi
+extern "C" void gemini_idle_check(void); // frees its screen + buffers when unused
 extern "C" void mail_open(void);       // MailApp.cpp - Gmail setup form + inbox count
 extern "C" void mail_service_ui(void); // polls the inbox check while that screen is up
 extern "C" void notes_open_file(const char *path); // Files app opens .txt files with this
@@ -1016,7 +1017,16 @@ bool buildTileIconFromFile(lv_obj_t *tile, const char *path)
     FsFile f = SDFs.open(path, O_RDONLY);
     if (!f)
         return false;
-    static char buf[2560]; // a 40x40 grid plus its palette sits well under this
+    // ⛔ PSRAM. 2,560 bytes of internal RAM held forever to read an icon file that is parsed
+    // once per app tile at startup. A 40x40 grid plus its palette sits well under this.
+    static char *buf = nullptr;
+    if (!buf) {
+        buf = (char *)heap_caps_malloc(2560, MALLOC_CAP_SPIRAM);
+        if (!buf)
+            buf = (char *)malloc(2560);
+        if (!buf)
+            return false;
+    }
     int n = (int)f.read((uint8_t *)buf, sizeof(buf) - 1);
     f.close();
     if (n <= 0)
@@ -1550,6 +1560,7 @@ void TFTView_320x240::createLauncher(void)
             }
 
             mail_service_ui(); // no-op unless the Mail screen is up and a check is running
+            gemini_idle_check(); // hands Gemini's memory back once it has been left alone
 
             // Coverage overlay: self-throttled by its own change check, so calling it on every
             // pass costs a handful of comparisons when nothing has moved.

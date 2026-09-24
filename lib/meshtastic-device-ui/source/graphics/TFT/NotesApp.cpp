@@ -48,7 +48,20 @@ lv_obj_t *prevScreen = nullptr;
 lv_timer_t *focusGuard = nullptr;
 
 unsigned noteIds[kMaxNotes];
-char notePreview[kMaxNotes][36];
+// ⛔ PSRAM. 1,440 bytes of internal RAM for preview strings shown only on the Notes list.
+// A helper rather than a raw array so every use goes through the allocation check.
+static char (*notePreviewBuf)[36] = nullptr;
+
+static char (*notePreviewArr(void))[36]
+{
+    if (!notePreviewBuf) {
+        notePreviewBuf = (char (*)[36])heap_caps_calloc(kMaxNotes, 36, MALLOC_CAP_SPIRAM);
+        if (!notePreviewBuf)
+            notePreviewBuf = (char (*)[36])calloc(kMaxNotes, 36);
+    }
+    return notePreviewBuf;
+}
+#define notePreview (notePreviewArr())
 int noteCount = 0;
 unsigned curId = 0;        // note being edited (list mode)
 bool curIsNew = false;     // brand-new note: discard if left empty
