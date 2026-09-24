@@ -40,6 +40,7 @@
 #include "configuration.h"
 #include "TDeckMail.h" // @@mail / @@inbox
 #include "TDeckCoverage.h" // @@cov
+#include "graphics/common/SdCard.h" // @@mailfile reads /gmail.txt
 #include <lvgl.h> // @@refr needs the refresh timer
 extern "C" void tdeck_fps_set(bool on); // @@fps - LGFXDriver.h
 #include "chess/chess.h"  // @@chess - benchmark the engine on the real chip
@@ -171,6 +172,24 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 LOG_INFO("@@ok cov rec=%d cells=%d first=%ld,%ld snr=%.2f rssi=%d n=%d",
                          (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
                          (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
+            } else if (!strncmp(s_line, "mailfile", 8)) {
+                // ⛔ REPORTS SHAPE, NEVER CONTENT. Jake says the app asks for the password every
+                // time it opens, which means haveCreds() is reading false. This says whether the
+                // file is there and how long each line is - enough to tell "missing" from
+                // "empty" from "fine" - without putting a password on the wire.
+                FsFile f = SDFs.open("/gmail.txt", O_RDONLY);
+                if (!f) {
+                    LOG_INFO("@@ok mailfile MISSING - SDFs.open failed");
+                } else {
+                    char l1[96] = {0}, l2[96] = {0};
+                    int n1 = f.fgets(l1, sizeof(l1));
+                    int n2 = f.fgets(l2, sizeof(l2));
+                    const uint32_t sz = (uint32_t)f.fileSize();
+                    f.close();
+                    LOG_INFO("@@ok mailfile size=%u line1=%d chars line2=%d chars", (unsigned)sz, n1, n2);
+                    memset(l1, 0, sizeof(l1));
+                    memset(l2, 0, sizeof(l2));
+                }
             } else if (!strncmp(s_line, "mailtest", 8)) {
                 // ⚠️ BEFORE "mail", or the shorter prefix swallows it - the same trap the
                 // lockpad/lock pair hit in @@open.

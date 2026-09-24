@@ -50,8 +50,12 @@ static bool checking = false;
 
 #define MAIL_ROWS 12
 static lv_obj_t *listBox = nullptr, *readBox = nullptr, *composeBox = nullptr;
+static lv_obj_t *gateBox = nullptr, *gateWho = nullptr, *removeBtn = nullptr, *removeLbl = nullptr;
+static lv_obj_t *infoBox = nullptr;
+static bool removeArmed = false; // second tap confirms
+static void refreshGate(void); // defined below; used by handlers declared before it
 static lv_obj_t *rowLbl[MAIL_ROWS] = {nullptr};
-static lv_obj_t *pageLbl = nullptr, *readHdr = nullptr, *readTxt = nullptr;
+static lv_obj_t *pageLbl = nullptr, *readHdr = nullptr, *readFrom = nullptr, *readTxt = nullptr;
 static lv_obj_t *toArea = nullptr, *subjArea = nullptr, *bodyArea = nullptr, *composeMsg = nullptr;
 // What the pending network call was for, so the poll knows which screen to fill in. The
 // transport has its own idea of the operation; this is the UI's, and they are deliberately
@@ -66,6 +70,10 @@ static bool savedAddress(char *out, size_t cap)
 {
     out[0] = 0;
     FsFile f = SDFs.open("/gmail.txt", O_RDONLY);
+    if (!f) {
+        delay(20);
+        f = SDFs.open("/gmail.txt", O_RDONLY); // same bus-contention retry as haveCreds()
+    }
     if (!f)
         return false;
     int n = f.fgets(out, (int)cap);
@@ -78,15 +86,43 @@ static bool savedAddress(char *out, size_t cap)
     return n > 3 && out[0];
 }
 
+// ⛔ A FAILED READ IS NOT PROOF THERE IS NO ACCOUNT, and treating it as one is why Jake kept
+// being asked to log in again. This re-read the SD card on every single app open; the card
+// shares its SPI bus with the display and the radio, so a read at a busy moment can simply
+// fail - and the app then concluded there were no credentials and showed the login form.
+// Verified the file was there the whole time: @@mailfile reported size=42, line1=23, line2=17.
+//
+// Now: a POSITIVE result is cached for the session, and a failure to open is never cached and
+// never reported as "no account" without a second attempt. The cache is cleared whenever the
+// file is written or removed, so it cannot go stale.
+static int s_credCache = -1; // -1 unknown, 0 definitely none, 1 present
+
+static void forgetCredCache(void)
+{
+    s_credCache = -1;
+}
+
 static bool haveCreds(void)
 {
-    FsFile f = SDFs.open("/gmail.txt", O_RDONLY);
-    if (!f)
-        return false;
-    char line[96];
-    int n = f.fgets(line, sizeof(line));
-    f.close();
-    return n > 3; // an address, at minimum
+    if (s_credCache >= 0)
+        return s_credCache == 1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        FsFile f = SDFs.open("/gmail.txt", O_RDONLY);
+        if (!f) {
+            if (attempt == 0) {
+                delay(20); // give the bus a moment; the other user of it is mid-transfer
+                continue;
+            }
+            return false; // deliberately NOT cached - we do not know, so we will ask again
+        }
+        char line[96];
+        const int n = f.fgets(line, sizeof(line));
+        f.close();
+        memset(line, 0, sizeof(line));
+        s_credCache = (n > 3) ? 1 : 0; // an address, at minimum
+        return s_credCache == 1;
+    }
+    return false;
 }
 
 static lv_obj_t *makeButton(lv_obj_t *parent, const char *txt, uint32_t colour, lv_event_cb_t cb)
@@ -101,14 +137,14 @@ static lv_obj_t *makeButton(lv_obj_t *parent, const char *txt, uint32_t colour, 
     return b;
 }
 
-enum MailView { VIEW_SETUP = 0, VIEW_STATUS, VIEW_LIST, VIEW_READ, VIEW_COMPOSE };
-static int view = VIEW_STATUS;
+enum MailView { VIEW_GATE = 0, VIEW_SETUP, VIEW_STATUS, VIEW_LIST, VIEW_READ, VIEW_COMPOSE };
+static int view = VIEW_GATE;
 
 static void showView(int v)
 {
     view = v;
-    lv_obj_t *boxes[] = {setupBox, statusBox, listBox, readBox, composeBox};
-    for (int i = 0; i < 5; i++) {
+    lv_obj_t *boxes[] = {gateBox, setupBox, statusBox, listBox, readBox, composeBox};
+    for (int i = 0; i < 6; i++) {
         if (!boxes[i])
             continue;
         if (i == v)
@@ -205,6 +241,7 @@ static void onSave(lv_event_t *)
             wf.println(keep);
             wf.close();
             memset(keep, 0, sizeof(keep)); // never lingers, same rule as a typed one
+            forgetCredCache();
             tdeck_mail_forget_creds();
             showSetup(false);
             lv_label_set_text(statusLbl, "Saved. Checking...");
@@ -237,6 +274,7 @@ static void onSave(lv_event_t *)
     // should exist after this line is the one on the card.
     memset(pass, 0, sizeof(pass));
     lv_textarea_set_text(passArea, "");
+    forgetCredCache();
     tdeck_mail_forget_creds(); // drop the cached copy so the new file is picked up
     LOG_INFO("[MAIL] credentials saved for %s", addr); // the ADDRESS only, never the password
 
@@ -257,6 +295,12 @@ static void onCheck(lv_event_t *)
         lv_label_set_text(statusLbl, "Busy - try again in a moment");
 }
 
+static void onBackToGate(lv_event_t *)
+{
+    refreshGate();
+    showView(VIEW_GATE);
+}
+
 static void onEdit(lv_event_t *)
 {
     // Show what is actually stored, rather than a blank form that implies nothing is.
@@ -267,6 +311,70 @@ static void onEdit(lv_event_t *)
         lv_textarea_set_text(passArea, "");
     lv_label_set_text(formMsg, haveCreds() ? "Leave the password blank to keep the saved one" : "");
     showSetup(true);
+}
+
+// Reflect what is actually stored. Called whenever the gate is shown, so it can never be stale.
+static void refreshGate(void)
+{
+    char addr[96];
+    const bool have = savedAddress(addr, sizeof(addr));
+    removeArmed = false;
+    if (gateWho)
+        lv_label_set_text_fmt(gateWho, have ? "Signed in as %s" : "No account saved yet", addr);
+    if (removeBtn) {
+        // Greyed out with nothing to remove; red when there is, because it destroys something.
+        lv_obj_set_style_bg_color(removeBtn, lv_color_hex(have ? 0xff453a : 0x2c2c2e), LV_PART_MAIN);
+        if (removeLbl) {
+            lv_label_set_text(removeLbl, "Remove account");
+            lv_obj_set_style_text_color(removeLbl, lv_color_hex(have ? 0xffffff : 0x5a5a5e), LV_PART_MAIN);
+        }
+    }
+}
+
+static void onGateLogin(lv_event_t *)
+{
+    if (haveCreds()) {
+        // ⭐ AUTO SIGN-IN. The credentials are already on the card; there is nothing to ask for.
+        // Jake: "once clicked login, it should auto sign you in, or bring you to the login form
+        // depending".
+        showView(VIEW_STATUS);
+        lv_label_set_text(statusLbl, "Signing in...");
+        uiWant = WANT_COUNT;
+        checking = tdeck_mail_check();
+        if (!checking)
+            lv_label_set_text(statusLbl, "Busy - try again in a moment");
+        return;
+    }
+    char addr[96];
+    if (savedAddress(addr, sizeof(addr)) && addrArea)
+        lv_textarea_set_text(addrArea, addr);
+    lv_label_set_text(formMsg, "");
+    showView(VIEW_SETUP);
+}
+
+static void onGateRemove(lv_event_t *)
+{
+    if (!haveCreds())
+        return; // nothing to remove; the button is greyed for exactly this reason
+    if (!removeArmed) {
+        // ⛔ TWO TAPS. Deleting the saved login is not undoable without Google's website and a
+        // fresh app password, so a stray tap must not do it.
+        removeArmed = true;
+        if (removeLbl)
+            lv_label_set_text(removeLbl, "Tap again to confirm");
+        return;
+    }
+    SDFs.remove("/gmail.txt");
+    forgetCredCache();
+    tdeck_mail_forget_creds();
+    if (passArea)
+        lv_textarea_set_text(passArea, "");
+    if (addrArea)
+        lv_textarea_set_text(addrArea, "@gmail.com");
+    LOG_INFO("[MAIL] saved account removed");
+    refreshGate();
+    if (gateWho)
+        lv_label_set_text(gateWho, "Account removed from this device");
 }
 
 static void fillList(void)
@@ -330,10 +438,10 @@ static void onRow(lv_event_t *e)
     unsigned seq = 0;
     bool seen = true;
     tdeck_mail_item(i, &seq, &from, &subj, &date, &seen);
-    char hdr[200];
-    snprintf(hdr, sizeof(hdr), "%s\n%s", subj, from);
     if (readHdr)
-        lv_label_set_text(readHdr, hdr);
+        lv_label_set_text(readHdr, subj);
+    if (readFrom)
+        lv_label_set_text(readFrom, from);
     if (readTxt)
         lv_label_set_text(readTxt, "loading...");
     showView(VIEW_READ);
@@ -432,17 +540,117 @@ extern "C" void mail_open(void)
         lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
         tui_statusbar_reserve(screen);
 
+        // ---------- the gate: what you see when the app opens ----------
+        gateBox = lv_obj_create(screen);
+        lv_obj_remove_style_all(gateBox);
+        lv_obj_set_pos(gateBox, 0, 0);
+        lv_obj_set_size(gateBox, 320, 218);
+        lv_obj_clear_flag(gateBox, LV_OBJ_FLAG_SCROLLABLE);
+        {
+            lv_obj_t *t = lv_label_create(gateBox);
+            lv_label_set_text(t, "Mail");
+            lv_obj_set_pos(t, 8, 6);
+            lv_obj_set_size(t, 200, 26);
+            lv_obj_set_style_text_font(t, &ui_font_montserrat_20, LV_PART_MAIN);
+            lv_obj_set_style_text_color(t, lv_color_hex(0xffffff), LV_PART_MAIN);
+
+            gateWho = lv_label_create(gateBox);
+            lv_obj_set_pos(gateWho, 8, 38);
+            lv_obj_set_size(gateWho, 304, 34); // bounded: an address can be any length
+            lv_label_set_long_mode(gateWho, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(gateWho, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(gateWho, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+            lv_label_set_text(gateWho, "");
+
+            lv_obj_t *li = makeButton(gateBox, "Log in", 0x0a84ff, onGateLogin);
+            lv_obj_set_size(li, 304, 40);
+            lv_obj_set_pos(li, 8, 80);
+
+            removeBtn = lv_btn_create(gateBox);
+            lv_obj_set_size(removeBtn, 304, 40);
+            lv_obj_set_pos(removeBtn, 8, 128);
+            lv_obj_set_style_radius(removeBtn, 8, LV_PART_MAIN);
+            removeLbl = lv_label_create(removeBtn);
+            lv_obj_center(removeLbl);
+            lv_obj_add_event_cb(removeBtn, onGateRemove, LV_EVENT_CLICKED, NULL);
+
+            lv_obj_t *hint = lv_label_create(gateBox);
+            lv_obj_set_pos(hint, 8, 176);
+            lv_obj_set_size(hint, 304, 34);
+            lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(hint, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(hint, lv_color_hex(0x5a5a5e), LV_PART_MAIN);
+            lv_label_set_text(hint, "Connects to Gmail. Tap i for how your password is stored.");
+        }
+
+        // ---------- info panel: what happens to the password ----------
+        // Jake asked for this explicitly, and it is the right thing to put in front of someone
+        // before they type a credential into a device.
+        infoBox = lv_obj_create(screen);
+        lv_obj_remove_style_all(infoBox);
+        lv_obj_set_pos(infoBox, 0, 0);
+        lv_obj_set_size(infoBox, 320, 218);
+        lv_obj_set_style_bg_color(infoBox, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(infoBox, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_add_flag(infoBox, LV_OBJ_FLAG_HIDDEN);
+        {
+            lv_obj_t *sc = lv_obj_create(infoBox);
+            lv_obj_set_pos(sc, 4, 4);
+            lv_obj_set_size(sc, 312, 174);
+            lv_obj_set_style_bg_color(sc, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+            lv_obj_set_style_border_width(sc, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(sc, 6, LV_PART_MAIN);
+            lv_obj_set_scroll_dir(sc, LV_DIR_VER);
+            lv_obj_t *t = lv_label_create(sc);
+            lv_obj_set_width(t, 296);
+            lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(t, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(t, lv_color_hex(0xffffff), LV_PART_MAIN);
+            lv_label_set_text(t,
+                              "Your password\n\n"
+                              "It is an app password, not your real Google one. Google stopped "
+                              "allowing real passwords for mail apps. It only works for mail, and "
+                              "you can revoke it at myaccount.google.com/apppasswords without "
+                              "changing anything else.\n\n"
+                              "Where it is kept\n\n"
+                              "In a plain text file called gmail.txt on this device's SD card. "
+                              "Not encrypted - anyone holding the card can read it. Remove "
+                              "account deletes that file.\n\n"
+                              "Where it is not\n\n"
+                              "Never written to the log. Never sent anywhere except Gmail, over a "
+                              "connection checked against Google's own certificate. Screenshots "
+                              "are refused while the login form is open, so it cannot be "
+                              "captured over the USB cable.");
+            lv_obj_t *ok = makeButton(infoBox, "Close", 0x3a3a3c, [](lv_event_t *) {
+                lv_obj_add_flag(infoBox, LV_OBJ_FLAG_HIDDEN);
+            });
+            lv_obj_set_size(ok, 120, 32);
+            lv_obj_set_pos(ok, 4, 182);
+        }
+
         // ---------- setup form ----------
         setupBox = lv_obj_create(screen);
         lv_obj_remove_style_all(setupBox);
-        lv_obj_set_pos(setupBox, 0, 26);
-        lv_obj_set_size(setupBox, 320, 214);
+        lv_obj_set_pos(setupBox, 0, 0);
+        lv_obj_set_size(setupBox, 320, 218);
         lv_obj_clear_flag(setupBox, LV_OBJ_FLAG_SCROLLABLE);
 
         // ⭐ THE LAYOUT ADDS UP, ON PURPOSE. setupBox is 214 tall and every row below has an
         // explicit height, so the total is checkable by reading it rather than by running it:
         //   label 14 + field 32 + label 14 + field 32 + hint 50 + buttons 32 + message 32 = 206
         // Nothing here can grow into the row beneath it.
+        {
+            // Top-right on both the gate and the form, as asked.
+            for (int k = 0; k < 2; k++) {
+                lv_obj_t *ib = makeButton(k ? setupBox : gateBox, "i", 0x2c2c2e, [](lv_event_t *) {
+                    lv_obj_clear_flag(infoBox, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_move_foreground(infoBox);
+                });
+                lv_obj_set_size(ib, 28, 28);
+                lv_obj_set_pos(ib, 288, 2);
+            }
+        }
+
         lv_obj_t *t1 = lv_label_create(setupBox);
         lv_label_set_text(t1, "Gmail address");
         lv_obj_set_style_text_color(t1, lv_color_hex(0x8e8e93), LV_PART_MAIN);
@@ -526,8 +734,8 @@ extern "C" void mail_open(void)
         // ---------- status screen ----------
         statusBox = lv_obj_create(screen);
         lv_obj_remove_style_all(statusBox);
-        lv_obj_set_pos(statusBox, 0, 26);
-        lv_obj_set_size(statusBox, 320, 214);
+        lv_obj_set_pos(statusBox, 0, 0);
+        lv_obj_set_size(statusBox, 320, 218);
         lv_obj_clear_flag(statusBox, LV_OBJ_FLAG_SCROLLABLE);
 
         countLbl = lv_label_create(statusBox);
@@ -539,7 +747,7 @@ extern "C" void mail_open(void)
         lv_obj_t *chk = makeButton(statusBox, "Check now", 0x0a84ff, onCheck);
         lv_obj_set_size(chk, 150, 32);
         lv_obj_set_pos(chk, 4, 56);
-        lv_obj_t *edit = makeButton(statusBox, "Account", 0x3a3a3c, onEdit);
+        lv_obj_t *edit = makeButton(statusBox, "Account", 0x3a3a3c, onBackToGate);
         lv_obj_set_size(edit, 158, 32);
         lv_obj_set_pos(edit, 158, 56);
         lv_obj_t *inbx = makeButton(statusBox, "Inbox", 0x30d158, [](lv_event_t *) {
@@ -567,8 +775,8 @@ extern "C" void mail_open(void)
         // is never a larger list held in memory that this one is a window onto.
         listBox = lv_obj_create(screen);
         lv_obj_remove_style_all(listBox);
-        lv_obj_set_pos(listBox, 0, 26);
-        lv_obj_set_size(listBox, 320, 214);
+        lv_obj_set_pos(listBox, 0, 0);
+        lv_obj_set_size(listBox, 320, 218);
         lv_obj_clear_flag(listBox, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(listBox, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < MAIL_ROWS; i++) {
@@ -613,16 +821,27 @@ extern "C" void mail_open(void)
         // ---------- read one message ----------
         readBox = lv_obj_create(screen);
         lv_obj_remove_style_all(readBox);
-        lv_obj_set_pos(readBox, 0, 26);
-        lv_obj_set_size(readBox, 320, 214);
+        lv_obj_set_pos(readBox, 0, 0);
+        lv_obj_set_size(readBox, 320, 218);
         lv_obj_clear_flag(readBox, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(readBox, LV_OBJ_FLAG_HIDDEN);
         readHdr = lv_label_create(readBox);
         lv_obj_set_pos(readHdr, 4, 0);
-        lv_obj_set_size(readHdr, 306, 30); // two lines: subject, then sender
+        // ⛔ TWO LABELS, NOT ONE TWO-LINE ONE. LONG_DOT collapses to a SINGLE line whatever
+        // newlines the text contains, so a "subject<nl>sender" label showed the subject and
+        // silently swallowed the sender. Caught by looking at the screen: no From line at all.
+        lv_obj_set_size(readHdr, 306, 15);
         lv_label_set_long_mode(readHdr, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(readHdr, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(readHdr, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_label_set_text(readHdr, "");
+        readFrom = lv_label_create(readBox);
+        lv_obj_set_pos(readFrom, 4, 16);
+        lv_obj_set_size(readFrom, 306, 14);
+        lv_label_set_long_mode(readFrom, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(readFrom, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(readFrom, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_label_set_text(readFrom, "");
         {
             lv_obj_t *sc = lv_obj_create(readBox);
             lv_obj_set_pos(sc, 2, 32);
@@ -648,8 +867,8 @@ extern "C" void mail_open(void)
         // ---------- compose ----------
         composeBox = lv_obj_create(screen);
         lv_obj_remove_style_all(composeBox);
-        lv_obj_set_pos(composeBox, 0, 26);
-        lv_obj_set_size(composeBox, 320, 214);
+        lv_obj_set_pos(composeBox, 0, 0);
+        lv_obj_set_size(composeBox, 320, 218);
         lv_obj_clear_flag(composeBox, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(composeBox, LV_OBJ_FLAG_HIDDEN);
         {
@@ -697,7 +916,11 @@ extern "C" void mail_open(void)
         if (savedAddress(addr, sizeof(addr)) && addrArea)
             lv_textarea_set_text(addrArea, addr);
     }
-    showSetup(!haveCreds());
+    // Always open on the gate. Jake: "you open the mail app, then it gives two options".
+    refreshGate();
+    if (infoBox)
+        lv_obj_add_flag(infoBox, LV_OBJ_FLAG_HIDDEN);
+    showView(VIEW_GATE);
     if (lv_group_get_default() && addrArea) {
         lv_group_add_obj(lv_group_get_default(), addrArea);
         lv_group_add_obj(lv_group_get_default(), passArea);
