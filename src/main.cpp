@@ -1315,6 +1315,9 @@ extern "C" void tdeck_mail_service(void);
 // Mesh coverage mapper: the SD write half. The sampling half runs on the UI task and is
 // deliberately a hash insert and nothing more. See src/TDeckCoverage.cpp.
 extern "C" void tdeck_coverage_service(void);
+// The chess search. Same rule and the same thread as the others: two seconds of
+// thinking on the UI task would freeze the screen and stall the radio with it.
+extern "C" void tdeck_chess_service(void);
 
 // DIAGNOSTIC ONLY - comment out for anything that ships.
 // Runs the app internet door exactly the way the Weather app does: two fetches back to back
@@ -1417,6 +1420,7 @@ void loop()
     tdeck_net_service();
     tdeck_mail_service();
     tdeck_coverage_service();
+    tdeck_chess_service();
 #ifdef NETDOOR_SELFTEST
     netDoorSelfTest();
 #endif

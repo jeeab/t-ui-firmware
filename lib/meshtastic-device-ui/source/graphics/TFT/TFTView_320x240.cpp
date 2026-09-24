@@ -228,6 +228,8 @@ extern "C" void channels_open(void);
 extern "C" void notes_open(void);
 extern "C" void gemini_open(void); // GeminiApp.cpp - ask Gemini a question over wi-fi
 extern "C" void gemini_idle_check(void); // frees its screen + buffers when unused
+extern "C" void chess_open(void);        // ChessApp.cpp - play the engine
+extern "C" void chess_idle_check(void);  // 128 objects; hands them back when unused
 extern "C" void mail_open(void);       // MailApp.cpp - Gmail setup form + inbox count
 extern "C" void mail_service_ui(void); // polls the inbox check while that screen is up
 extern "C" void notes_open_file(const char *path); // Files app opens .txt files with this
@@ -689,6 +691,7 @@ static const LauncherApp kApps[] = {
     // so on screen rather than letting a lost phone link look like a bug.
     {"Gemini", &img_messages_button_image, 0x30d158, nullptr, nullptr, nullptr, &gemini_open},
     {"Mail", &img_messages_button_image, 0xff9f0a, nullptr, nullptr, nullptr, &mail_open},
+    {"Chess", &img_messages_button_image, 0xf2f2f2, nullptr, nullptr, nullptr, &chess_open},
     // Calculator = self-contained module (CalculatorApp.cpp).
     {"Calculator", &img_nodes_button_image, 0xff9f0a, nullptr, nullptr, nullptr, &calculator_open},
     // Breakout = a Lua GAME loaded from /apps/breakout/main.lua on the SD card.
@@ -879,6 +882,11 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 19, 2, 6, 38, color, 3);  // vertical
         icBox(ic, 2, 19, 40, 6, color, 3);  // horizontal
         icBox(ic, 33, 5, 5, 5, color, LV_RADIUS_CIRCLE); // small spark off the shoulder
+    } else if (!strcmp(name, "Chess")) { // a pawn: head, collar, waist, base
+        icBox(ic, 16, 4, 10, 10, color, LV_RADIUS_CIRCLE); // head
+        icBox(ic, 13, 15, 16, 4, color, 2);                // collar
+        icBox(ic, 17, 19, 8, 10, color, 2);                // body
+        icBox(ic, 10, 30, 22, 6, color, 2);                // base
     } else if (!strcmp(name, "Mail")) { // envelope: body, then the flap as two leaning bars
         icBox(ic, 4, 9, 36, 24, color, 3);                   // the envelope body
         icBox(ic, 8, 13, 16, 4, 0x1c1c1e, 1);                // flap, left half, sloping down
@@ -1561,6 +1569,7 @@ void TFTView_320x240::createLauncher(void)
 
             mail_service_ui(); // no-op unless the Mail screen is up and a check is running
             gemini_idle_check(); // hands Gemini's memory back once it has been left alone
+            chess_idle_check();  // and the chess board, which is the biggest of them
 
             // Coverage overlay: self-throttled by its own change check, so calling it on every
             // pass costs a handful of comparisons when nothing has moved.
