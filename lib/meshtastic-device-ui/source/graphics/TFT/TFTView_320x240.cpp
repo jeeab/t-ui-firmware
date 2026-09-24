@@ -878,6 +878,14 @@ void buildTileIcon(lv_obj_t *tile, const char *name, uint32_t color)
         icBox(ic, 19, 2, 6, 38, color, 3);  // vertical
         icBox(ic, 2, 19, 40, 6, color, 3);  // horizontal
         icBox(ic, 33, 5, 5, 5, color, LV_RADIUS_CIRCLE); // small spark off the shoulder
+    } else if (!strcmp(name, "Mail")) { // envelope: body, then the flap as two leaning bars
+        icBox(ic, 4, 9, 36, 24, color, 3);                   // the envelope body
+        icBox(ic, 8, 13, 16, 4, 0x1c1c1e, 1);                // flap, left half, sloping down
+        icBox(ic, 10, 16, 14, 4, 0x1c1c1e, 1);               //  stepped rather than rotated -
+        icBox(ic, 13, 19, 10, 4, 0x1c1c1e, 1);               //  icBox cannot rotate, and three
+        icBox(ic, 20, 13, 16, 4, 0x1c1c1e, 1);               //  steps a side reads as a V at
+        icBox(ic, 20, 16, 14, 4, 0x1c1c1e, 1);               //  40px without needing one.
+        icBox(ic, 21, 19, 10, 4, 0x1c1c1e, 1);
     } else if (!strcmp(name, "Notes")) { // page with lines
         icBox(ic, 11, 3, 24, 34, 0xf2f2f2, 3);
         icBox(ic, 15, 10, 16, 2, 0x8e8e93, 1);

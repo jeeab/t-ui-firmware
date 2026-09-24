@@ -28,15 +28,55 @@ extern "C" void tdeck_mail_counts(int *total, int *unseen);
 extern "C" const char *tdeck_mail_error(void);
 extern "C" void tdeck_mail_forget_creds(void); // re-read /gmail.txt after the form saves
 extern "C" void tdeck_shot_block(bool on);     // refuse @@shot while a secret is on screen
+extern "C" bool tdeck_mail_list(int page);
+extern "C" int tdeck_mail_list_count(void);
+extern "C" int tdeck_mail_total(void);
+extern "C" int tdeck_mail_page(void);
+extern "C" bool tdeck_mail_item(int i, unsigned *seq, const char **from, const char **subj, const char **date,
+                                bool *seen);
+extern "C" bool tdeck_mail_read(unsigned seq);
+extern "C" const char *tdeck_mail_body(void);
+extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char *body);
 
 static lv_obj_t *screen = nullptr;
 static lv_obj_t *addrArea = nullptr;
 static lv_obj_t *passArea = nullptr;
-static lv_obj_t *statusLbl = nullptr;
+static lv_obj_t *statusLbl = nullptr; // status screen
+static lv_obj_t *formMsg = nullptr;   // the form has its own, inside the form box
 static lv_obj_t *countLbl = nullptr;
 static lv_obj_t *setupBox = nullptr;
 static lv_obj_t *statusBox = nullptr;
 static bool checking = false;
+
+#define MAIL_ROWS 12
+static lv_obj_t *listBox = nullptr, *readBox = nullptr, *composeBox = nullptr;
+static lv_obj_t *rowLbl[MAIL_ROWS] = {nullptr};
+static lv_obj_t *pageLbl = nullptr, *readHdr = nullptr, *readTxt = nullptr;
+static lv_obj_t *toArea = nullptr, *subjArea = nullptr, *bodyArea = nullptr, *composeMsg = nullptr;
+// What the pending network call was for, so the poll knows which screen to fill in. The
+// transport has its own idea of the operation; this is the UI's, and they are deliberately
+// separate - a reply can arrive after the user has walked away from the screen that asked.
+enum UiWant { WANT_NONE = 0, WANT_COUNT, WANT_LIST, WANT_BODY, WANT_SEND };
+static int uiWant = WANT_NONE;
+static unsigned rowSeq[MAIL_ROWS] = {0};
+
+// Read back just the address line. ⛔ Deliberately does NOT read line 2 - nothing outside
+// onSave has any business holding the password, and a helper that returns it would get reused.
+static bool savedAddress(char *out, size_t cap)
+{
+    out[0] = 0;
+    FsFile f = SDFs.open("/gmail.txt", O_RDONLY);
+    if (!f)
+        return false;
+    int n = f.fgets(out, (int)cap);
+    f.close();
+    for (char *p = out; *p; p++)
+        if (*p == '\n' || *p == '\r') {
+            *p = 0;
+            break;
+        }
+    return n > 3 && out[0];
+}
 
 static bool haveCreds(void)
 {
@@ -61,12 +101,26 @@ static lv_obj_t *makeButton(lv_obj_t *parent, const char *txt, uint32_t colour, 
     return b;
 }
 
+enum MailView { VIEW_SETUP = 0, VIEW_STATUS, VIEW_LIST, VIEW_READ, VIEW_COMPOSE };
+static int view = VIEW_STATUS;
+
+static void showView(int v)
+{
+    view = v;
+    lv_obj_t *boxes[] = {setupBox, statusBox, listBox, readBox, composeBox};
+    for (int i = 0; i < 5; i++) {
+        if (!boxes[i])
+            continue;
+        if (i == v)
+            lv_obj_clear_flag(boxes[i], LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(boxes[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void showSetup(bool on)
 {
-    if (setupBox)
-        on ? lv_obj_clear_flag(setupBox, LV_OBJ_FLAG_HIDDEN) : lv_obj_add_flag(setupBox, LV_OBJ_FLAG_HIDDEN);
-    if (statusBox)
-        on ? lv_obj_add_flag(statusBox, LV_OBJ_FLAG_HIDDEN) : lv_obj_clear_flag(statusBox, LV_OBJ_FLAG_HIDDEN);
+    showView(on ? VIEW_SETUP : VIEW_STATUS);
     // ⛔ THE SCREENSHOT BLOCK IS NOT SET HERE. It is DERIVED from what is actually on screen,
     // every poll, in mail_service_ui(). Setting it at this transition is what the first version
     // did, and leaving the app by Back or Home does not pass through here - so the block stuck
@@ -99,7 +153,7 @@ static void onSave(lv_event_t *)
     stripSpaces(pass);
 
     if (!strchr(addr, '@')) {
-        lv_label_set_text(statusLbl, "That does not look like an email address");
+        lv_label_set_text(formMsg, "That is not an email address");
         return;
     }
     // ⛔ GMAIL ONLY, AND NOT ARBITRARILY. Jake asked whether this works for other providers.
@@ -113,21 +167,67 @@ static void onSave(lv_event_t *)
     {
         const char *at = strchr(addr, '@');
         if (strcasecmp(at, "@gmail.com") && strcasecmp(at, "@googlemail.com")) {
-            lv_label_set_text(statusLbl, "Gmail only for now - the security check is pinned to "
-                                         "Google's certificate");
+            lv_label_set_text(formMsg, "Gmail addresses only for now");
             return;
         }
     }
-    if (strlen(pass) < 16) {
-        // Google's app passwords are exactly 16 characters. Saying so beats a login failure
-        // twenty seconds later that could mean anything.
-        lv_label_set_text(statusLbl, "App passwords are 16 characters - check it");
-        return;
+    // ⛔ REJECT A REAL GOOGLE PASSWORD, DO NOT JUST SAVE IT.
+    // Jake, 2026-09-23: "i eneterned my normail gmail password and didnt work". The first check
+    // here was only `length < 16`, so a real password of 16 characters or more sailed through
+    // and got WRITTEN TO THE SD CARD IN PLAIN TEXT before failing to log in. That is a bad
+    // outcome from a validation that was trying to be helpful.
+    //
+    // A Google app password is always EXACTLY 16 characters and always all lowercase letters -
+    // no capitals, digits or symbols. Practically no real password looks like that, so the
+    // shape alone tells them apart. Check it BEFORE the file is opened.
+    // ⭐ BLANK PASSWORD MEANS "KEEP THE ONE ALREADY SAVED". The field is always empty when the
+    // form opens, because it is wiped the moment it is saved - so without this, opening Account
+    // to check the address forced you to retype all 16 characters, and looked like the login had
+    // been thrown away. Jake hit exactly that.
+    if (!pass[0] && haveCreds()) {
+        char keep[64] = {0};
+        FsFile rf = SDFs.open("/gmail.txt", O_RDONLY);
+        if (rf) {
+            char skip[96];
+            rf.fgets(skip, sizeof(skip)); // the address line, discarded
+            rf.fgets(keep, sizeof(keep));
+            rf.close();
+        }
+        stripSpaces(keep);
+        if (keep[0]) {
+            FsFile wf = SDFs.open("/gmail.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            if (!wf) {
+                memset(keep, 0, sizeof(keep));
+                lv_label_set_text(formMsg, "Could not write to the SD card");
+                return;
+            }
+            wf.println(addr);
+            wf.println(keep);
+            wf.close();
+            memset(keep, 0, sizeof(keep)); // never lingers, same rule as a typed one
+            tdeck_mail_forget_creds();
+            showSetup(false);
+            lv_label_set_text(statusLbl, "Saved. Checking...");
+            uiWant = WANT_COUNT;
+            checking = tdeck_mail_check();
+            return;
+        }
+    }
+    {
+        const size_t n = strlen(pass);
+        bool lowerOnly = true;
+        for (size_t i = 0; i < n; i++)
+            if (pass[i] < 'a' || pass[i] > 'z')
+                lowerOnly = false;
+        if (n != 16 || !lowerOnly) {
+            lv_label_set_text(formMsg, "Not an app password - needs 16 lowercase letters");
+            return;
+        }
     }
 
     FsFile f = SDFs.open("/gmail.txt", O_WRONLY | O_CREAT | O_TRUNC);
     if (!f) {
-        lv_label_set_text(statusLbl, "Could not write to the SD card");
+        lv_label_set_text(formMsg, "Could not write to the SD card");
         return;
     }
     f.println(addr);
@@ -142,6 +242,7 @@ static void onSave(lv_event_t *)
 
     showSetup(false);
     lv_label_set_text(statusLbl, "Saved. Checking...");
+    uiWant = WANT_COUNT;
     checking = tdeck_mail_check();
 }
 
@@ -150,6 +251,7 @@ static void onCheck(lv_event_t *)
     if (checking)
         return;
     lv_label_set_text(statusLbl, "Checking...");
+    uiWant = WANT_COUNT;
     checking = tdeck_mail_check();
     if (!checking)
         lv_label_set_text(statusLbl, "Busy - try again in a moment");
@@ -157,8 +259,102 @@ static void onCheck(lv_event_t *)
 
 static void onEdit(lv_event_t *)
 {
-    lv_label_set_text(statusLbl, "");
+    // Show what is actually stored, rather than a blank form that implies nothing is.
+    char addr[96];
+    if (savedAddress(addr, sizeof(addr)) && addrArea)
+        lv_textarea_set_text(addrArea, addr);
+    if (passArea)
+        lv_textarea_set_text(passArea, "");
+    lv_label_set_text(formMsg, haveCreds() ? "Leave the password blank to keep the saved one" : "");
     showSetup(true);
+}
+
+static void fillList(void)
+{
+    const int n = tdeck_mail_list_count();
+    for (int i = 0; i < MAIL_ROWS; i++) {
+        if (!rowLbl[i])
+            continue;
+        unsigned seq = 0;
+        const char *from = "", *subj = "", *date = "";
+        bool seen = true;
+        if (i < n && tdeck_mail_item(i, &seq, &from, &subj, &date, &seen)) {
+            rowSeq[i] = seq;
+            char buf[160];
+            // Sender first: scanning an inbox is mostly "who is this from". A bare display name
+            // if there is one, otherwise the address.
+            char who[40];
+            strncpy(who, from, sizeof(who) - 1);
+            who[sizeof(who) - 1] = 0;
+            char *lt = strchr(who, '<');
+            if (lt && lt != who)
+                *lt = 0; // "Name <addr>" -> "Name"
+            for (char *p = who; *p; p++)
+                if (*p == '"')
+                    *p = ' ';
+            snprintf(buf, sizeof(buf), "%s%s  %s", seen ? "" : "* ", who, subj);
+            lv_label_set_text(rowLbl[i], buf);
+            lv_obj_set_style_text_color(rowLbl[i], lv_color_hex(seen ? 0x8e8e93 : 0xffffff), LV_PART_MAIN);
+            lv_obj_clear_flag(rowLbl[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            rowSeq[i] = 0;
+            lv_obj_add_flag(rowLbl[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    char p[48];
+    const int total = tdeck_mail_total();
+    const int page = tdeck_mail_page();
+    snprintf(p, sizeof(p), "%d-%d of %d", page * MAIL_ROWS + 1, page * MAIL_ROWS + n, total);
+    if (pageLbl)
+        lv_label_set_text(pageLbl, p);
+}
+
+static void loadPage(int page)
+{
+    if (page < 0)
+        page = 0;
+    if (pageLbl)
+        lv_label_set_text(pageLbl, "loading...");
+    uiWant = WANT_LIST;
+    checking = tdeck_mail_list(page);
+    if (!checking && pageLbl)
+        lv_label_set_text(pageLbl, "busy");
+}
+
+static void onRow(lv_event_t *e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= MAIL_ROWS || !rowSeq[i])
+        return;
+    const char *from = "", *subj = "", *date = "";
+    unsigned seq = 0;
+    bool seen = true;
+    tdeck_mail_item(i, &seq, &from, &subj, &date, &seen);
+    char hdr[200];
+    snprintf(hdr, sizeof(hdr), "%s\n%s", subj, from);
+    if (readHdr)
+        lv_label_set_text(readHdr, hdr);
+    if (readTxt)
+        lv_label_set_text(readTxt, "loading...");
+    showView(VIEW_READ);
+    uiWant = WANT_BODY;
+    checking = tdeck_mail_read(rowSeq[i]);
+    if (!checking && readTxt)
+        lv_label_set_text(readTxt, "busy - try again in a moment");
+}
+
+static void onSend(lv_event_t *)
+{
+    const char *to = lv_textarea_get_text(toArea);
+    if (!to || !strchr(to, '@')) {
+        lv_label_set_text(composeMsg, "Who is it going to?");
+        return;
+    }
+    lv_label_set_text(composeMsg, "Sending...");
+    uiWant = WANT_SEND;
+    checking = tdeck_mail_send(to, lv_textarea_get_text(subjArea), lv_textarea_get_text(bodyArea));
+    if (!checking)
+        lv_label_set_text(composeMsg, "Busy - try again in a moment");
 }
 
 // Called from the UI poll while this screen is up.
@@ -182,7 +378,40 @@ extern "C" void mail_service_ui(void)
     if (st == 0)
         return;
     checking = false;
-    if (st > 0) {
+    const int want = uiWant;
+    uiWant = WANT_NONE;
+    if (st < 0) {
+        // One failure path for every operation, reported where the user is actually looking.
+        const char *err = tdeck_mail_error();
+        if (want == WANT_LIST && pageLbl)
+            lv_label_set_text(pageLbl, err);
+        else if (want == WANT_BODY && readTxt)
+            lv_label_set_text(readTxt, err);
+        else if (want == WANT_SEND && composeMsg)
+            lv_label_set_text(composeMsg, err);
+        else {
+            lv_label_set_text(countLbl, "--");
+            lv_label_set_text(statusLbl, err);
+        }
+        return;
+    }
+    switch (want) {
+    case WANT_LIST:
+        fillList();
+        break;
+    case WANT_BODY:
+        if (readTxt) {
+            const char *b = tdeck_mail_body();
+            lv_label_set_text(readTxt, (b && *b) ? b : "(no readable text in this message)");
+        }
+        break;
+    case WANT_SEND:
+        lv_label_set_text(composeMsg, "Sent");
+        lv_textarea_set_text(toArea, "");
+        lv_textarea_set_text(subjArea, "");
+        lv_textarea_set_text(bodyArea, "");
+        break;
+    default: {
         int total = -1, unseen = -1;
         tdeck_mail_counts(&total, &unseen);
         char buf[64];
@@ -190,9 +419,8 @@ extern "C" void mail_service_ui(void)
         lv_label_set_text(countLbl, buf);
         snprintf(buf, sizeof(buf), "%d messages in the inbox", total < 0 ? 0 : total);
         lv_label_set_text(statusLbl, buf);
-    } else {
-        lv_label_set_text(countLbl, "--");
-        lv_label_set_text(statusLbl, tdeck_mail_error());
+        break;
+    }
     }
 }
 
@@ -211,15 +439,19 @@ extern "C" void mail_open(void)
         lv_obj_set_size(setupBox, 320, 214);
         lv_obj_clear_flag(setupBox, LV_OBJ_FLAG_SCROLLABLE);
 
+        // ⭐ THE LAYOUT ADDS UP, ON PURPOSE. setupBox is 214 tall and every row below has an
+        // explicit height, so the total is checkable by reading it rather than by running it:
+        //   label 14 + field 32 + label 14 + field 32 + hint 50 + buttons 32 + message 32 = 206
+        // Nothing here can grow into the row beneath it.
         lv_obj_t *t1 = lv_label_create(setupBox);
         lv_label_set_text(t1, "Gmail address");
-        // (Gmail specifically - see the certificate note in onSave.)
         lv_obj_set_style_text_color(t1, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_set_pos(t1, 6, 0);
+        lv_obj_set_size(t1, 308, 14);
 
         addrArea = lv_textarea_create(setupBox);
-        lv_obj_set_pos(addrArea, 4, 18);
-        lv_obj_set_size(addrArea, 312, 34);
+        lv_obj_set_pos(addrArea, 4, 16);
+        lv_obj_set_size(addrArea, 312, 32);
         lv_textarea_set_one_line(addrArea, true);
         lv_textarea_set_max_length(addrArea, 80);
         lv_textarea_set_placeholder_text(addrArea, "you@gmail.com");
@@ -238,16 +470,17 @@ extern "C" void mail_open(void)
         lv_obj_set_style_anim_duration(addrArea, 0, LV_PART_CURSOR);
 
         lv_obj_t *t2 = lv_label_create(setupBox);
-        lv_label_set_text(t2, "App password (16 characters)");
+        lv_label_set_text(t2, "App password (16 letters)");
         lv_obj_set_style_text_color(t2, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_set_pos(t2, 6, 58);
+        lv_obj_set_pos(t2, 6, 52);
+        lv_obj_set_size(t2, 308, 14);
 
         passArea = lv_textarea_create(setupBox);
-        lv_obj_set_pos(passArea, 4, 76);
-        lv_obj_set_size(passArea, 312, 34);
+        lv_obj_set_pos(passArea, 4, 68);
+        lv_obj_set_size(passArea, 312, 32);
         lv_textarea_set_one_line(passArea, true);
         lv_textarea_set_max_length(passArea, 40);
-        lv_textarea_set_placeholder_text(passArea, "abcd efgh ijkl mnop");
+        lv_textarea_set_placeholder_text(passArea, "abcd efgh ijkl mnop (16 letters)");
         lv_obj_set_style_bg_color(passArea, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
         lv_obj_set_style_text_color(passArea, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_set_style_border_width(passArea, 0, LV_PART_MAIN);
@@ -260,23 +493,35 @@ extern "C" void mail_open(void)
         // the real exposure - a screenshot over the cable - is blocked instead.
 
         lv_obj_t *hint = lv_label_create(setupBox);
-        lv_obj_set_pos(hint, 6, 116);
-        lv_obj_set_width(hint, 308);
+        lv_obj_set_pos(hint, 6, 104);
+        // ⛔ WIDTH AND HEIGHT. A wrapping label given only a width grows downwards without
+        // limit and draws over whatever is below it - which is exactly what put this text
+        // through the Save button.
+        lv_obj_set_size(hint, 308, 50);
         lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(hint, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_label_set_text(hint, "Gmail only. Google Account > Security > App passwords - needs "
-                                "2-Step Verification on. Spaces are fine, they get stripped.");
+        // Short enough to FIT the 50px it has. A message that only fits because it is clipped
+        // is still a bug; the full explanation belongs somewhere with room for it.
+        lv_label_set_text(hint, "Not your normal password. Make a 16-letter one at\n"
+                                "myaccount.google.com/apppasswords");
 
         lv_obj_t *saveBtn = makeButton(setupBox, "Save", 0x30d158, onSave);
-        lv_obj_set_size(saveBtn, 150, 34);
-        lv_obj_set_pos(saveBtn, 4, 172);
+        lv_obj_set_size(saveBtn, 150, 32);
+        lv_obj_set_pos(saveBtn, 4, 158);
         lv_obj_t *cancelBtn = makeButton(setupBox, "Cancel", 0x3a3a3c, [](lv_event_t *) {
             lv_textarea_set_text(passArea, ""); // never leave it sitting on a screen nobody is at
             if (haveCreds())
                 showSetup(false);
         });
-        lv_obj_set_size(cancelBtn, 158, 34);
-        lv_obj_set_pos(cancelBtn, 158, 172);
+        lv_obj_set_size(cancelBtn, 158, 32);
+        lv_obj_set_pos(cancelBtn, 158, 158);
+
+        formMsg = lv_label_create(setupBox);
+        lv_obj_set_pos(formMsg, 6, 194);
+        lv_obj_set_size(formMsg, 308, 32); // fixed: an error here must not shove the form about
+        lv_label_set_long_mode(formMsg, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(formMsg, lv_color_hex(0xff9f0a), LV_PART_MAIN);
+        lv_label_set_text(formMsg, "");
 
         // ---------- status screen ----------
         statusBox = lv_obj_create(screen);
@@ -292,21 +537,166 @@ extern "C" void mail_open(void)
         lv_label_set_text(countLbl, "--");
 
         lv_obj_t *chk = makeButton(statusBox, "Check now", 0x0a84ff, onCheck);
-        lv_obj_set_size(chk, 150, 34);
-        lv_obj_set_pos(chk, 4, 60);
+        lv_obj_set_size(chk, 150, 32);
+        lv_obj_set_pos(chk, 4, 56);
         lv_obj_t *edit = makeButton(statusBox, "Account", 0x3a3a3c, onEdit);
-        lv_obj_set_size(edit, 158, 34);
-        lv_obj_set_pos(edit, 158, 60);
+        lv_obj_set_size(edit, 158, 32);
+        lv_obj_set_pos(edit, 158, 56);
+        lv_obj_t *inbx = makeButton(statusBox, "Inbox", 0x30d158, [](lv_event_t *) {
+            showView(VIEW_LIST);
+            loadPage(0);
+        });
+        lv_obj_set_size(inbx, 150, 32);
+        lv_obj_set_pos(inbx, 4, 92);
+        lv_obj_t *wr = makeButton(statusBox, "Write", 0xff9f0a, [](lv_event_t *) {
+            lv_label_set_text(composeMsg, "");
+            showView(VIEW_COMPOSE);
+        });
+        lv_obj_set_size(wr, 158, 32);
+        lv_obj_set_pos(wr, 158, 92);
 
-        statusLbl = lv_label_create(screen);
+        statusLbl = lv_label_create(statusBox);
         lv_obj_set_pos(statusLbl, 6, 132);
-        lv_obj_set_width(statusLbl, 308);
+        lv_obj_set_size(statusLbl, 308, 78); // bounded, so a long IMAP error cannot overflow
         lv_label_set_long_mode(statusLbl, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(statusLbl, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_label_set_text(statusLbl, "");
+        // ---------- inbox list ----------
+        // ⭐ TWELVE ROWS, AND THE FETCH SIZE IS ALSO TWELVE. Jake has ~7,000 messages; the page
+        // on screen and the page asked of the server are deliberately the same thing, so there
+        // is never a larger list held in memory that this one is a window onto.
+        listBox = lv_obj_create(screen);
+        lv_obj_remove_style_all(listBox);
+        lv_obj_set_pos(listBox, 0, 26);
+        lv_obj_set_size(listBox, 320, 214);
+        lv_obj_clear_flag(listBox, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(listBox, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < MAIL_ROWS; i++) {
+            lv_obj_t *l = lv_label_create(listBox);
+            lv_obj_set_pos(l, 4, i * 15);
+            // ⛔ EXPLICIT HEIGHT. These hold sender names and subjects straight off the
+            // internet, of any length. LONG_DOT with a height clips to one line; without the
+            // height it wraps and walks over the rows beneath it.
+            lv_obj_set_size(l, 306, 15);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(l, onRow, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+            rowLbl[i] = l;
+        }
+        {
+            lv_obj_t *pv = makeButton(listBox, "<", 0x3a3a3c, [](lv_event_t *) {
+                const int p = tdeck_mail_page();
+                if (p > 0)
+                    loadPage(p - 1);
+            });
+            lv_obj_set_size(pv, 44, 28);
+            lv_obj_set_pos(pv, 4, 184);
+            lv_obj_t *nx = makeButton(listBox, ">", 0x3a3a3c,
+                                      [](lv_event_t *) { loadPage(tdeck_mail_page() + 1); });
+            lv_obj_set_size(nx, 44, 28);
+            lv_obj_set_pos(nx, 272, 184);
+            lv_obj_t *bk = makeButton(listBox, "Back", 0x3a3a3c,
+                                      [](lv_event_t *) { showView(VIEW_STATUS); });
+            lv_obj_set_size(bk, 66, 28);
+            lv_obj_set_pos(bk, 54, 184);
+            pageLbl = lv_label_create(listBox);
+            lv_obj_set_pos(pageLbl, 126, 190);
+            lv_obj_set_size(pageLbl, 142, 16);
+            lv_label_set_long_mode(pageLbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(pageLbl, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(pageLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+            lv_label_set_text(pageLbl, "");
+        }
+
+        // ---------- read one message ----------
+        readBox = lv_obj_create(screen);
+        lv_obj_remove_style_all(readBox);
+        lv_obj_set_pos(readBox, 0, 26);
+        lv_obj_set_size(readBox, 320, 214);
+        lv_obj_clear_flag(readBox, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(readBox, LV_OBJ_FLAG_HIDDEN);
+        readHdr = lv_label_create(readBox);
+        lv_obj_set_pos(readHdr, 4, 0);
+        lv_obj_set_size(readHdr, 306, 30); // two lines: subject, then sender
+        lv_label_set_long_mode(readHdr, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(readHdr, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(readHdr, "");
+        {
+            lv_obj_t *sc = lv_obj_create(readBox);
+            lv_obj_set_pos(sc, 2, 32);
+            lv_obj_set_size(sc, 316, 146);
+            lv_obj_set_style_bg_color(sc, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+            lv_obj_set_style_border_width(sc, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(sc, 4, LV_PART_MAIN);
+            lv_obj_set_scroll_dir(sc, LV_DIR_VER);
+            readTxt = lv_label_create(sc);
+            // Inside a scroller the label is ALLOWED to grow - that is the point of the
+            // scroller - but its width is fixed so it wraps rather than running off the side.
+            lv_obj_set_width(readTxt, 300);
+            lv_label_set_long_mode(readTxt, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(readTxt, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(readTxt, lv_color_hex(0xffffff), LV_PART_MAIN);
+            lv_label_set_text(readTxt, "");
+            lv_obj_t *bk = makeButton(readBox, "Back to inbox", 0x3a3a3c,
+                                      [](lv_event_t *) { showView(VIEW_LIST); });
+            lv_obj_set_size(bk, 150, 28);
+            lv_obj_set_pos(bk, 4, 182);
+        }
+
+        // ---------- compose ----------
+        composeBox = lv_obj_create(screen);
+        lv_obj_remove_style_all(composeBox);
+        lv_obj_set_pos(composeBox, 0, 26);
+        lv_obj_set_size(composeBox, 320, 214);
+        lv_obj_clear_flag(composeBox, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(composeBox, LV_OBJ_FLAG_HIDDEN);
+        {
+            auto field = [&](const char *ph, int y, int h, bool oneLine) {
+                lv_obj_t *t = lv_textarea_create(composeBox);
+                lv_obj_set_pos(t, 4, y);
+                lv_obj_set_size(t, 312, h);
+                if (oneLine)
+                    lv_textarea_set_one_line(t, true);
+                lv_textarea_set_placeholder_text(t, ph);
+                lv_obj_set_style_bg_color(t, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+                lv_obj_set_style_text_color(t, lv_color_hex(0xffffff), LV_PART_MAIN);
+                lv_obj_set_style_border_width(t, 0, LV_PART_MAIN);
+                lv_obj_set_style_text_font(t, &ui_font_montserrat_12, LV_PART_MAIN);
+                lv_obj_set_style_bg_color(t, lv_color_hex(0xffffff), LV_PART_CURSOR);
+                lv_obj_set_style_bg_opa(t, LV_OPA_50, LV_PART_CURSOR);
+                lv_obj_set_style_anim_duration(t, 0, LV_PART_CURSOR);
+                if (lv_group_get_default())
+                    lv_group_add_obj(lv_group_get_default(), t);
+                return t;
+            };
+            toArea = field("To: someone@example.com", 0, 28, true);
+            subjArea = field("Subject", 32, 28, true);
+            bodyArea = field("Message", 64, 88, false);
+            lv_obj_t *sb = makeButton(composeBox, "Send", 0x30d158, onSend);
+            lv_obj_set_size(sb, 150, 30);
+            lv_obj_set_pos(sb, 4, 158);
+            lv_obj_t *cb = makeButton(composeBox, "Cancel", 0x3a3a3c,
+                                      [](lv_event_t *) { showView(VIEW_STATUS); });
+            lv_obj_set_size(cb, 158, 30);
+            lv_obj_set_pos(cb, 158, 158);
+            composeMsg = lv_label_create(composeBox);
+            lv_obj_set_pos(composeMsg, 6, 192);
+            lv_obj_set_size(composeMsg, 308, 20);
+            lv_label_set_long_mode(composeMsg, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(composeMsg, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(composeMsg, lv_color_hex(0xff9f0a), LV_PART_MAIN);
+            lv_label_set_text(composeMsg, "");
+        }
     }
 
     // First run goes straight to the form; after that, straight to the inbox count.
+    {
+        char addr[96];
+        if (savedAddress(addr, sizeof(addr)) && addrArea)
+            lv_textarea_set_text(addrArea, addr);
+    }
     showSetup(!haveCreds());
     if (lv_group_get_default() && addrArea) {
         lv_group_add_obj(lv_group_get_default(), addrArea);

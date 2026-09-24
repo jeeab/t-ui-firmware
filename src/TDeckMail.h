@@ -32,6 +32,24 @@ void tdeck_mail_counts(int *total, int *unseen);
 // Human-readable reason the last attempt failed. Never contains the password.
 const char *tdeck_mail_error(void);
 
+// ---- reading ---------------------------------------------------------------------------
+// Fetch one PAGE of inbox headers, newest first. page 0 is the newest. ⭐ Only ever one page is
+// requested from the server or held in memory - Jake's inbox has ~7,000 messages and the cost
+// here is the same as for twelve.
+bool tdeck_mail_list(int page);
+int tdeck_mail_list_count(void);  // headers actually fetched for this page
+int tdeck_mail_total(void);       // messages in the inbox
+int tdeck_mail_page(void);        // which page the last list was
+bool tdeck_mail_item(int i, unsigned *seq, const char **from, const char **subj, const char **date, bool *seen);
+
+// Fetch one message and turn it into plain text. Uses BODY.PEEK, so opening a message does NOT
+// mark it read - tapping through an inbox should not quietly clear 7,000 unread flags.
+bool tdeck_mail_read(unsigned seq);
+const char *tdeck_mail_body(void);
+
+// ---- sending ---------------------------------------------------------------------------
+bool tdeck_mail_send(const char *to, const char *subject, const char *body);
+
 // Called from loop() in main.cpp, NOT from the UI task.
 void tdeck_mail_service(void);
 

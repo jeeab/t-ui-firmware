@@ -34,6 +34,7 @@
 // while it runs, and a blocking socket read on it freezes the screen.
 // -----------------------------------------------------------------------------------------
 
+void disableBluetooth(); // ⛔ one antenna: wi-fi cannot join while BT holds the radio
 extern "C" bool tdeck_wifi_connect_now(const char *ssid, const char *psk);
 extern "C" void tdeck_wifi_disconnect_now(void);
 extern "C" bool tdeck_wifi_connected(void);
@@ -84,6 +85,8 @@ static const char kGtsRootR1[] =
 
 static const char *kImapHost = "imap.gmail.com";
 static const int kImapPort = 993;
+static const char *kSmtpHost = "smtp.gmail.com";
+static const int kSmtpPort = 465; // implicit TLS, so the same certificate check applies
 
 // ---- state, all touched only from loop() except the volatile handshake with the UI ----------
 enum MailState { MAIL_IDLE = 0, MAIL_START, MAIL_CONNECTING, MAIL_WORK, MAIL_DONE, MAIL_ERROR };
@@ -107,6 +110,32 @@ static char s_pass[64] = {0};
 // It is also the diagnostic to reach for later when mail breaks: it separates "the network or
 // the certificate is wrong" from "the login is wrong", which otherwise look identical.
 static volatile bool s_connectOnly = false;
+
+// What this session is for. One connection does one job and logs out; keeping a session open
+// between actions would mean owning a socket across the UI's lifetime and reconnecting on every
+// wi-fi blip anyway.
+enum MailOp { OP_CHECK = 0, OP_LIST, OP_READ, OP_SEND };
+static volatile int s_op = OP_CHECK;
+
+#define MAIL_PAGE 12 // rows that fit the screen; also the fetch size, deliberately the same
+typedef struct {
+    uint32_t seq;
+    bool seen;
+    char from[54];
+    char subj[74];
+    char date[18];
+} MailHdr;
+// PSRAM: a page of headers is ~1.8KB and is only touched while the inbox screen is up.
+static MailHdr *s_hdr = nullptr;
+static int s_hdrN = 0;
+static int s_page = 0;        // 0 = newest page
+static uint32_t s_readSeq = 0;
+static char *s_bodyBuf = nullptr; // PSRAM - a message body has no business in internal RAM
+static const int kBodyCap = 8192; // plenty for reading; a longer mail is truncated with a note
+static int s_bodyLen = 0;
+static char s_sendTo[96] = {0};
+static char s_sendSubj[120] = {0};
+static char *s_sendBody = nullptr;
 
 static void mailFail(const char *why)
 {
@@ -178,6 +207,161 @@ static bool imapLine(WiFiClientSecure &c, char *buf, int cap, uint32_t timeoutMs
     return false;
 }
 
+// Read exactly n bytes of an IMAP literal, keeping the first cap-1 of them. The rest is still
+// CONSUMED - leaving it in the socket would desynchronise every reply after it, which shows up
+// as unrelated commands mysteriously failing.
+static int readLiteral(WiFiClientSecure &c, int n, char *out, int cap)
+{
+    int got = 0, kept = 0;
+    uint32_t end = millis() + 15000;
+    while (got < n && (int32_t)(millis() - end) < 0) {
+        int ch = c.read();
+        if (ch < 0) {
+            if (!c.connected() && !c.available())
+                break;
+            delay(2);
+            continue;
+        }
+        got++;
+        if (kept < cap - 1)
+            out[kept++] = (char)ch;
+    }
+    if (out && cap > 0)
+        out[kept < cap ? kept : cap - 1] = 0;
+    return kept;
+}
+
+static int b64val(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;
+}
+
+static int b64decode(const char *in, int len, char *out, int cap)
+{
+    int n = 0, bits = 0, acc = 0;
+    for (int i = 0; i < len; i++) {
+        int v = b64val(in[i]);
+        if (v < 0)
+            continue;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (n < cap - 1)
+                out[n++] = (char)((acc >> bits) & 0xFF);
+        }
+    }
+    out[n] = 0;
+    return n;
+}
+
+static void b64encode(const char *in, int len, char *out, int cap)
+{
+    static const char *T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int n = 0;
+    for (int i = 0; i < len; i += 3) {
+        int a = (unsigned char)in[i];
+        int b = i + 1 < len ? (unsigned char)in[i + 1] : 0;
+        int cc = i + 2 < len ? (unsigned char)in[i + 2] : 0;
+        if (n + 4 >= cap)
+            break;
+        out[n++] = T[a >> 2];
+        out[n++] = T[((a & 3) << 4) | (b >> 4)];
+        out[n++] = i + 1 < len ? T[((b & 15) << 2) | (cc >> 6)] : '=';
+        out[n++] = i + 2 < len ? T[cc & 63] : '=';
+    }
+    out[n] = 0;
+}
+
+// ⭐ SUBJECTS ARE OFTEN MIME "ENCODED WORDS": =?UTF-8?B?...?= or =?UTF-8?Q?...?=. Without this
+// a third of an inbox reads as gibberish punctuation, which looks like a broken app rather than
+// an undecoded header. Only the two common encodings; anything else is left as-is.
+static void decodeWords(char *s)
+{
+    char out[160];
+    int o = 0;
+    const char *p = s;
+    while (*p && o < (int)sizeof(out) - 1) {
+        const char *start = strstr(p, "=?");
+        if (!start) {
+            while (*p && o < (int)sizeof(out) - 1)
+                out[o++] = *p++;
+            break;
+        }
+        while (p < start && o < (int)sizeof(out) - 1)
+            out[o++] = *p++;
+        const char *q1 = strchr(start + 2, '?');
+        if (!q1) { out[o++] = *p++; continue; }
+        const char *q2 = strchr(q1 + 1, '?');
+        if (!q2) { out[o++] = *p++; continue; }
+        const char *end = strstr(q2 + 1, "?=");
+        if (!end) { out[o++] = *p++; continue; }
+        const char enc = (char)toupper((unsigned char)q1[1]);
+        const int n = (int)(end - (q2 + 1));
+        char raw[200];
+        int rn = n < (int)sizeof(raw) - 1 ? n : (int)sizeof(raw) - 1;
+        memcpy(raw, q2 + 1, rn);
+        raw[rn] = 0;
+        char dec[200];
+        if (enc == 'B') {
+            b64decode(raw, rn, dec, sizeof(dec));
+        } else { // Q: like quoted-printable, but '_' is a space
+            int d = 0;
+            for (int i = 0; i < rn && d < (int)sizeof(dec) - 1; i++) {
+                if (raw[i] == '_') dec[d++] = ' ';
+                else if (raw[i] == '=' && i + 2 < rn) {
+                    char h[3] = {raw[i + 1], raw[i + 2], 0};
+                    dec[d++] = (char)strtol(h, nullptr, 16);
+                    i += 2;
+                } else dec[d++] = raw[i];
+            }
+            dec[d] = 0;
+        }
+        for (const char *d = dec; *d && o < (int)sizeof(out) - 1; d++)
+            out[o++] = *d;
+        p = end + 2;
+        while (*p == ' ' && p[1] == '=' && p[2] == '?') // encoded words run together
+            p++;
+    }
+    out[o] = 0;
+    strncpy(s, out, o + 1);
+}
+
+// Pull one header out of a fetched header blob, unfolding continuation lines.
+static void hdrField(const char *blob, const char *name, char *out, int cap)
+{
+    out[0] = 0;
+    const int nlen = (int)strlen(name);
+    for (const char *p = blob; *p;) {
+        if (!strncasecmp(p, name, nlen)) {
+            p += nlen;
+            while (*p == ' ' || *p == '\t')
+                p++;
+            int o = 0;
+            while (*p && o < cap - 1) {
+                if (*p == '\r') { p++; continue; }
+                if (*p == '\n') {
+                    if (p[1] == ' ' || p[1] == '\t') { p++; out[o++] = ' '; continue; } // folded
+                    break;
+                }
+                out[o++] = *p++;
+            }
+            out[o] = 0;
+            decodeWords(out);
+            return;
+        }
+        while (*p && *p != '\n')
+            p++;
+        if (*p)
+            p++;
+    }
+}
+
 // Send "<tag> <cmd>" and read until the line that starts with that tag. Returns true on OK.
 // `capture`, if given, keeps the first untagged line containing `want`, for the STATUS reply.
 static bool imapCmd(WiFiClientSecure &c, const char *tag, const char *cmd, const char *want = nullptr,
@@ -200,6 +384,369 @@ static bool imapCmd(WiFiClientSecure &c, const char *tag, const char *cmd, const
 }
 
 // One whole IMAP session, blocking, with short timeouts. Wi-Fi is already up when this runs.
+// ---- list one page of the inbox -------------------------------------------------------------
+//
+// ⭐ ASKS THE SERVER FOR A RANGE, never for everything. With 7,000 messages the difference is
+// not performance, it is whether the device survives at all: the newest twelve are sequence
+// numbers 6989..7000, the page after that 6977..6988. Memory cost is identical at any inbox size.
+static bool imapList(WiFiClientSecure &c)
+{
+    char st[400] = {0};
+    if (!imapCmd(c, "b1", "SELECT INBOX", "EXISTS", st, sizeof(st))) {
+        mailFail("could not open the inbox");
+        return false;
+    }
+    if (!s_hdr) {
+        s_hdr = (MailHdr *)heap_caps_calloc(MAIL_PAGE, sizeof(MailHdr), MALLOC_CAP_SPIRAM);
+        if (!s_hdr)
+            s_hdr = (MailHdr *)calloc(MAIL_PAGE, sizeof(MailHdr));
+        if (!s_hdr) {
+            mailFail("out of memory for the message list");
+            return false;
+        }
+    }
+    const int total = atoi(st + 2); // "* 6994 EXISTS"
+    s_total = total;
+    s_hdrN = 0;
+    if (total <= 0)
+        return true;
+
+    int hi = total - s_page * MAIL_PAGE;
+    if (hi <= 0)
+        return true; // paged past the oldest message
+    int lo = hi - MAIL_PAGE + 1;
+    if (lo < 1)
+        lo = 1;
+
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "b2 FETCH %d:%d (FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])\r\n", lo, hi);
+    c.print(cmd);
+
+    char line[420];
+    while (imapLine(c, line, sizeof(line), 12000)) {
+        if (!strncmp(line, "b2 ", 3))
+            break; // tagged response: this command is finished
+        if (line[0] != '*')
+            continue;
+        const char *brace = strrchr(line, '{');
+        if (!brace)
+            continue; // an untagged line with no literal - not one of our FETCH replies
+        const uint32_t seq = (uint32_t)atoi(line + 2);
+        const bool seen = strstr(line, "\\Seen") != nullptr;
+        char hb[560];
+        readLiteral(c, atoi(brace + 1), hb, sizeof(hb));
+        if (s_hdrN < MAIL_PAGE) {
+            MailHdr *h = &s_hdr[s_hdrN++];
+            h->seq = seq;
+            h->seen = seen;
+            hdrField(hb, "From:", h->from, sizeof(h->from));
+            hdrField(hb, "Subject:", h->subj, sizeof(h->subj));
+            hdrField(hb, "Date:", h->date, sizeof(h->date));
+            if (!h->subj[0])
+                strncpy(h->subj, "(no subject)", sizeof(h->subj) - 1);
+        }
+    }
+    // The server returns lo..hi ascending, so the newest is last. Reverse it: a mail app that
+    // shows the oldest message of the page first is simply wrong.
+    for (int i = 0, j = s_hdrN - 1; i < j; i++, j--) {
+        MailHdr t = s_hdr[i];
+        s_hdr[i] = s_hdr[j];
+        s_hdr[j] = t;
+    }
+    LOG_INFO("mail: page %d -> %d headers of %d", s_page, s_hdrN, total);
+    return true;
+}
+
+// Turn a raw RFC822 message into something readable. Handles the three cases that cover almost
+// everything: plain text, multipart with a text/plain part, and HTML-only.
+static void extractText(char *raw, int len)
+{
+    if (!s_bodyBuf)
+        return;
+    // Find the MIME boundary, if this is a multipart message.
+    char boundary[80] = {0};
+    const char *b = strcasestr(raw, "boundary=");
+    if (b) {
+        b += 9;
+        if (*b == '"')
+            b++;
+        int i = 0;
+        while (*b && *b != '"' && *b != '\r' && *b != '\n' && *b != ';' && i < (int)sizeof(boundary) - 1)
+            boundary[i++] = *b++;
+        boundary[i] = 0;
+    }
+
+    const char *text = nullptr;
+    int textLen = 0;
+    bool base64 = false, qp = false, html = false;
+    int attachments = 0;
+
+    if (boundary[0]) {
+        char sep[88];
+        snprintf(sep, sizeof(sep), "--%s", boundary);
+        char *p = raw;
+        while ((p = strstr(p, sep)) != nullptr) {
+            p += strlen(sep);
+            char *hdrEnd = strstr(p, "\r\n\r\n");
+            if (!hdrEnd)
+                break;
+            *hdrEnd = 0; // temporarily terminate this part's headers so the searches below stop
+            const bool isPlain = strcasestr(p, "text/plain") != nullptr;
+            const bool isHtml = strcasestr(p, "text/html") != nullptr;
+            const bool isB64 = strcasestr(p, "base64") != nullptr;
+            const bool isQp = strcasestr(p, "quoted-printable") != nullptr;
+            const bool isAttach = strcasestr(p, "attachment") != nullptr || strcasestr(p, "filename=") != nullptr;
+            *hdrEnd = '\r';
+            if (isAttach)
+                attachments++;
+            if (!text && (isPlain || (isHtml && !isPlain))) {
+                char *bodyStart = hdrEnd + 4;
+                char *next = strstr(bodyStart, sep);
+                text = bodyStart;
+                textLen = next ? (int)(next - bodyStart) : (int)(len - (bodyStart - raw));
+                base64 = isB64;
+                qp = isQp;
+                html = isHtml && !isPlain;
+                if (isPlain)
+                    continue; // a plain part beats a later html one, but keep counting attachments
+            }
+            p = hdrEnd + 4;
+        }
+    }
+    if (!text) {
+        // Not multipart (or nothing matched): the body is whatever follows the blank line.
+        char *bodyStart = strstr(raw, "\r\n\r\n");
+        text = bodyStart ? bodyStart + 4 : raw;
+        textLen = len - (int)(text - raw);
+        base64 = strcasestr(raw, "base64") != nullptr;
+        qp = strcasestr(raw, "quoted-printable") != nullptr;
+        html = strcasestr(raw, "text/html") != nullptr;
+    }
+    if (textLen < 0)
+        textLen = 0;
+
+    int o = 0;
+    if (base64) {
+        o = b64decode(text, textLen, s_bodyBuf, kBodyCap);
+    } else if (qp) {
+        for (int i = 0; i < textLen && o < kBodyCap - 1; i++) {
+            if (text[i] == '=' && i + 1 < textLen && (text[i + 1] == '\r' || text[i + 1] == '\n')) {
+                while (i + 1 < textLen && (text[i + 1] == '\r' || text[i + 1] == '\n'))
+                    i++;
+                continue; // soft line break: the '=' and the newline both vanish
+            }
+            if (text[i] == '=' && i + 2 < textLen) {
+                char h[3] = {text[i + 1], text[i + 2], 0};
+                s_bodyBuf[o++] = (char)strtol(h, nullptr, 16);
+                i += 2;
+                continue;
+            }
+            s_bodyBuf[o++] = text[i];
+        }
+    } else {
+        for (int i = 0; i < textLen && o < kBodyCap - 1; i++)
+            s_bodyBuf[o++] = text[i];
+    }
+    s_bodyBuf[o] = 0;
+
+    if (html) {
+        // Crudely de-tag. Jake asked for "simple text" and a real renderer is not on the table;
+        // this at least turns a marketing email into readable sentences rather than markup.
+        int w = 0;
+        bool in = false;
+        for (int i = 0; s_bodyBuf[i]; i++) {
+            if (s_bodyBuf[i] == '<') { in = true; continue; }
+            if (s_bodyBuf[i] == '>') { in = false; s_bodyBuf[w++] = ' '; continue; }
+            if (!in)
+                s_bodyBuf[w++] = s_bodyBuf[i];
+        }
+        s_bodyBuf[w] = 0;
+        o = w;
+    }
+    if (attachments && o < kBodyCap - 40)
+        o += snprintf(s_bodyBuf + o, kBodyCap - o, "\n\n[%d attachment%s - not viewable here]",
+                      attachments, attachments == 1 ? "" : "s");
+    s_bodyLen = o;
+}
+
+static bool imapReadOne(WiFiClientSecure &c)
+{
+    if (!imapCmd(c, "c1", "SELECT INBOX")) {
+        mailFail("could not open the inbox");
+        return false;
+    }
+    if (!s_bodyBuf) {
+        s_bodyBuf = (char *)heap_caps_malloc(kBodyCap, MALLOC_CAP_SPIRAM);
+        if (!s_bodyBuf)
+            s_bodyBuf = (char *)malloc(kBodyCap);
+        if (!s_bodyBuf) {
+            mailFail("out of memory for the message");
+            return false;
+        }
+    }
+    // BODY.PEEK, not BODY: PEEK does not set the \Seen flag. Opening a message on the T-Deck
+    // should not silently mark 7,000 unread emails as read one careless tap at a time.
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "c2 FETCH %u (BODY.PEEK[])\r\n", (unsigned)s_readSeq);
+    c.print(cmd);
+
+    char line[420];
+    bool got = false;
+    while (imapLine(c, line, sizeof(line), 15000)) {
+        if (!strncmp(line, "c2 ", 3))
+            break;
+        if (line[0] != '*' || got)
+            continue;
+        const char *brace = strrchr(line, '{');
+        if (!brace)
+            continue;
+        const int n = atoi(brace + 1);
+        char *raw = (char *)heap_caps_malloc(kBodyCap, MALLOC_CAP_SPIRAM);
+        if (!raw) {
+            mailFail("out of memory for the message");
+            return false;
+        }
+        const int kept = readLiteral(c, n, raw, kBodyCap);
+        extractText(raw, kept);
+        heap_caps_free(raw);
+        if (n > kBodyCap)
+            LOG_INFO("mail: message %u is %d bytes, showing the first %d", (unsigned)s_readSeq, n, kBodyCap);
+        got = true;
+    }
+    if (!got) {
+        mailFail("could not read that message");
+        return false;
+    }
+    LOG_INFO("mail: read message %u, %d chars of text", (unsigned)s_readSeq, s_bodyLen);
+    return true;
+}
+
+// ---- sending -------------------------------------------------------------------------------
+// A separate connection to a separate host, so it does not share imapCheck's session. Same
+// certificate: smtp.gmail.com chains to the same Google root as imap.gmail.com.
+static bool smtpReply(WiFiClientSecure &c, int want)
+{
+    // SMTP replies can be multi-line: "250-SIZE" then "250-8BITMIME" then "250 HELP". Only the
+    // line with a SPACE after the code is the last one - stopping at the first line makes every
+    // command after EHLO read the wrong reply.
+    char line[300];
+    for (int guard = 0; guard < 40; guard++) {
+        if (!imapLine(c, line, sizeof(line), 12000))
+            return false;
+        if (strlen(line) < 4)
+            continue;
+        if (line[3] == ' ') {
+            const int code = atoi(line);
+            if (code != want)
+                LOG_INFO("smtp: expected %d, got: %.80s", want, line);
+            return code == want;
+        }
+    }
+    return false;
+}
+
+static bool smtpSend(void)
+{
+    if (!loadCreds())
+        return false;
+    tdeck_tls_reserve_release();
+    bool ok = false;
+    WiFiClientSecure *c = new WiFiClientSecure();
+    if (!c) {
+        mailFail("out of memory for the TLS client");
+        tdeck_tls_reserve_take();
+        return false;
+    }
+    c->setCACert(kGtsRootR1);
+    c->setTimeout(10000);
+    LOG_INFO("smtp: connecting to %s:%d", kSmtpHost, kSmtpPort);
+    if (!c->connect(kSmtpHost, kSmtpPort)) {
+        mailFail("could not reach the mail server");
+        goto done;
+    }
+    if (!smtpReply(*c, 220)) {
+        mailFail("no greeting from the mail server");
+        goto done;
+    }
+    c->print("EHLO tdeck\r\n");
+    if (!smtpReply(*c, 250)) {
+        mailFail("mail server refused EHLO");
+        goto done;
+    }
+    {
+        char b64[160];
+        c->print("AUTH LOGIN\r\n");
+        if (!smtpReply(*c, 334)) {
+            mailFail("mail server refused AUTH");
+            goto done;
+        }
+        b64encode(s_user, (int)strlen(s_user), b64, sizeof(b64));
+        c->printf("%s\r\n", b64);
+        if (!smtpReply(*c, 334)) {
+            mailFail("mail server rejected the address");
+            goto done;
+        }
+        // ⛔ The password goes over the wire here and NOWHERE ELSE. Not logged, and the base64
+        // of it is wiped off the stack immediately - it is trivially reversible, so it is just
+        // the password in another coat.
+        b64encode(s_pass, (int)strlen(s_pass), b64, sizeof(b64));
+        c->printf("%s\r\n", b64);
+        const bool authed = smtpReply(*c, 235);
+        memset(b64, 0, sizeof(b64));
+        if (!authed) {
+            mailFail("login rejected when sending");
+            goto done;
+        }
+    }
+    c->printf("MAIL FROM:<%s>\r\n", s_user);
+    if (!smtpReply(*c, 250)) {
+        mailFail("sender rejected");
+        goto done;
+    }
+    c->printf("RCPT TO:<%s>\r\n", s_sendTo);
+    if (!smtpReply(*c, 250)) {
+        mailFail("that address was rejected");
+        goto done;
+    }
+    c->print("DATA\r\n");
+    if (!smtpReply(*c, 354)) {
+        mailFail("server would not accept the message");
+        goto done;
+    }
+    c->printf("From: <%s>\r\n", s_user);
+    c->printf("To: <%s>\r\n", s_sendTo);
+    c->printf("Subject: %s\r\n", s_sendSubj);
+    c->print("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+    if (s_sendBody) {
+        // ⚠️ DOT-STUFFING. A line consisting of a single "." ends the message, so a body
+        // containing one would truncate the mail and leave the rest as garbage commands. Any
+        // line starting with "." gets a second one, which the receiver strips. Rare, and
+        // silently corrupting when missed.
+        const char *p = s_sendBody;
+        bool lineStart = true;
+        while (*p) {
+            if (lineStart && *p == '.')
+                c->print('.');
+            c->print(*p);
+            lineStart = (*p == '\n');
+            p++;
+        }
+    }
+    c->print("\r\n.\r\n");
+    if (!smtpReply(*c, 250)) {
+        mailFail("the server did not accept the message");
+        goto done;
+    }
+    c->print("QUIT\r\n");
+    ok = true;
+    LOG_INFO("smtp: sent to %s", s_sendTo);
+done:
+    c->stop();
+    delete c;
+    tdeck_tls_reserve_take();
+    return ok;
+}
+
 static bool imapCheck(void)
 {
     // Same reserve the HTTPS path uses, for the same reason and with the same ordering: release
@@ -255,21 +802,28 @@ static bool imapCheck(void)
         }
         LOG_INFO("mail: logged in");
 
-        // STATUS rather than SELECT: one round trip, gives both numbers, and does not mark
-        // anything read. RFC 3501 says not to STATUS the mailbox you have SELECTed - we have
-        // selected nothing, so this is the clean order.
-        char st[320] = {0};
-        if (!imapCmd(*c, "a2", "STATUS INBOX (MESSAGES UNSEEN)", "STATUS", st, sizeof(st))) {
-            mailFail("STATUS failed");
-            goto done;
+        // One session, one job, then log out.
+        if (s_op == OP_LIST) {
+            ok = imapList(*c);
+        } else if (s_op == OP_READ) {
+            ok = imapReadOne(*c);
+        } else {
+            // STATUS rather than SELECT: one round trip, gives both numbers, and does not mark
+            // anything read. RFC 3501 says not to STATUS the mailbox you have SELECTed - we have
+            // selected nothing, so this is the clean order.
+            char st[320] = {0};
+            if (!imapCmd(*c, "a2", "STATUS INBOX (MESSAGES UNSEEN)", "STATUS", st, sizeof(st))) {
+                mailFail("STATUS failed");
+                goto done;
+            }
+            const char *m = strstr(st, "MESSAGES ");
+            const char *u = strstr(st, "UNSEEN ");
+            s_total = m ? atoi(m + 9) : -1;
+            s_unseen = u ? atoi(u + 7) : -1;
+            ok = true;
+            LOG_INFO("mail: INBOX total=%d unseen=%d", s_total, s_unseen);
         }
-        const char *m = strstr(st, "MESSAGES ");
-        const char *u = strstr(st, "UNSEEN ");
-        s_total = m ? atoi(m + 9) : -1;
-        s_unseen = u ? atoi(u + 7) : -1;
-        imapCmd(*c, "a3", "LOGOUT");
-        ok = true;
-        LOG_INFO("mail: INBOX total=%d unseen=%d", s_total, s_unseen);
+        imapCmd(*c, "a9", "LOGOUT");
     }
 done:
     c->stop();
@@ -294,6 +848,7 @@ extern "C" bool tdeck_mail_check(void)
         return false;
     s_err[0] = 0;
     s_connectOnly = false;
+    s_op = OP_CHECK;
     s_pending = true;
     return true;
 }
@@ -304,6 +859,90 @@ extern "C" bool tdeck_mail_connect_test(void)
         return false;
     s_err[0] = 0;
     s_connectOnly = true;
+    s_op = OP_CHECK;
+    s_pending = true;
+    return true;
+}
+
+extern "C" bool tdeck_mail_list(int page)
+{
+    if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
+        return false;
+    s_err[0] = 0;
+    s_connectOnly = false;
+    s_op = OP_LIST;
+    s_page = page < 0 ? 0 : page;
+    s_pending = true;
+    return true;
+}
+
+extern "C" int tdeck_mail_list_count(void)
+{
+    return s_hdrN;
+}
+
+extern "C" int tdeck_mail_total(void)
+{
+    return s_total;
+}
+
+extern "C" int tdeck_mail_page(void)
+{
+    return s_page;
+}
+
+extern "C" bool tdeck_mail_item(int i, unsigned *seq, const char **from, const char **subj, const char **date,
+                                bool *seen)
+{
+    if (!s_hdr || i < 0 || i >= s_hdrN)
+        return false;
+    if (seq)
+        *seq = s_hdr[i].seq;
+    if (from)
+        *from = s_hdr[i].from;
+    if (subj)
+        *subj = s_hdr[i].subj;
+    if (date)
+        *date = s_hdr[i].date;
+    if (seen)
+        *seen = s_hdr[i].seen;
+    return true;
+}
+
+extern "C" bool tdeck_mail_read(unsigned seq)
+{
+    if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
+        return false;
+    s_err[0] = 0;
+    s_connectOnly = false;
+    s_op = OP_READ;
+    s_readSeq = seq;
+    s_bodyLen = 0;
+    s_pending = true;
+    return true;
+}
+
+extern "C" const char *tdeck_mail_body(void)
+{
+    return (s_bodyBuf && s_bodyLen) ? s_bodyBuf : "";
+}
+
+extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char *body)
+{
+    if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
+        return false;
+    if (!to || !strchr(to, '@'))
+        return false;
+    s_err[0] = 0;
+    s_connectOnly = false;
+    s_op = OP_SEND;
+    strncpy(s_sendTo, to, sizeof(s_sendTo) - 1);
+    s_sendTo[sizeof(s_sendTo) - 1] = 0;
+    strncpy(s_sendSubj, subject ? subject : "", sizeof(s_sendSubj) - 1);
+    s_sendSubj[sizeof(s_sendSubj) - 1] = 0;
+    if (s_sendBody)
+        free(s_sendBody);
+    s_sendBody = strdup(body ? body : "");
     s_pending = true;
     return true;
 }
@@ -347,6 +986,20 @@ extern "C" void tdeck_mail_service(void)
             s_state = MAIL_WORK;
             break;
         }
+        // ⛔ DROP BLUETOOTH FIRST. One antenna - wi-fi will not join while BT has the radio, and
+        // the only symptom is a 15-second timeout and "wi-fi did not connect", which reads like a
+        // router problem. TDeckNet does this for its own fetches; mail did not, so mail worked
+        // ONLY when something else (Weather, Gemini) had already torn BT down. Latched, because
+        // repeatedly deinit-ing an already-down stack is a place double-frees hide. BT stays down
+        // until the next reboot either way - the same trade Jake already accepted for Gemini.
+        {
+            static bool s_btDown = false;
+            if (!s_btDown) {
+                LOG_INFO("mail: dropping Bluetooth so wi-fi can have the radio");
+                disableBluetooth();
+                s_btDown = true;
+            }
+        }
         if (!tdeck_wifi_connect_now(config.network.wifi_ssid, config.network.wifi_psk)) {
             mailFail("no wi-fi configured");
             break;
@@ -368,7 +1021,8 @@ extern "C" void tdeck_mail_service(void)
         break;
     }
     case MAIL_WORK: {
-        bool ok = imapCheck();
+        // Sending talks to a different host entirely, so it does not go through the IMAP session.
+        bool ok = (s_op == OP_SEND) ? smtpSend() : imapCheck();
         if (s_ownWifi) {
             tdeck_wifi_disconnect_now();
             s_ownWifi = false;
@@ -388,6 +1042,14 @@ extern "C" void tdeck_mail_service(void)
 extern "C" bool tdeck_mail_check(void) { return false; }
 extern "C" bool tdeck_mail_connect_test(void) { return false; }
 extern "C" void tdeck_mail_forget_creds(void) {}
+extern "C" bool tdeck_mail_list(int) { return false; }
+extern "C" int tdeck_mail_list_count(void) { return 0; }
+extern "C" int tdeck_mail_total(void) { return 0; }
+extern "C" int tdeck_mail_page(void) { return 0; }
+extern "C" bool tdeck_mail_item(int, unsigned *, const char **, const char **, const char **, bool *) { return false; }
+extern "C" bool tdeck_mail_read(unsigned) { return false; }
+extern "C" const char *tdeck_mail_body(void) { return ""; }
+extern "C" bool tdeck_mail_send(const char *, const char *, const char *) { return false; }
 extern "C" int tdeck_mail_poll(void) { return -1; }
 extern "C" void tdeck_mail_counts(int *t, int *u)
 {

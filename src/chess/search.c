@@ -186,6 +186,12 @@ static Move *s_moveStack = NULL;
 // device booting properly. Allocated from the same PSRAM block as everything else now.
 static int16_t (*s_history)[128]; // [128][128], int16 is ample for a move-ordering score
 
+// ⛔ 4KB of internal RAM for a list of position hashes - cold, and touched once per move.
+// Internal RAM is the scarce thing on this device and the TLS handshake needs 34KB of it
+// CONTIGUOUS; every static kilobyte here is one the radio and wi-fi cannot have.
+static uint64_t *s_gameHist = NULL;
+static int s_gameHistN = 0;
+
 #define PLY_LIST(ply) (s_moveStack + (size_t)(ply) * MAX_MOVES)
 
 void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes)
@@ -216,6 +222,7 @@ void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes
                                    : calloc(plies * MAX_MOVES, sizeof(Move)));
     s_history = (int16_t(*)[128])(allocFn ? allocFn(128UL * 128UL * sizeof(int16_t))
                                           : calloc(128UL * 128UL, sizeof(int16_t)));
+    s_gameHist = (uint64_t *)(allocFn ? allocFn(512UL * sizeof(uint64_t)) : calloc(512UL, sizeof(uint64_t)));
     if (s_history)
         memset(s_history, 0, 128UL * 128UL * sizeof(int16_t));
     // The rules half needs an allocator too, for its Zobrist tables.
@@ -229,14 +236,12 @@ static volatile bool s_abort;
 static bool s_timeUp;
 static SearchInfo s_info;
 static Move s_killers[MAX_PLY][2];
-static uint64_t s_gameHist[512];
-static int s_gameHistN = 0;
 
 void search_stop(void) { s_abort = true; }
 void search_history_clear(void) { s_gameHistN = 0; }
 void search_history_push(uint64_t h)
 {
-    if (s_gameHistN < 512)
+    if (s_gameHist && s_gameHistN < 512)
         s_gameHist[s_gameHistN++] = h;
 }
 void search_history_pop(void)
@@ -257,6 +262,8 @@ static bool isRepetition(const Board *b)
     // Caught by the search test: it reported depth 30 reached with ZERO nodes searched, and the
     // engine playing the first move in the list every time. A plausible-looking off-by-one that
     // silently turned the whole search off.
+    if (!s_gameHist)
+        return false;
     for (int i = s_gameHistN - 2; i >= 0 && i >= s_gameHistN - b->halfmove - 1; i--)
         if (s_gameHist[i] == b->hash)
             return true;
@@ -541,7 +548,9 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     s_deadline = start + budget;
 
     // Root scores are kept so the weak levels can choose a slightly-worse move on purpose.
-    static int16_t rootScore[MAX_MOVES]; // int16: a centipawn score never needs more
+    static int16_t *rootScore = NULL;
+    if (!rootScore)
+        rootScore = (int16_t *)((char *)PLY_LIST(MAX_PLY + 4)); // a spare slot, reused as scores
     Move *rootMove = PLY_LIST(MAX_PLY + 5); // borrow a reserved slot rather than 1.5KB of .bss
     int rootN = 0;
     int completedDepth = 0, bestScore = 0;
@@ -549,7 +558,7 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     for (int depth = 1; depth <= cfg->depth; depth++) {
         int alpha = -INF, localBest = -INF;
         Move localBestMove = list[0];
-        static int16_t scores[MAX_MOVES];
+        int16_t *scores = (int16_t *)((char *)PLY_LIST(MAX_PLY + 4) + MAX_MOVES * sizeof(int16_t));
         Move *order = PLY_LIST(MAX_PLY + 7);
         int m = chess_gen_moves(b, order);
         scoreMoves(b, order, m, 0, completedDepth ? &rootMove[0] : NULL);
