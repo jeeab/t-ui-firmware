@@ -56,6 +56,11 @@ void search_history_pop(void);
 // Static evaluation, centipawns, positive = good for the side to move. Exposed for tests.
 int eval_position(const Board *b);
 
+// Free everything search_init() allocated - over 1.2MB of PSRAM. Safe only when no search is
+// running; search_init() reallocates on next use. The game itself is saved to a file, so all of
+// this is a rebuildable cache.
+void search_release(void);
+
 // Abort the current search from another thread/task. On the device the UI sets this so a long
 // think can be cancelled by the user rather than freezing the app.
 void search_stop(void);

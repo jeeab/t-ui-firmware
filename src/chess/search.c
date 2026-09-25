@@ -243,6 +243,44 @@ static bool s_timeUp;
 static SearchInfo s_info;
 
 void search_stop(void) { s_abort = true; }
+
+// ⭐ GIVE THE TABLES BACK. Measured on the device: opening chess takes 1,250,764 bytes of PSRAM
+// - a 1MB transposition table, a 96KB move stack, a 32KB history table - and before this it was
+// never returned. Half the free PSRAM on the device, held for the rest of the session because
+// somebody looked at a chessboard once, when the map tile cache wants up to 1.5MB of the same
+// pool.
+//
+// This is only safe because the GAME does not live here: the position is written to /chess.fen
+// after every move, so everything below is a cache that can be rebuilt. search_init() reallocates
+// on the next use and the board is reloaded from the file.
+//
+// ⛔ THE SEARCH MUST NOT BE RUNNING. Freeing the move stack from under a live search would be a
+// use-after-free on another task. The caller checks.
+void search_release(void)
+{
+    if (s_tt) {
+        free(s_tt);
+        s_tt = NULL;
+        s_ttCount = 0;
+    }
+    if (s_moveStack) {
+        free(s_moveStack);
+        s_moveStack = NULL;
+    }
+    if (s_history) {
+        free(s_history);
+        s_history = NULL;
+    }
+    if (s_gameHist) {
+        free(s_gameHist);
+        s_gameHist = NULL;
+        s_gameHistN = 0;
+    }
+    if (s_killers) {
+        free(s_killers);
+        s_killers = NULL;
+    }
+}
 void search_history_clear(void) { s_gameHistN = 0; }
 void search_history_push(uint64_t h)
 {

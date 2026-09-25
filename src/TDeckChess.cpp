@@ -261,10 +261,22 @@ bool tdeck_chess_request_engine(void)
 // Free the thinking task when the app is put away. Only safe when it is idle.
 extern "C" void tdeck_chess_release(void)
 {
-    if (s_thinking || !s_task)
-        return;
-    vTaskDelete(s_task);
-    s_task = nullptr;
+    if (s_thinking)
+        return; // never tear down under a live search
+    if (s_task) {
+        vTaskDelete(s_task);
+        s_task = nullptr;
+    }
+    // ⭐ AND HAND BACK THE 1.25MB OF PSRAM. Jake asked the right question - "if I close chess is
+    // it always in ram?" - and it was: measured 2,505,728 bytes free before opening chess and
+    // 1,254,964 after, never recovered. The tables are a CACHE; the game is on the SD card in
+    // /chess.fen, so throwing them away loses nothing. ensureInit() rebuilds them and reloads
+    // the position on the next open.
+    if (s_ready) {
+        search_release();
+        s_ready = false;
+        s_undoN = 0; // the undo stack described a position that is about to be reloaded from file
+    }
 }
 
 extern "C" unsigned tdeck_chess_stack_free(void)
