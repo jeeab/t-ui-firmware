@@ -4264,16 +4264,3 @@ CONFIG_ARDUINO_SELECTIVE_SimpleBLE=n
 CONFIG_ARDUINO_SELECTIVE_RainMaker=n
 CONFIG_ARDUINO_SELECTIVE_OpenThread=n
 CONFIG_ARDUINO_SELECTIVE_Insights=n
-
-# ---- TLS memory: DO NOT BOTHER TRYING THIS HERE --------------------------------------------
-# ⛔ mbedTLS in this build is a PREBUILT STATIC LIBRARY that ships with the Arduino framework
-# (packages/framework-arduinoespressif32-libs/esp32/lib/libmbedtls.a). Its record buffers -
-# 16KB in and 16KB out, which is why a handshake needs ~34KB of CONTIGUOUS internal RAM - are
-# baked into that .a. Setting CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN here, or even in the generated
-# sdkconfig.t-deck-tft, changes NOTHING: tried both on 2026-09-24, and each build finished in
-# two minutes without recompiling mbedtls at all.
-#
-# Halving the outbound buffer really would fix the "(-32512) SSL - Memory allocation failed"
-# that has broken Get Apps, Weather and mail - but it needs ESP-IDF built from source, which is
-# a much larger change than it is worth for this. The lever that DOES work from here is the
-# contiguous block tdeck_tls_reserve_init() holds back at boot; see src/TDeckNet.cpp.

@@ -48,7 +48,7 @@ static lv_obj_t *setupBox = nullptr;
 static lv_obj_t *statusBox = nullptr;
 static bool checking = false;
 
-#define MAIL_ROWS 12
+#define MAIL_ROWS 8 // matches MAIL_PAGE in TDeckMail.cpp: one fetch, one screen
 static lv_obj_t *listBox = nullptr, *readBox = nullptr, *composeBox = nullptr;
 static lv_obj_t *gateBox = nullptr, *gateWho = nullptr, *removeBtn = nullptr, *removeLbl = nullptr;
 static lv_obj_t *infoBox = nullptr;
@@ -676,6 +676,14 @@ extern "C" void mail_open(void)
         lv_obj_set_style_bg_color(addrArea, lv_color_hex(0xffffff), LV_PART_CURSOR);
         lv_obj_set_style_bg_opa(addrArea, LV_OPA_50, LV_PART_CURSOR);
         lv_obj_set_style_anim_duration(addrArea, 0, LV_PART_CURSOR);
+        // ⛔ AND DELETE THE ANIMATION THAT ALREADY EXISTS. lv_textarea_create() starts a
+        // blinking cursor during construction using the DEFAULT time, so setting the duration to
+        // zero above does not stop it - start_cursor_blink only re-reads that on focus, or on a
+        // style change delivered to the label child. An active LVGL animation then forces a
+        // refresh EVERY FRAME: measured 17-18 fps and 124-280 KB/s pushed while sitting idle,
+        // against 2 fps once it is gone. Any later focus re-runs the check, finds the zero and
+        // deletes it itself, so this one call is all that is needed.
+        lv_anim_delete(addrArea, nullptr);
 
         lv_obj_t *t2 = lv_label_create(setupBox);
         lv_label_set_text(t2, "App password (16 letters)");
@@ -695,6 +703,7 @@ extern "C" void mail_open(void)
         lv_obj_set_style_bg_color(passArea, lv_color_hex(0xffffff), LV_PART_CURSOR);
         lv_obj_set_style_bg_opa(passArea, LV_OPA_50, LV_PART_CURSOR);
         lv_obj_set_style_anim_duration(passArea, 0, LV_PART_CURSOR);
+        lv_anim_delete(passArea, nullptr);
         // ⚠️ DELIBERATELY NOT MASKED. It is a 16-character random string typed on a thumb
         // keyboard; hiding it guarantees typos that surface later as "login rejected" with no
         // way to tell a wrong character from a wrong setting. The screen is in your hand, and
@@ -781,11 +790,11 @@ extern "C" void mail_open(void)
         lv_obj_add_flag(listBox, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < MAIL_ROWS; i++) {
             lv_obj_t *l = lv_label_create(listBox);
-            lv_obj_set_pos(l, 4, i * 15);
+            lv_obj_set_pos(l, 4, i * 20);
             // ⛔ EXPLICIT HEIGHT. These hold sender names and subjects straight off the
             // internet, of any length. LONG_DOT with a height clips to one line; without the
             // height it wraps and walks over the rows beneath it.
-            lv_obj_set_size(l, 306, 15);
+            lv_obj_set_size(l, 306, 20);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
             lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
@@ -886,6 +895,7 @@ extern "C" void mail_open(void)
                 lv_obj_set_style_bg_color(t, lv_color_hex(0xffffff), LV_PART_CURSOR);
                 lv_obj_set_style_bg_opa(t, LV_OPA_50, LV_PART_CURSOR);
                 lv_obj_set_style_anim_duration(t, 0, LV_PART_CURSOR);
+                lv_anim_delete(t, nullptr);
                 if (lv_group_get_default())
                     lv_group_add_obj(lv_group_get_default(), t);
                 return t;

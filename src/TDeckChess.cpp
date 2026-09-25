@@ -207,12 +207,16 @@ bool tdeck_chess_thinking(void)
     return s_thinking;
 }
 
+extern "C" unsigned tdeck_chess_stack_free(void); // defined below; the task logs it each search
+
 static void chessTask(void *)
 {
     for (;;) {
         xSemaphoreTake(s_go, portMAX_DELAY);
         Move m;
         const bool ok = search_best_move(&s_searchBoard, (ChessLevel)s_level, kThinkMs, &m);
+        // Right-size the stack from evidence rather than from my guess of 10KB.
+        LOG_INFO("[CHESS] search done, stack headroom %u bytes", (unsigned)tdeck_chess_stack_free());
         s_result = m;
         s_applyPending = ok;
         s_thinking = false; // the service on the main loop picks it up from here
@@ -235,7 +239,13 @@ bool tdeck_chess_request_engine(void)
         // 10KB. The move lists live in PSRAM now (see search.c), so the search itself uses very
         // little stack - but "very little" is worth measuring rather than assuming, and
         // tdeck_chess_stack_free() reports the high-water mark.
-        if (xTaskCreate(chessTask, "chess", 10240, nullptr, 1, &s_task) != pdPASS) {
+        // ⛔ PINNED TO CORE 1, AWAY FROM THE DISPLAY. Jake: "having chess open is lagging hard,
+        // maybe froze my device". xTaskCreate leaves a task UNPINNED, so this CPU-bound search
+        // was free to land on core 0 - where the "tft" task lives at the SAME priority 1. Two
+        // equal-priority tasks on one core time-slice, so the UI got half the CPU for ten solid
+        // seconds. That is the lag, and on a screen already asked for 40fps it reads as a freeze.
+        // Core 1 is the Arduino loop's core, which spends most of its time waiting.
+        if (xTaskCreatePinnedToCore(chessTask, "chess", 10240, nullptr, 1, &s_task, 1) != pdPASS) {
             s_task = nullptr;
             return false;
         }

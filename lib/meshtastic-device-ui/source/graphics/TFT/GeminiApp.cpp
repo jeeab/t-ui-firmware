@@ -191,6 +191,14 @@ extern "C" void gemini_open(void)
         lv_obj_set_style_bg_color(askArea, lv_color_hex(0xffffff), LV_PART_CURSOR);
         lv_obj_set_style_bg_opa(askArea, LV_OPA_50, LV_PART_CURSOR);
         lv_obj_set_style_anim_duration(askArea, 0, LV_PART_CURSOR);
+        // ⛔ AND DELETE THE ANIMATION THAT ALREADY EXISTS. lv_textarea_create() starts a
+        // blinking cursor during construction using the DEFAULT time, so setting the duration to
+        // zero above does not stop it - start_cursor_blink only re-reads that on focus, or on a
+        // style change delivered to the label child. An active LVGL animation then forces a
+        // refresh EVERY FRAME: measured 17-18 fps and 124-280 KB/s pushed while sitting idle,
+        // against 2 fps once it is gone. Any later focus re-runs the check, finds the zero and
+        // deletes it itself, so this one call is all that is needed.
+        lv_anim_delete(askArea, nullptr);
         if (lv_group_get_default())
             lv_group_add_obj(lv_group_get_default(), askArea);
         // Enter asks, rather than inserting a newline nobody wants in a one-line question.

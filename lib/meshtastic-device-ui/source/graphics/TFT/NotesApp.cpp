@@ -395,6 +395,14 @@ void buildEditScreen(void)
     lv_obj_set_style_bg_color(titleArea, lv_color_hex(0xffffff), LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(titleArea, LV_OPA_50, LV_PART_CURSOR);
     lv_obj_set_style_anim_duration(titleArea, 0, LV_PART_CURSOR);
+    // ⛔ AND DELETE THE ANIMATION THAT ALREADY EXISTS. lv_textarea_create() starts a
+    // blinking cursor during construction using the DEFAULT time, so setting the duration to
+    // zero above does not stop it - start_cursor_blink only re-reads that on focus, or on a
+    // style change delivered to the label child. An active LVGL animation then forces a
+    // refresh EVERY FRAME: measured 17-18 fps and 124-280 KB/s pushed while sitting idle,
+    // against 2 fps once it is gone. Any later focus re-runs the check, finds the zero and
+    // deletes it itself, so this one call is all that is needed.
+    lv_anim_delete(titleArea, nullptr);
     lv_textarea_set_max_length(titleArea, 40);
     lv_textarea_set_placeholder_text(titleArea, "Title");
     if (lv_group_get_default())
@@ -433,6 +441,7 @@ void buildEditScreen(void)
     lv_obj_set_style_bg_color(editArea, lv_color_hex(0xffffff), LV_PART_CURSOR);
     lv_obj_set_style_bg_opa(editArea, LV_OPA_50, LV_PART_CURSOR);
     lv_obj_set_style_anim_duration(editArea, 0, LV_PART_CURSOR);
+    lv_anim_delete(editArea, nullptr);
     lv_textarea_set_max_length(editArea, kMaxNoteBytes);
     lv_textarea_set_placeholder_text(editArea, "Start typing on the keyboard...");
     if (lv_group_get_default())

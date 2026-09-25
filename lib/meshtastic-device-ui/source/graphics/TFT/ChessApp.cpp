@@ -81,6 +81,13 @@ void showMenu(bool on);
 
 int sqAt(int file, int rank) { return rank * 8 + file; }
 
+// ⭐ ONLY TOUCH WHAT CHANGED. Setting an LVGL style invalidates the object whether or not the
+// value actually differs, so the first version repainted all 128 objects - the whole screen -
+// on every single tap. Remembering the last colour and piece per square turns a full redraw
+// into two or three squares, which is what a chess move actually changes.
+uint32_t lastColour[64] = {0};
+uint16_t lastPiece[64] = {0xFFFF};
+
 void refreshBoard(void)
 {
     for (int i = 0; i < 64; i++) {
@@ -94,9 +101,15 @@ void refreshBoard(void)
         uint32_t c = lightSq ? kLight : kDark;
         if (lit || isDest)
             c = lightSq ? kLightSel : kDarkSel;
-        lv_obj_set_style_bg_color(sqObj[i], lv_color_hex(c), LV_PART_MAIN);
+        if (c != lastColour[i]) {
+            lastColour[i] = c;
+            lv_obj_set_style_bg_color(sqObj[i], lv_color_hex(c), LV_PART_MAIN);
+        }
 
         const unsigned char pc = tdeck_chess_piece_at(i);
+        if (pc == lastPiece[i])
+            continue; // this square is already showing exactly this
+        lastPiece[i] = pc;
         if (!pc) {
             lv_obj_add_flag(pcLbl[i], LV_OBJ_FLAG_HIDDEN);
             continue;
@@ -330,6 +343,12 @@ extern "C" void chess_open(void)
     }
     selected = -1;
     destN = 0;
+    // ⛔ The cache describes objects that no longer exist after a teardown. Clearing it forces
+    // the first paint to actually draw, instead of skipping every square as "unchanged".
+    for (int i = 0; i < 64; i++) {
+        lastColour[i] = 0;
+        lastPiece[i] = 0xFFFF;
+    }
     showMenu(false);
     refreshBoard();
     lv_screen_load(screen);

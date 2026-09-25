@@ -126,10 +126,23 @@ void tui_statusbar_tick(void)
         snprintf(buf, sizeof(buf), "1 msg");
     else
         snprintf(buf, sizeof(buf), "%d msgs", unread);
-    // lv_label_set_text already skips the work when the string has not changed, so this is
-    // cheap to call several times a second.
+    // ⛔ lv_label_set_text SKIPS UNCHANGED TEXT. lv_obj_set_style_text_color DOES NOT - setting
+    // a style invalidates the object whether or not the value differs. The original comment here
+    // said this was "cheap to call several times a second" and was half right: the text was
+    // cheap, the three colour writes underneath were repainting the whole bar 17 times a second
+    // on every screen that shows it.
+    //
+    // MEASURED with @@fps: 17 fps and 124 KB/s pushed while sitting IDLE on the Mail and Chess
+    // screens, against 2 fps and 5 KB/s on the launcher, which does not use this bar. Jake
+    // reported it as "having chess open is lagging hard, maybe froze my device" - it was not
+    // chess, it was every app built on this bar. Only write a colour when it changes.
+    static uint32_t lastNotifCol = 0xFFFFFFFF, lastBatCol = 0xFFFFFFFF;
     lv_label_set_text(notifLbl, buf);
-    lv_obj_set_style_text_color(notifLbl, lv_color_hex(unread ? 0x30d158 : 0x8e8e93), LV_PART_MAIN);
+    const uint32_t notifCol = unread ? 0x30d158 : 0x8e8e93;
+    if (notifCol != lastNotifCol) {
+        lastNotifCol = notifCol;
+        lv_obj_set_style_text_color(notifLbl, lv_color_hex(notifCol), LV_PART_MAIN);
+    }
 
     if (tdeck_clock_text(buf, sizeof(buf)))
         lv_label_set_text(clockLbl, buf);
@@ -137,14 +150,18 @@ void tui_statusbar_tick(void)
         lv_label_set_text(clockLbl, "");
 
     const int pct = tdeck_battery_pct();
+    uint32_t batCol;
     if (pct < 0) {
         lv_label_set_text(batLbl, "--");
-        lv_obj_set_style_text_color(batLbl, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        batCol = 0x8e8e93;
     } else {
         const bool plugged = tdeck_battery_plugged();
         snprintf(buf, sizeof(buf), "%d%%%s", pct, plugged ? "+" : "");
         lv_label_set_text(batLbl, buf);
-        lv_obj_set_style_text_color(
-            batLbl, lv_color_hex(plugged ? 0x30d158 : (pct <= 15 ? 0xff453a : 0xffffff)), LV_PART_MAIN);
+        batCol = plugged ? 0x30d158 : (pct <= 15 ? 0xff453a : 0xffffff);
+    }
+    if (batCol != lastBatCol) {
+        lastBatCol = batCol;
+        lv_obj_set_style_text_color(batLbl, lv_color_hex(batCol), LV_PART_MAIN);
     }
 }

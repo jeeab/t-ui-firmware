@@ -117,7 +117,7 @@ static volatile bool s_connectOnly = false;
 enum MailOp { OP_CHECK = 0, OP_LIST, OP_READ, OP_SEND };
 static volatile int s_op = OP_CHECK;
 
-#define MAIL_PAGE 12 // rows that fit the screen; also the fetch size, deliberately the same
+#define MAIL_PAGE 8 // rows on screen AND the fetch size, deliberately the same number
 typedef struct {
     uint32_t seq;
     bool seen;
@@ -768,7 +768,14 @@ static bool imapCheck(void)
     if (!c->connect(kImapHost, kImapPort)) {
         // A certificate failure and a network failure look the same from here, so say both
         // rather than send the user hunting the wrong one.
-        mailFail("could not connect (network, or certificate rejected)");
+        // ⭐ NAME THE LIKELY CAUSE. "Could not connect" sent Jake looking at his wi-fi when the
+        // real problem is a TLS handshake that cannot get its ~34KB of CONTIGUOUS internal RAM -
+        // far more likely with another app open (the chess search holds a 10KB task stack). If
+        // the block is too small, say that instead; it is something the user can act on.
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 34u * 1024u)
+            mailFail("not enough free memory - close other apps and retry");
+        else
+            mailFail("could not connect (network, or certificate rejected)");
         goto done;
     }
     {
