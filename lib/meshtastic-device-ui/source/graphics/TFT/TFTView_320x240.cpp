@@ -1027,15 +1027,23 @@ bool buildTileIconFromFile(lv_obj_t *tile, const char *path)
         return false;
     // ⛔ PSRAM. 2,560 bytes of internal RAM held forever to read an icon file that is parsed
     // once per app tile at startup. A 40x40 grid plus its palette sits well under this.
+    //
+    // ⛔ kIconBuf, NEVER sizeof(buf). This was `static char buf[2560]` until the RAM audit moved
+    // it to PSRAM, which made it a POINTER - and the sizeof(buf) left behind silently became 4.
+    // Every app icon shipped on the card then read as 3 bytes, failed to parse, and fell back to
+    // the built-in icon. That is how Jake's weather app "lost its icon". It compiles clean and
+    // reads correctly; the only defence is not writing sizeof on something that can become a
+    // pointer. Same mistake, same day, in tdeckgemini::service().
+    static const int kIconBuf = 2560;
     static char *buf = nullptr;
     if (!buf) {
-        buf = (char *)heap_caps_malloc(2560, MALLOC_CAP_SPIRAM);
+        buf = (char *)heap_caps_malloc(kIconBuf, MALLOC_CAP_SPIRAM);
         if (!buf)
-            buf = (char *)malloc(2560);
+            buf = (char *)malloc(kIconBuf);
         if (!buf)
             return false;
     }
-    int n = (int)f.read((uint8_t *)buf, sizeof(buf) - 1);
+    int n = (int)f.read((uint8_t *)buf, kIconBuf - 1);
     f.close();
     if (n <= 0)
         return false;
@@ -4686,9 +4694,33 @@ void TFTView_320x240::openMapsMenu(void)
         }
     }
     if (i == 0) {
+        // ⛔ DO NOT SAY "no styles found on card" WHEN THE READ FAILED. Jake hit this: the card
+        // was fine and full of maps, but a read at a busy moment came back empty and the app
+        // told him his card had nothing on it. A restart "fixed" it, which is the tell - the
+        // card never changed, only our ability to read it that instant did.
+        const bool readFailed = !sdCard || sdCard->cardType() == ISdCard::eNone || tdeckMapStyleScanFailed();
         lv_obj_t *none = lv_label_create(maps_style_ovl);
-        lv_label_set_text(none, "no styles found on card");
-        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_label_set_text(none, readFailed ? "couldn't read the card" : "no map styles on card");
+        lv_obj_set_style_text_color(none, lv_color_hex(readFailed ? 0xff9f0a : 0x8e8e93), LV_PART_MAIN);
+        if (readFailed) {
+            // One tap to recover, instead of a reboot. Re-mounts the card and reopens the menu.
+            row("Retry card", 0xffffff,
+                [](lv_event_t *) {
+                    THIS->closeMapsMenu();
+                    // Async for the same reason as the coverage rows below: updateSDCard()
+                    // deletes and rebuilds the card object, and reopening builds a new overlay -
+                    // neither belongs inside the event handler of the overlay being destroyed.
+                    lv_async_call(
+                        [](void *) {
+                            THIS->updateSDCard();
+                            THIS->mapsStyleInited = false; // let the style restore run again
+                            THIS->mapsInitTileStyle();
+                            THIS->openMapsMenu();
+                        },
+                        nullptr);
+                },
+                NULL);
+        }
     }
 
     // Coverage mapper. Two rows, deliberately separate: you want to record on a drive without

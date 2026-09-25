@@ -123,3 +123,9 @@ class NoSdCard : public ISdCard
 };
 
 extern ISdCard *sdCard;
+
+// True when the LAST loadMapStyles() could not open the folder at all, as opposed to opening it
+// and genuinely finding nothing. The two need different words in front of Jake - one means "there
+// are no maps on this card", the other means "I could not read the card, try again" - and telling
+// him the first when it was the second sends him looking in the wrong place.
+bool tdeckMapStyleScanFailed(void);

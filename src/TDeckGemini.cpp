@@ -52,14 +52,19 @@ char *gReply = nullptr;
 // ⛔ Caller must ensure no request is in flight - see geminiIdleCheck() in GeminiApp.cpp.
 void release(void);
 
+// ⛔ THE SIZE HAS TO BE A NAMED CONSTANT, not sizeof(). This buffer used to be `char buf[4096]`,
+// where sizeof(buf) was 4096. Moving it to PSRAM made it a POINTER, and every sizeof(buf) left
+// behind silently became 4 - so the HTTP reply was read 4 bytes at a time and Gemini stopped
+// working. Nothing warns about it; the code still compiles and still looks right.
+static const int kWorkBuf = 4096;
 static char *s_workBuf = nullptr;
 
 static char *geminiWorkBuf(void)
 {
     if (!s_workBuf) {
-        s_workBuf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+        s_workBuf = (char *)heap_caps_malloc(kWorkBuf, MALLOC_CAP_SPIRAM);
         if (!s_workBuf)
-            s_workBuf = (char *)malloc(4096);
+            s_workBuf = (char *)malloc(kWorkBuf);
     }
     return s_workBuf;
 }
@@ -315,22 +320,26 @@ void service()
         char *buf = geminiWorkBuf();
         if (!buf)
             return;
-        const int n = tdeck_net_result(buf, sizeof(buf));
+        const int n = tdeck_net_result(buf, kWorkBuf);
         tdeck_net_reset();
         if (n <= 0) {
             fail("Empty answer");
             return;
         }
-        buf[n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1] = 0;
-        if (extractReply(buf, gReply, sizeof(gReply))) {
+        buf[n < kWorkBuf ? n : kWorkBuf - 1] = 0;
+        char *reply = replyBuf();
+        if (!reply) {
+            fail("Out of memory reading the answer");
+            return;
+        }
+        if (extractReply(buf, reply, kMaxReply + 1)) {
             snprintf(gStatus, sizeof(gStatus), "");
             gState = DONE;
         } else {
             // extractReply puts Gemini's own explanation in gReply when it refused; show that
             // rather than a generic failure, because it is usually actionable.
-            snprintf(gStatus, sizeof(gStatus), "%s", gReply[0] ? gReply : "Could not read the answer");
-            if (replyBuf())
-        gReply[0] = 0;
+            snprintf(gStatus, sizeof(gStatus), "%s", reply[0] ? reply : "Could not read the answer");
+            reply[0] = 0;
             gState = FAILED;
         }
         return;

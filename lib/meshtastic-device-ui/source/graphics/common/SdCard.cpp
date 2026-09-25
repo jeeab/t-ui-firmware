@@ -1,6 +1,44 @@
 #include "graphics/common/SdCard.h"
 #include "util/ILog.h"
 
+#ifdef ARCH_ESP32
+#include "esp_heap_caps.h"
+#endif
+
+// ⛔ AN EMPTY STYLE LIST IS AMBIGUOUS, and the UI used to state it as fact: "no styles found on
+// card". The card shares its SPI bus with the display and the radio, so an open can simply fail
+// at a busy moment - and "I could not read the card" then reaches Jake as "your card has no maps
+// on it", which sends him looking in entirely the wrong place. Exactly the bug shape that had
+// the Mail app asking him to log in again every time: A FAILED READ IS NOT PROOF OF ABSENCE.
+//
+// loadMapStyles() retries once and records which it was; this lets the caller say the true thing.
+static bool s_styleScanFailed = false;
+
+bool tdeckMapStyleScanFailed(void)
+{
+    return s_styleScanFailed;
+}
+
+// Free internal RAM at the moment of a failure. An SD open can fail because the bus was busy OR
+// because there was nothing left to allocate a file handle from, and those need different fixes.
+static unsigned tdeckFreeInternal(void)
+{
+#ifdef ARCH_ESP32
+    return (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+#else
+    return 0;
+#endif
+}
+
+static unsigned tdeckLargestInternal(void)
+{
+#ifdef ARCH_ESP32
+    return (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+#else
+    return 0;
+#endif
+}
+
 // A style folder is a NAME, like "USGS-Topo". A folder whose name is all digits is a zoom
 // LEVEL, which means the card has tiles sitting directly in /maps with no style folder around
 // them. Those must never be offered as styles: picking "12" would build the path
@@ -297,6 +335,11 @@ std::set<std::string> SdFsCard::loadMapStyles(const char *folder)
 {
     std::set<std::string> styles;
     File maps = SDFs.open(folder);
+    if (!maps) {
+        delay(20); // give the bus a moment; the other user of it is mid-transfer
+        maps = SDFs.open(folder);
+    }
+    s_styleScanFailed = !maps;
     if (maps) {
         do {
             File style = maps.openNextFile();
@@ -320,9 +363,13 @@ std::set<std::string> SdFsCard::loadMapStyles(const char *folder)
         if (map) {
             ILOG_DEBUG("SdFs: found /map dir");
             styles.insert("/map");
+            s_styleScanFailed = false;
             map.close();
         } else {
-            ILOG_INFO("SdFs: no maps found");
+            // Say which it was, and say how much room was left - the next time this happens we
+            // want the log to answer "why", not just repeat the symptom.
+            ILOG_INFO("SdFs: no maps found in %s (scan %s, internal free %u largest %u)", folder,
+                      s_styleScanFailed ? "FAILED TO OPEN" : "opened ok", tdeckFreeInternal(), tdeckLargestInternal());
         }
     }
     updated = true;
