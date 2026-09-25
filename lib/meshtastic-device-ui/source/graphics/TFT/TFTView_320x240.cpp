@@ -9366,8 +9366,38 @@ void TFTView_320x240::armLockGlance(void)
     LOG_INFO("lock glance armed: floor=%d fade=%us stay=%d", (int)tdeck_dim_floor, (unsigned)kLockFadeSecs, stay);
 }
 
+// Put the user back where they were before the device locked itself.
+//
+// Jake, 2026-09-25: "when my device sleeps on its own and i unlock it again, can we have it go to
+// the current app open ... it seems to close everything and go back to the homepage".
+//
+// ⛔ THE SAVED POINTER CAN BE DEAD BY NOW, and following it would be a crash, not a bug. The idle
+// teardown hooks run WHILE THE DEVICE IS LOCKED - gemini_idle_check() and chess_idle_check() are
+// in the same poll that notices the lock - and both delete their whole screen to hand memory back.
+// So the one app most likely to be open when it sleeps is also the one most likely to have been
+// freed underneath us. lv_obj_is_valid() is the check; Home is the answer when it fails.
+void TFTView_320x240::restoreAfterUnlock(void)
+{
+    lv_obj_t *want = launcher_screen;
+    if (preLockScreen && lv_obj_is_valid(preLockScreen) && preLockScreen != lockpad_screen &&
+        preLockScreen != lockglance_screen)
+        want = preLockScreen;
+    preLockScreen = nullptr; // one-shot: a later unlock must not resurrect an older screen
+    if (want)
+        lv_screen_load_anim(want, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+}
+
 void TFTView_320x240::lockDevice(void)
 {
+    // Remember where we were, BEFORE any lock screen replaces it. Guarded on "not already a lock
+    // screen" because this is also called from the PIN pad's own idle timeout to drop back to
+    // black - and letting that overwrite the answer with "the lock screen" is how the feature
+    // would quietly stop working after ten seconds of sitting there.
+    {
+        lv_obj_t *cur = lv_screen_active();
+        if (cur && cur != lockpad_screen && cur != lockglance_screen)
+            preLockScreen = cur;
+    }
     // ⛔ THERE IS NO SEPARATE SCREENSAVER, AND THAT IS DELIBERATE.
     // jeeab/t-ui#8 asked for one. Jake's call, and it is right: a screensaver and a lock
     // screen both showing the clock, date and battery is one screen too many, and having to
@@ -10625,8 +10655,7 @@ void TFTView_320x240::lockGlanceUnlocked(void)
     lockState = LOCK_NONE;
     lockedAtMs = 0;
     lv_display_trigger_activity(NULL);
-    if (launcher_screen)
-        lv_screen_load_anim(launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    restoreAfterUnlock(); // back to whatever was open when it went to sleep
 }
 
 void TFTView_320x240::showLockPad(bool setMode)
@@ -10772,8 +10801,7 @@ void TFTView_320x240::submitLockPad(void)
         tdeck_dim_floor = 0;
         setBrightness(db.uiConfig.screen_brightness);
         lv_display_trigger_activity(NULL);
-        if (launcher_screen)
-            lv_screen_load_anim(launcher_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+        restoreAfterUnlock(); // back to whatever was open when it went to sleep
     } else {
         lockLen = 0;
         lockDigits[0] = 0;
