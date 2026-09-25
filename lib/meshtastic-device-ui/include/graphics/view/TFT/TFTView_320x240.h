@@ -611,7 +611,8 @@ class TFTView_320x240 : public MeshtasticView
     // Jake, 2026-09-25: "when it sleeps it seems to close everything and go back to the homepage
     // whenever i unlock". Where he actually was, so unlocking puts him back there.
     lv_obj_t *preLockScreen = nullptr;
-    void restoreAfterUnlock(void); // back to preLockScreen, or Home if it is no longer there
+    void rememberScreenBeforeLock(void); // called from EVERY route into a lock screen
+    void restoreAfterUnlock(void);       // back to preLockScreen, or Home if it is no longer there
     void handleHomeGesture(void);            // runs on every trackball double-click
     void handleBackGesture(void);            // runs on the "erase" key when nothing is being typed
     void lockDevice(void);                   // black out the screen + require the PIN

@@ -9144,6 +9144,7 @@ void TFTView_320x240::handleHomeGesture(void)
         } else {
             lockState = LOCK_NONE;
             lockedAtMs = 0;
+            preLockScreen = nullptr; // see the note at the PIN-set path: every cycle starts empty
         }
         return;
     }
@@ -9376,12 +9377,64 @@ void TFTView_320x240::armLockGlance(void)
 // in the same poll that notices the lock - and both delete their whole screen to hand memory back.
 // So the one app most likely to be open when it sleeps is also the one most likely to have been
 // freed underneath us. lv_obj_is_valid() is the check; Home is the answer when it fails.
+// Remember the screen that is about to be covered by a lock screen.
+//
+// ⛔ CALLED FROM EVERY ROUTE INTO A LOCK SCREEN, not just lockDevice(). The first version only
+// captured in lockDevice(), and Jake found the hole immediately: "i let it sleep with the mail
+// app ... it did a breif flash on the mail app ... typed it in and i was at the homepage again".
+// That brief flash of Mail is the whole diagnosis - the screen had been BLANKED by the display
+// driver's own timeout without lockDevice() ever running, so nothing had been remembered, and the
+// wake path went glance -> pad -> Home. Capture where the lock screens are SHOWN and it does not
+// matter who decided to show them.
+void TFTView_320x240::rememberScreenBeforeLock(void)
+{
+    // ⛔ ONLY ON THE WAY IN, i.e. from not-locked. MEASURED FAILING without this: open Maps, let
+    // it sleep, wake it, slide, type the PIN -> landed on Home.
+    //
+    // The lock screens are shown on the way UP as well as on the way down. Waking goes
+    // dark -> glance -> pad, and by then lockDevice() has already put Home underneath the black -
+    // so those calls cheerfully recorded "the launcher" over the "Maps" captured when the device
+    // actually went to sleep. The capture has to fire on the transition out of LOCK_NONE and
+    // never again until the device is unlocked.
+    //
+    // This still covers the case the extra call sites were added for - Jake's Mail report, where
+    // the display driver blanked the screen without lockDevice() ever running. Nothing set
+    // lockState there, so it is still LOCK_NONE when the glance appears, and Mail gets recorded.
+    // ⛔ FIRST RECORDER WINS. Gating on lockState was wrong and MEASURED INTERMITTENT - pass,
+    // fail, fail, pass - because it depends on which sleep path ran, and there are two:
+    //
+    //   lockDevice()          sets lockState AND loads Home under the black. Captures correctly
+    //                         on the way down, before Home replaces the app.
+    //   the display timeout   just blanks the backlight. lockState is untouched and the APP IS
+    //                         STILL THE ACTIVE SCREEN - which is exactly why Jake saw "a breif
+    //                         flash on the mail app" before the PIN pad.
+    //
+    // The lock screens are then shown on the way UP as well, and in the first case Home is by
+    // then the active screen - so a way-up capture would overwrite the good answer with "Home".
+    // Gating on lockState tried to stop that and instead blocked the second path entirely,
+    // whenever something had already set lockState on the way down.
+    //
+    // Whoever records first is the one that saw the real screen. restoreAfterUnlock() clears it,
+    // so every lock cycle starts empty.
+    if (preLockScreen)
+        return;
+    lv_obj_t *cur = lv_screen_active();
+    if (cur && cur != lockpad_screen && cur != lockglance_screen) {
+        preLockScreen = cur;
+        ILOG_INFO("lock: remembered screen %p (launcher=%p)", (void *)cur, (void *)launcher_screen);
+    } else {
+        ILOG_INFO("lock: nothing worth remembering (cur=%p)", (void *)cur);
+    }
+}
+
 void TFTView_320x240::restoreAfterUnlock(void)
 {
     lv_obj_t *want = launcher_screen;
     if (preLockScreen && lv_obj_is_valid(preLockScreen) && preLockScreen != lockpad_screen &&
         preLockScreen != lockglance_screen)
         want = preLockScreen;
+    ILOG_INFO("lock: restoring %p (saved=%p launcher=%p valid=%d)", (void *)want, (void *)preLockScreen,
+              (void *)launcher_screen, preLockScreen ? (int)lv_obj_is_valid(preLockScreen) : -1);
     preLockScreen = nullptr; // one-shot: a later unlock must not resurrect an older screen
     if (want)
         lv_screen_load_anim(want, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
@@ -9393,11 +9446,7 @@ void TFTView_320x240::lockDevice(void)
     // screen" because this is also called from the PIN pad's own idle timeout to drop back to
     // black - and letting that overwrite the answer with "the lock screen" is how the feature
     // would quietly stop working after ten seconds of sitting there.
-    {
-        lv_obj_t *cur = lv_screen_active();
-        if (cur && cur != lockpad_screen && cur != lockglance_screen)
-            preLockScreen = cur;
-    }
+    rememberScreenBeforeLock();
     // ⛔ THERE IS NO SEPARATE SCREENSAVER, AND THAT IS DELIBERATE.
     // jeeab/t-ui#8 asked for one. Jake's call, and it is right: a screensaver and a lock
     // screen both showing the clock, date and battery is one screen too many, and having to
@@ -10231,6 +10280,7 @@ void TFTView_320x240::openLockSettings(void)
 // how LVGL sliders behave - there is a PIN behind it either way.
 void TFTView_320x240::showLockGlance(void)
 {
+    rememberScreenBeforeLock(); // whoever got us here, this is where the app disappears
     lockState = LOCK_GLANCE;
     lockLen = 0;
     lockDigits[0] = 0;
@@ -10660,6 +10710,7 @@ void TFTView_320x240::lockGlanceUnlocked(void)
 
 void TFTView_320x240::showLockPad(bool setMode)
 {
+    rememberScreenBeforeLock(); // whoever got us here, this is where the app disappears
     lockSetMode = setMode;
     lockLen = 0;
     lockDigits[0] = 0;
@@ -10780,6 +10831,12 @@ void TFTView_320x240::submitLockPad(void)
         controller->storeUIConfig(db.uiConfig); // persist across reboots
         lockState = LOCK_NONE;
         lockedAtMs = 0; // unlocked for real: the next lock starts a fresh grace window
+        // ⛔ AND DROP THE REMEMBERED SCREEN. "First recorder wins" is only correct if every
+        // cycle starts empty, and this unlock path does NOT go through restoreAfterUnlock()
+        // - so without this the pointer survives into the next sleep, wins against the
+        // screen actually being covered, and unlocking sends you to wherever you were two
+        // cycles ago. THAT is the intermittency: it depended on which way you last woke up.
+        preLockScreen = nullptr;
         openSettings(); // back to Settings; PIN saved
         return;
     }
