@@ -1595,11 +1595,34 @@ void TFTView_320x240::createLauncher(void)
             // screen of its own to be "correct"; forcing one there would fight the wake path,
             // and this device has already been made unwakeable once by exactly that kind of
             // well-meant assertion. Assert only where the right answer is unambiguous.
+            // ⛔ ONLY AGAINST main_screen, AND ONLY AFTER IT HAS PERSISTED. Jake, 2026-09-25:
+            // "whenever im tpying in the pin, its just reboots and goes tot he t-ui logo".
+            //
+            // The first version asserted against ANY screen that was not the expected lock
+            // screen. Waking runs glance -> pad, and for the instant between lockGlanceUnlocked()
+            // setting LOCK_ENTRY and showLockPad() loading the pad, the active screen is still
+            // the glance - so this fired and issued a SECOND lv_screen_load_anim() from the poll
+            // timer, racing the one the button's own event handler was already doing. Two screen
+            // loads for the same transition, one from inside an event, is the shape that has
+            // frozen this device before.
+            //
+            // What it exists to stop is exactly one thing: a config-sync revealing the Meshtastic
+            // UI while the device is locked. So watch for THAT, not for "anything unexpected" -
+            // and require it to still be there on the next pass, so no transition can trip it.
             if (THIS->lockState == LOCK_ENTRY || THIS->lockState == LOCK_GLANCE) {
-                lv_obj_t *want = (THIS->lockState == LOCK_GLANCE) ? THIS->lockglance_screen : THIS->lockpad_screen;
-                if (want && lv_screen_active() != want) {
-                    ILOG_WARN("lock: something loaded another screen while locked - putting the lock back");
-                    lv_screen_load_anim(want, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+                static uint8_t strikes = 0;
+                if (lv_screen_active() == objects.main_screen) {
+                    if (++strikes >= 2) {
+                        strikes = 0;
+                        lv_obj_t *want =
+                            (THIS->lockState == LOCK_GLANCE) ? THIS->lockglance_screen : THIS->lockpad_screen;
+                        if (want) {
+                            ILOG_WARN("lock: the Meshtastic UI appeared while locked - putting the lock back");
+                            lv_screen_load_anim(want, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+                        }
+                    }
+                } else {
+                    strikes = 0;
                 }
             }
 
