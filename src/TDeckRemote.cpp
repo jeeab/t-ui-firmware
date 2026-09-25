@@ -38,7 +38,8 @@
 // launcher bridges; see the notes in TDeckPop.cpp.
 // -----------------------------------------------------------------------------
 #include "configuration.h"
-#include "TDeckMail.h" // @@mail / @@inbox
+#include "TDeckMail.h"   // @@mail / @@inbox
+#include "TDeckGemini.h" // @@gem - ask it headlessly, no unlock needed
 #include "TDeckCoverage.h" // @@cov
 #include "graphics/common/SdCard.h" // @@mailfile reads /gmail.txt
 #include <lvgl.h> // @@refr needs the refresh timer
@@ -186,6 +187,23 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                              (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
                              (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
                 }
+            } else if (!strncmp(s_line, "gem", 3)) {
+                // @@gem [prompt]  - ask Gemini HEADLESSLY, no screen and no unlock needed.
+                // @@gem           - with no prompt, just report where the last ask got to.
+                //
+                // Built because Gemini sat on "Connecting..." forever and driving the app by
+                // hand needs Jake's PIN, which is his. This exercises the whole path - config,
+                // wi-fi, TLS, Google, parse - from the cable, and says which stage it reached.
+                // ⛔ Reports the REPLY, which is Gemini's own words about a prompt sent from
+                // here; it never touches his messages or anything else on the device.
+                const char *a = s_line + 3;
+                while (*a == ' ')
+                    a++;
+                if (*a)
+                    tdeckgemini::ask(a);
+                const char *r = tdeckgemini::reply();
+                LOG_INFO("@@ok gem state=%d status=\"%s\" reply=\"%.70s\"", tdeckgemini::state(),
+                         tdeckgemini::statusText(), r ? r : "");
             } else if (!strncmp(s_line, "mailsend", 8)) {
                 if (tdeck_mail_send_selftest())
                     LOG_INFO("@@ok mailsend queued (to the signed-in address only)");

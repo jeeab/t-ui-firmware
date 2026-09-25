@@ -237,6 +237,15 @@ extern "C" int tdeck_net_poll(void)
     }
 }
 
+// The RAW state, for callers that want to tell "joining wi-fi" from "waiting on the server".
+// tdeck_net_poll() deliberately collapses those into "working", which is the right default -
+// but a UI that shows one word for twenty seconds reads as a hang, so it can ask for more.
+// Returns the NetState values: 0 idle, 1 start, 2 connecting, 3 fetch, 4 done, 5 error.
+extern "C" int tdeck_net_state(void)
+{
+    return s_state;
+}
+
 // Copy the body when done; returns bytes copied (0 if not done). Reading it returns the
 // door to idle so the next fetch can start. Only safe to read once NET_DONE, which the
 // service sets AFTER the body is fully written — so no torn reads.
@@ -366,6 +375,31 @@ extern "C" void tdeck_net_service(void)
             LOG_INFO("net: dropping the wi-fi we brought up");
             tdeck_wifi_disconnect_now();
             s_ownWifi = false;
+        }
+    }
+
+    // ⭐ KEEP TRYING TO GET THE RESERVE BACK, not just once at the end of a fetch.
+    //
+    // MEASURED 2026-09-25: the first HTTPS request after boot works, and every one after it fails
+    // with code=-1. The reserve is taken at boot when internal RAM is clean (36,864 bytes), handed
+    // to the handshake, and then re-taken the moment the TLS client is deleted - which is the
+    // right place and is not enough. By then the user has opened Maps or chess or Gemini, the
+    // largest internal block has fallen from 34,804 to 27,636, the whole {36,32,28}KB ladder
+    // misses, and nothing ever tries again. One HTTPS request per boot, silently.
+    //
+    // A handshake needs ~34KB contiguous, so a smaller reserve would not help; what helps is
+    // ASKING AGAIN LATER. Closing Maps or chess frees exactly the kind of block this wants, and
+    // this grabs it within a few seconds of it appearing. Costs one failed malloc every 5s in the
+    // worst case, and nothing at all once it succeeds.
+    {
+        static uint32_t s_nextTake = 0;
+        const bool idle = (s_state != NET_START && s_state != NET_CONNECTING && s_state != NET_FETCH);
+        if (idle && !s_tlsReserve && (int32_t)(millis() - s_nextTake) > 0) {
+            s_nextTake = millis() + 5000;
+            tdeck_tls_reserve_init();
+            if (s_tlsReserve)
+                LOG_INFO("tls reserve: re-acquired %u bytes - HTTPS will work again",
+                         (unsigned)s_tlsReserveBytes);
         }
     }
 

@@ -1576,6 +1576,33 @@ void TFTView_320x240::createLauncher(void)
                 THIS->lockDevice();
             }
 
+            // ⛔ THE LOCK IS AN INVARIANT, NOT A SIX-SECOND WINDOW.
+            //
+            // Jake, 2026-09-25: "seemed to boot into MUI instead of the pin screen. sometimes
+            // normally the screen flashes to mui then back for some reason on boot." Both halves
+            // are the same race. A config-sync event loads main_screen shortly after boot, and
+            // the only thing putting the lock back was bootHome - a timer that re-asserts every
+            // 400ms and then STOPS AFTER 15 REPEATS. Sync inside six seconds: you see the flash.
+            // Sync after six seconds: the Meshtastic UI stays up and THE DEVICE IS UNLOCKED, with
+            // his messages and settings reachable without the PIN he set.
+            //
+            // Widening the window would be the same bug with a bigger number. Ten call sites load
+            // main_screen and more will be added, so this does not chase the writers: while the
+            // device is locked, the lock screen IS the active screen, checked forever, for the
+            // cost of one pointer compare a tick.
+            //
+            // ⚠️ LOCK_ENTRY and LOCK_GLANCE ONLY. LOCK_DARK is the screen-off state and has no
+            // screen of its own to be "correct"; forcing one there would fight the wake path,
+            // and this device has already been made unwakeable once by exactly that kind of
+            // well-meant assertion. Assert only where the right answer is unambiguous.
+            if (THIS->lockState == LOCK_ENTRY || THIS->lockState == LOCK_GLANCE) {
+                lv_obj_t *want = (THIS->lockState == LOCK_GLANCE) ? THIS->lockglance_screen : THIS->lockpad_screen;
+                if (want && lv_screen_active() != want) {
+                    ILOG_WARN("lock: something loaded another screen while locked - putting the lock back");
+                    lv_screen_load_anim(want, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+                }
+            }
+
             mail_service_ui(); // no-op unless the Mail screen is up and a check is running
             gemini_idle_check(); // hands Gemini's memory back once it has been left alone
             chess_idle_check();  // and the chess board, which is the biggest of them
