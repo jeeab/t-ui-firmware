@@ -143,6 +143,39 @@ extern "C" void tdeck_coverage_sample(uint32_t fromNode, int32_t rssi, float snr
     s_dirty = true;
 }
 
+// ⭐ SYNTHETIC CELLS, FOR PROVING THE OVERLAY DRAWS.
+//
+// The heatmap had never once been looked at on a screen, because looking at it requires a survey
+// and a survey requires driving around - so the first person to find out whether it worked would
+// have been Jake, after a wasted trip. This injects a known pattern at a known place so the
+// drawing can be checked in ten seconds at a desk.
+//
+// ⛔ IT SETS s_synthetic, WHICH BLOCKS EVERY SAVE. Made-up coverage reaching /coverage.csv would
+// be the single worst bug this feature could have - a map that confidently shows reception where
+// there is none. A flag that has to be cleared is a guarantee; "remember to clear it afterwards"
+// is not. tdeck_coverage_clear() is the only way out.
+static bool s_synthetic = false;
+
+extern "C" bool tdeck_coverage_is_synthetic(void)
+{
+    return s_synthetic;
+}
+
+extern "C" void tdeck_coverage_inject(int32_t lat, int32_t lon, int snrQ, int rssi)
+{
+    if (!ensureTable())
+        return;
+    s_synthetic = true;
+    Cell *c = findOrAdd(lat >> kCellShift, lon >> kCellShift, true);
+    if (!c)
+        return;
+    c->bestSnrQ = (int16_t)snrQ;
+    c->bestRssi = (int16_t)rssi;
+    if (c->n < 65535)
+        c->n++;
+    // deliberately NOT s_dirty - see above
+}
+
 extern "C" int tdeck_coverage_count(void)
 {
     return s_count;
@@ -185,6 +218,7 @@ extern "C" void tdeck_coverage_clear(void)
         memset(s_cells, 0, (size_t)kMaxCells * sizeof(Cell));
     s_count = 0;
     s_dirty = false;
+    s_synthetic = false; // the only way back to recording real coverage
     SDFs.remove(kFile);
     LOG_INFO("coverage: cleared");
 }
@@ -222,6 +256,12 @@ extern "C" void tdeck_coverage_service(void)
 {
     if (!s_dirty || !s_cells)
         return;
+    if (s_synthetic) {
+        // Belt and braces. inject() never sets s_dirty, but a real packet arriving while test
+        // cells are in the table would - and then the save would write both out together.
+        s_dirty = false;
+        return;
+    }
     // ⚠️ RATE LIMITED HARD. Rewriting the whole grid is a multi-KB SD write, and the SD shares
     // its SPI bus with the display and the LoRa radio. Every 30s while actually moving is
     // plenty: the grid is in RAM and the only thing a save protects against is a flat battery.

@@ -620,6 +620,7 @@ class TFTView_320x240 : public MeshtasticView
     uint32_t stayOnDriftMs = 0;
     uint8_t stayOnDriftIdx = 0;
     void refreshCoverageOverlay(void);         // heatmap of where the mesh reaches
+    void coverageTestFill(void);               // ⛔ synthetic cells, to prove the heatmap draws
     bool coverage_overlay_on = false;          // showing it is separate from RECORDING it
     lv_obj_t **coverage_cells = nullptr; // pool allocated on first use, not 480 bytes of .bss
     void showLockGlance(void);

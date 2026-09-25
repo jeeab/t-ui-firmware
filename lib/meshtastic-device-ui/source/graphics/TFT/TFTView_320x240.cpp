@@ -89,6 +89,7 @@ extern "C" void tdeck_coverage_set_enabled(bool on);
 extern "C" int tdeck_coverage_count(void);
 extern "C" bool tdeck_coverage_cell(int i, int32_t *lat, int32_t *lon, int *snrQ, int *rssi, int *n);
 extern "C" void tdeck_coverage_clear(void);
+extern "C" void tdeck_coverage_inject(int32_t lat, int32_t lon, int snrQ, int rssi); // ⛔ test data only
 extern "C" void tdeck_coverage_load(void);
 // Node bridge (src/TDeckNodesBridge.cpp), so the pins search can find people too.
 extern "C" int tdeck_nodes_list(uint32_t *out, int maxN);
@@ -4454,14 +4455,62 @@ void mapdlWriteMeta(void)
 // cannot be forgotten.
 static const int kCovPool = 120;
 
+// ⛔ SYNTHETIC COVERAGE, for proving the overlay draws. See tdeck_coverage_inject().
+//
+// The heatmap had never been looked at on a screen, because seeing it needs a survey and a survey
+// needs driving around - so the first person to discover it was broken would have been Jake,
+// after a wasted trip. This lays a 5x5 grid of cells on the map's CURRENT centre (guaranteed on
+// screen, whatever he last panned to) stepping through the whole SNR range, so every colour band
+// and the cell geometry can be checked at a desk.
+//
+// The pattern is deliberately a diagonal ramp rather than random: a gradient that runs the wrong
+// way, or cells half a cell out of place, are both obvious in a photograph and neither would be
+// obvious in noise.
+void TFTView_320x240::coverageTestFill(void)
+{
+    if (!userMap) {
+        LOG_INFO("coverage: Maps app has not been opened this boot, so there is no map to fill against");
+        return;
+    }
+    float clat = 0, clon = 0;
+    userMap->getCenter(clat, clon);
+    const int32_t lat0 = (int32_t)lroundf(clat * 1e7f);
+    const int32_t lon0 = (int32_t)lroundf(clon * 1e7f);
+    const int32_t step = 4096; // one cell, matching kCellShift in TDeckCoverage.cpp
+
+    for (int row = -2; row <= 2; row++) {
+        for (int col = -2; col <= 2; col++) {
+            // -18 dB in the bottom-left to +9 dB in the top-right, crossing every colour band.
+            const float snr = -18.0f + ((row + 2) + (col + 2)) * 27.0f / 8.0f;
+            tdeck_coverage_inject(lat0 + row * step, lon0 + col * step, (int)lroundf(snr * 4.0f),
+                                  -120 + (int)((snr + 20.0f) * 2.0f));
+        }
+    }
+    coverage_overlay_on = true;
+    refreshCoverageOverlay();
+    LOG_INFO("coverage: 25 SYNTHETIC cells at %.5f,%.5f - nothing will be saved until @@cov clear", clat, clon);
+}
+
+// ⛔ userMap, NOT map. THIS IS WHY THE HEATMAP NEVER WORKED.
+//
+// There are two MapPanels on this device: `map` is the mesh map on the Meshtastic screen, and
+// `userMap` is the Maps app. This function drew into maps_marker_layer - a child of maps_screen,
+// so the MAPS APP - while asking `map` where things were. Two different maps, at two different
+// centres and zooms, and on a boot where the mesh map had never been opened `map` is null and
+// the whole overlay silently returned.
+//
+// Found 2026-09-24 by trying to photograph it. It had never once been looked at on a screen,
+// because looking at it needs a survey - so this would have been discovered by Jake, after
+// driving around Sultan collecting data that then drew in the wrong place or not at all.
+// Verifying the thing you cannot easily verify is exactly where the bugs are.
 void TFTView_320x240::refreshCoverageOverlay(void)
 {
-    if (!map || !maps_marker_layer)
+    if (!userMap || !maps_marker_layer)
         return;
 
     const int cells = tdeck_coverage_count();
     float clat = 0, clon = 0;
-    map->getCenter(clat, clon);
+    userMap->getCenter(clat, clon);
     const uint8_t zoom = MapTileSettings::getZoomLevel();
 
     static float lastLat = 1e9f, lastLon = 1e9f;
@@ -4502,8 +4551,8 @@ void TFTView_320x240::refreshCoverageOverlay(void)
     // through any future change to the cell size, which a hand-computed constant would not.
     const int32_t kCellUnits = 4096; // must match kCellShift in TDeckCoverage.cpp (1 << 12)
     int16_t ax = 0, ay = 0, bx = 0, by = 0;
-    map->geoToScreen(clat, clon, ax, ay);
-    map->geoToScreen(clat - kCellUnits / 1e7f, clon + kCellUnits / 1e7f, bx, by);
+    userMap->geoToScreen(clat, clon, ax, ay);
+    userMap->geoToScreen(clat - kCellUnits / 1e7f, clon + kCellUnits / 1e7f, bx, by);
     int w = bx - ax, h = by - ay;
     if (w < 2)
         w = 2;
@@ -4521,7 +4570,7 @@ void TFTView_320x240::refreshCoverageOverlay(void)
         if (!tdeck_coverage_cell(i, &la, &lo, &q, &rssi, &n))
             continue;
         int16_t x = 0, y = 0;
-        if (!map->geoToScreen(la / 1e7f, lo / 1e7f, x, y))
+        if (!userMap->geoToScreen(la / 1e7f, lo / 1e7f, x, y))
             continue; // off screen
         const float snr = q / 4.0f;
         // LoRa SNR runs from roughly -20 (barely decodable) to +10 (right beside it).
@@ -9770,6 +9819,12 @@ void TFTView_320x240::remoteService(void)
         tdeck_remote_reply(buf);
         break;
     }
+    case 15: // ⛔ synthetic coverage cells. Queued rather than run on the serial task because it
+        THIS->coverageTestFill(); // touches LVGL, which belongs to the "tft" task and nothing else.
+        snprintf(buf, sizeof(buf), "cov test %d cells (SYNTHETIC - nothing saves until @@cov clear)",
+                 tdeck_coverage_count());
+        tdeck_remote_reply(buf);
+        break;
     case 8: // key
         THIS->remoteInit();
         s_remoteKey = (uint32_t)x;

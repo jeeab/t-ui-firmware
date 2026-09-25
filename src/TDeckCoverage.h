@@ -37,6 +37,13 @@ bool tdeck_coverage_cell(int i, int32_t *lat, int32_t *lon, int *snrQ, int *rssi
 // Wipe the grid and the file. Used by the "clear" button, and after a move to a new area.
 void tdeck_coverage_clear(void);
 
+// ⛔ TEST DATA ONLY, and it POISONS the grid on purpose: once called, nothing is saved to the
+// card until tdeck_coverage_clear(). Exists so the heatmap drawing can be proven at a desk
+// instead of by driving around and hoping. Fake coverage written to /coverage.csv would be the
+// worst bug this feature could have, so the block is a flag, not a convention.
+void tdeck_coverage_inject(int32_t lat, int32_t lon, int snrQ, int rssi);
+bool tdeck_coverage_is_synthetic(void);
+
 // Load a previously saved grid from the SD card. Safe to call when there is no file.
 void tdeck_coverage_load(void);
 

@@ -166,12 +166,26 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                     tdeck_coverage_set_enabled(false);
                 else if (!strncmp(a, "clear", 5))
                     tdeck_coverage_clear();
-                int32_t la = 0, lo = 0;
-                int q = 0, rs = 0, n = 0;
-                bool any = tdeck_coverage_cell(0, &la, &lo, &q, &rs, &n);
-                LOG_INFO("@@ok cov rec=%d cells=%d first=%ld,%ld snr=%.2f rssi=%d n=%d",
-                         (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
-                         (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
+                // ⛔ "test" lays down SYNTHETIC cells so the heatmap can be looked at without a
+                // survey. QUEUED, not run here: it draws, and drawing belongs to the "tft" task.
+                // Poisons the grid until "clear" - see tdeck_coverage_inject(). It reports its
+                // own result from the UI task, so skip the reply below rather than printing a
+                // count taken before the fill has happened.
+                //
+                // ⚠️ And skip it by NOT REPLYING, never by returning early: the end of this
+                // function resets s_len and s_armed, and jumping over that would leave the
+                // parser holding half a stale command.
+                const bool queued = !strncmp(a, "test", 4);
+                if (queued)
+                    s_cmd = 15;
+                if (!queued) {
+                    int32_t la = 0, lo = 0;
+                    int q = 0, rs = 0, n = 0;
+                    bool any = tdeck_coverage_cell(0, &la, &lo, &q, &rs, &n);
+                    LOG_INFO("@@ok cov rec=%d cells=%d first=%ld,%ld snr=%.2f rssi=%d n=%d",
+                             (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
+                             (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
+                }
             } else if (!strncmp(s_line, "mailsend", 8)) {
                 if (tdeck_mail_send_selftest())
                     LOG_INFO("@@ok mailsend queued (to the signed-in address only)");
