@@ -768,14 +768,33 @@ static bool imapCheck(void)
     if (!c->connect(kImapHost, kImapPort)) {
         // A certificate failure and a network failure look the same from here, so say both
         // rather than send the user hunting the wrong one.
-        // ⭐ NAME THE LIKELY CAUSE. "Could not connect" sent Jake looking at his wi-fi when the
-        // real problem is a TLS handshake that cannot get its ~34KB of CONTIGUOUS internal RAM -
-        // far more likely with another app open (the chess search holds a 10KB task stack). If
-        // the block is too small, say that instead; it is something the user can act on.
-        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 34u * 1024u)
-            mailFail("not enough free memory - close other apps and retry");
-        else
-            mailFail("could not connect (network, or certificate rejected)");
+        //
+        // ⛔ THIS ADVICE WAS WRONG AND JAKE CAUGHT IT: "it says 'not enough memory, close other
+        // apps to continue' - shouldn't the mail app be the only app open?" He was right to
+        // doubt it, and the message was wrong in three separate ways:
+        //
+        //  1. "close other apps" CANNOT HELP. LVGL allocates its screens from PSRAM
+        //     (LV_MEM_POOL_ALLOC -> MALLOC_CAP_SPIRAM), so leaving Maps or Settings open costs
+        //     no internal RAM at all. The one real exception is chess, which holds a 10KB task
+        //     stack. Telling him to close apps sent him to do something that does nothing.
+        //  2. The 34KB threshold came from believing the handshake needs one 34KB block. It
+        //     needs TWO of about 16.7KB - see the reserve in TDeckNet.cpp. The largest block on
+        //     a settled heap is ~16KB, so this test was true on virtually every failure and
+        //     relabelled ordinary network errors as memory errors.
+        //  3. It measured MALLOC_CAP_INTERNAL while the allocation uses INTERNAL|8BIT. Some
+        //     internal RAM is 32-bit-only, so the number was flattering.
+        //
+        // Now: the right caps, a threshold that matches one record buffer, and advice the user
+        // can actually act on - the reserve re-acquires itself within a few seconds, so waiting
+        // really is the fix.
+        {
+            const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            LOG_INFO("mail: connect failed, largest usable internal block %u", (unsigned)largest);
+            if (largest < 17u * 1024u)
+                mailFail("not enough memory just now - wait a few seconds and try again");
+            else
+                mailFail("could not connect (network, or certificate rejected)");
+        }
         goto done;
     }
     {
