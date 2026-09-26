@@ -27,6 +27,9 @@ class TFTView_320x240 : public MeshtasticView
     static void openFlashlightAction(void);
     static void openMapsAction(void);    // Maps tile -> our own standalone Maps app screen
     static void openGetAppsAction(void); // Get Apps tile -> browse + install add-on apps
+    // The 10s wifi/MQTT status poll, called from loop() rather than the UI task - sending from
+    // the UI task means blocking on a mutex while holding spiLock, which is the freeze.
+    static void connstatusService(void);
 
     // methods to update view
     void setMyInfo(uint32_t nodeNum) override;

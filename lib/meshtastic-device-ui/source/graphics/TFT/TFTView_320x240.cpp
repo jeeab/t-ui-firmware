@@ -89,6 +89,7 @@ extern "C" void tdeck_coverage_set_enabled(bool on);
 extern "C" int tdeck_coverage_count(void);
 extern "C" bool tdeck_coverage_cell(int i, int32_t *lat, int32_t *lon, int *snrQ, int *rssi, int *n);
 extern "C" void tdeck_coverage_clear(void);
+volatile bool tdeck_connstatus_due = false; // see the 10s block: sent from loop(), never the UI task
 extern "C" void tdeck_coverage_inject(int32_t lat, int32_t lon, int snrQ, int rssi); // ⛔ test data only
 extern "C" void tdeck_coverage_load(void);
 // Node bridge (src/TDeckNodesBridge.cpp), so the pins search can find people too.
@@ -9817,6 +9818,30 @@ void TFTView_320x240::remoteInit(void)
         lv_indev_set_group(s_remoteKeys, lv_group_get_default());
 }
 
+// ⭐ THE 10s CONNECTION-STATUS POLL, RUN FROM loop() INSTEAD OF THE UI TASK.
+//
+// See the note in the 10s block for why: PacketQueue::push takes a blocking std::mutex, and the
+// "tft" task holds spiLock for the whole of task_handler() - so a contended mutex there stops
+// the screen, the SD card and the radio together until the watchdog fires. Every one of the four
+// newest stored freezes names that call.
+//
+// Here the same wait costs nothing but this function's own time. SharedQueue exists precisely to
+// be used across tasks, so sending from loop() is what it is for.
+void TFTView_320x240::connstatusService(void)
+{
+    if (!tdeck_connstatus_due)
+        return;
+    tdeck_connstatus_due = false;
+    TFTView_320x240 *v = instance();
+    if (v && v->controller)
+        v->controller->requestDeviceConnectionStatus();
+}
+
+extern "C" void tdeck_connstatus_service(void)
+{
+    TFTView_320x240::connstatusService();
+}
+
 // Called from the UI poll timer. Does nothing at all until a command arrives.
 void TFTView_320x240::remoteService(void)
 {
@@ -18533,8 +18558,25 @@ void TFTView_320x240::task_handler(void)
                 lastrun10 = curtime;
                 TFT_STEP("10s-mem", updateFreeMem());
 
+                // ⛔ DO NOT SEND FROM THE UI TASK. THIS IS THE FREEZE.
+                //
+                // Every one of the four newest stall records names this call:
+                //     restart=FROZE (task) stalled_for=15s spilock=[tft 14s loop=B ui=B in=10s-connstatus]
+                //
+                // requestDeviceConnectionStatus -> sendAdminMessage -> send -> PacketClient::send
+                // -> SharedQueue::clientSend -> PacketQueue::push, which takes a std::mutex with
+                // a plain lock_guard. Blocking. And the "tft" task is holding spiLock the whole
+                // time it runs, so when that mutex is contended the screen, the SD card and the
+                // radio all stop together for as long as it takes - 6 to 14 seconds in the stored
+                // records, which is past the watchdog. Jake sees the boot logo and calls it a
+                // reboot; it is a freeze being put out of its misery.
+                //
+                // Nothing about a ten-second status poll needs to happen on the UI task. Flag it
+                // and let the main loop send it, exactly as every other deferred service on this
+                // device does. If the mutex is contended there, the loop waits - and the loop is
+                // not holding spiLock, so nothing else stops.
                 if ((db.config.network.wifi_enabled || db.module_config.mqtt.enabled) && !displaydriver->isPowersaving()) {
-                    TFT_STEP("10s-connstatus", controller->requestDeviceConnectionStatus());
+                    tdeck_connstatus_due = true;
                 }
             }
             if (curtime - lastrun60 >= 60) { // call every 60s
