@@ -4551,8 +4551,8 @@ void TFTView_320x240::coverageTestFill(void)
 // the whole overlay silently returned.
 //
 // Found 2026-09-24 by trying to photograph it. It had never once been looked at on a screen,
-// because looking at it needs a survey - so this would have been discovered by Jake, after
-// driving around Sultan collecting data that then drew in the wrong place or not at all.
+// because looking at it needs a survey - so this would have been discovered by a user, after
+// driving around collecting data that then drew in the wrong place or not at all.
 // Verifying the thing you cannot easily verify is exactly where the bugs are.
 void TFTView_320x240::refreshCoverageOverlay(void)
 {
