@@ -763,9 +763,41 @@ static bool imapCheck(void)
     // ⭐ THE WHOLE POINT. Not setInsecure(): a password is going over this socket.
     c->setCACert(kGtsRootR1);
     c->setTimeout(8000);
-    LOG_INFO("mail: connecting to %s:%d (largest internal block %u)", kImapHost, kImapPort,
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    if (!c->connect(kImapHost, kImapPort)) {
+    // ⭐ RETRY THE CONNECT. The FIRST TLS connect after wi-fi has just come up fails often enough
+    // that one attempt is not a fair test of anything - measured on this device with Get Apps,
+    // where attempt 1 returned -11 and attempt 2 returned the catalog, seconds apart. Jake hit
+    // the same thing on battery: "could not connect or certificate rejected" on a device with
+    // plenty of memory and a working network.
+    //
+    // DHCP and DNS are up before this runs, but "up" and "ready to complete a handshake" are not
+    // the same instant, and on battery the CPU is slower getting there. Three tries across ~5
+    // seconds costs nothing when the first succeeds and turns a spurious failure into a working
+    // mailbox when it does not.
+    //
+    // ⚠️ A FRESH CLIENT EACH TIME. A WiFiClientSecure that has failed a handshake is not
+    // guaranteed to be reusable, and retrying on the same object is the kind of thing that works
+    // on the bench and fails in the field.
+    bool connected = false;
+    for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
+        if (attempt > 1) {
+            delete c;
+            delay(1500);
+            c = new WiFiClientSecure();
+            if (!c) {
+                mailFail("out of memory for the TLS client");
+                tdeck_tls_reserve_take();
+                return false;
+            }
+            c->setCACert(kGtsRootR1);
+            c->setTimeout(8000);
+        }
+        LOG_INFO("mail: connecting to %s:%d, attempt %d (largest usable internal block %u)", kImapHost, kImapPort, attempt,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        connected = c->connect(kImapHost, kImapPort);
+        if (!connected)
+            LOG_INFO("mail: attempt %d did not connect", attempt);
+    }
+    if (!connected) {
         // A certificate failure and a network failure look the same from here, so say both
         // rather than send the user hunting the wrong one.
         //

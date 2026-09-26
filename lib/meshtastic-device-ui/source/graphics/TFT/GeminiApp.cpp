@@ -41,6 +41,11 @@ namespace
 {
 lv_obj_t *screen = nullptr;
 lv_obj_t *askArea = nullptr;
+// True while the box holds a question that has already been sent: drawn grey, and
+// wiped by the first keystroke of the next one.
+bool s_sentText = false;
+lv_obj_t *helpBox = nullptr; // "how do I get a key" overlay, behind the ? in the corner
+size_t s_sentLen = 0; // how long the sent question was, so the next keystroke can drop exactly it
 lv_obj_t *answerLbl = nullptr;
 lv_obj_t *statusLbl = nullptr;
 lv_obj_t *askBtnLbl = nullptr;
@@ -87,13 +92,27 @@ void doAsk(lv_event_t *)
     lv_label_set_text(answerLbl, "");
     setStatus("Asking... (this turns Bluetooth off)", 0x0a84ff);
     tdeckgemini::ask(q);
+
+    // ⭐ THE SENT QUESTION GOES GREY AND GETS OUT OF THE WAY. Jake: "when I type and send a
+    // message, the message retains there. Instead can me last sent message be grayed out in the
+    // type box, and automatically be overwritten when I start typing again?"
+    //
+    // Leaving it black and editable reads as "this has not been sent yet", and the next question
+    // has to be deleted character by character first. Grey says "this one is gone", and the first
+    // keystroke clears it - see the LV_EVENT_VALUE_CHANGED handler where the textarea is built.
+    s_sentText = true;
+    s_sentLen = strlen(q);
+    lv_obj_set_style_text_color(askArea, lv_color_hex(0x8e8e93), LV_PART_MAIN);
 }
 
 void onClear(lv_event_t *)
 {
     tdeckgemini::clear();
-    if (askArea)
+    if (askArea) {
         lv_textarea_set_text(askArea, "");
+        s_sentText = false;
+        lv_obj_set_style_text_color(askArea, lv_color_hex(0xffffff), LV_PART_MAIN);
+    }
     if (answerLbl)
         lv_label_set_text(answerLbl, "");
     setStatus("", 0xffffff);
@@ -164,6 +183,7 @@ extern "C" void gemini_idle_check(void)
     lv_obj_delete(screen);
     screen = nullptr;
     askArea = answerLbl = statusLbl = askBtnLbl = nullptr;
+    helpBox = nullptr;
     lastState = -1;
     tdeckgemini::release();
 }
@@ -203,6 +223,91 @@ extern "C" void gemini_open(void)
             lv_group_add_obj(lv_group_get_default(), askArea);
         // Enter asks, rather than inserting a newline nobody wants in a one-line question.
         lv_obj_add_event_cb(askArea, [](lv_event_t *e) { doAsk(e); }, LV_EVENT_READY, NULL);
+
+        // The first keystroke after sending throws the old question away rather than appending to
+        // it. Checked on VALUE_CHANGED because that is the only event that fires for a character
+        // arriving from the keyboard, the trackball or a paste alike.
+        lv_obj_add_event_cb(
+            askArea,
+            [](lv_event_t *) {
+                if (!s_sentText || !askArea)
+                    return;
+                s_sentText = false;
+                lv_obj_set_style_text_color(askArea, lv_color_hex(0xffffff), LV_PART_MAIN);
+                // Keep only what was just typed: everything before it belonged to the old
+                // question. One character in practice, but a paste is handled the same way.
+                const char *t = lv_textarea_get_text(askArea);
+                const size_t keep = t ? strlen(t) : 0;
+                if (keep > s_sentLen && s_sentLen > 0) {
+                    char tail[220];
+                    snprintf(tail, sizeof(tail), "%s", t + s_sentLen);
+                    lv_textarea_set_text(askArea, tail);
+                }
+                s_sentLen = 0;
+            },
+            LV_EVENT_VALUE_CHANGED, NULL);
+
+        // ⭐ SCROLLABLE, because 200 characters do not fit in 52 pixels. Jake: "can that typing
+        // box be scrollable?" - it could not; a long question simply ran out of sight with no way
+        // to get back to it.
+        lv_obj_set_scrollbar_mode(askArea, LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_set_scroll_dir(askArea, LV_DIR_VER);
+        lv_textarea_set_one_line(askArea, false);
+
+        // ⭐ "HOW DO I GET A KEY", tucked in the corner. Jake: "can you have a how to button
+        // tucked in the corner saying how to get the api". Without it the only thing a new user
+        // sees is "No key - add one to /gemini.txt on the SD card", which says WHERE to put a
+        // thing it never tells them how to obtain. Same placement and styling as Mail's info
+        // button, because two apps explaining a credential differently is one thing to learn
+        // twice.
+        {
+            lv_obj_t *hb = makeButton(screen, "?", 0x2c2c2e, [](lv_event_t *) {
+                if (helpBox) {
+                    lv_obj_clear_flag(helpBox, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_move_foreground(helpBox);
+                }
+            }, nullptr);
+            lv_obj_set_size(hb, 28, 28);
+            lv_obj_set_pos(hb, 288, 0);
+        }
+
+        helpBox = lv_obj_create(screen);
+        lv_obj_set_pos(helpBox, 0, 0);
+        lv_obj_set_size(helpBox, 320, 218);
+        lv_obj_set_style_bg_color(helpBox, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+        lv_obj_set_style_border_width(helpBox, 0, LV_PART_MAIN);
+        lv_obj_add_flag(helpBox, LV_OBJ_FLAG_HIDDEN);
+        {
+            lv_obj_t *h = lv_label_create(helpBox);
+            lv_label_set_text(h, "Getting a Gemini key");
+            lv_obj_set_style_text_color(h, lv_color_hex(0xffffff), LV_PART_MAIN);
+            lv_obj_set_pos(h, 4, 2);
+
+            lv_obj_t *b = lv_label_create(helpBox);
+            lv_label_set_long_mode(b, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(b, 296);      // ⛔ WRAP NEEDS AN EXPLICIT WIDTH AND HEIGHT or it
+            lv_obj_set_height(b, 150);     //    draws straight over the button below it
+            lv_obj_set_pos(b, 4, 24);
+            lv_label_set_text(b, "1. On a computer: aistudio.google.com\n"
+                                 "2. Sign in, then \"Get API key\"\n"
+                                 "3. Create a key and copy it\n"
+                                 "4. On the SD card, make a file\n"
+                                 "    called gemini.txt\n"
+                                 "5. Put one line in it:\n"
+                                 "    key=YOUR_KEY\n"
+                                 "\n"
+                                 "The key stays on the card - never\n"
+                                 "built into the firmware, so the\n"
+                                 "installer is safe to share.");
+            lv_obj_set_style_text_color(b, lv_color_hex(0xc7c7cc), LV_PART_MAIN);
+
+            lv_obj_t *ok = makeButton(helpBox, "Close", 0x3a3a3c, [](lv_event_t *) {
+                if (helpBox)
+                    lv_obj_add_flag(helpBox, LV_OBJ_FLAG_HIDDEN);
+            }, nullptr);
+            lv_obj_set_size(ok, 100, 30);
+            lv_obj_set_pos(ok, 108, 182);
+        }
 
         lv_obj_t *askBtn = makeButton(screen, "Ask", 0x0a84ff, doAsk, &askBtnLbl);
         lv_obj_set_size(askBtn, 150, 34);
