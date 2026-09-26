@@ -9452,12 +9452,34 @@ void TFTView_320x240::rememberScreenBeforeLock(void)
 
 void TFTView_320x240::restoreAfterUnlock(void)
 {
+    // ⛔ lv_obj_is_valid() IS NOT ENOUGH, AND THIS REBOOTED JAKE'S DEVICE.
+    //
+    // "on the color whenever im tpying in the pin, its just reboots" - on the OK press, i.e. right
+    // here. lv_obj_is_valid() walks the whole tree and returns true for ANY live object, children
+    // included. Gemini and chess DELETE THEIR ENTIRE SCREEN while the device is asleep, to hand
+    // memory back - so the saved pointer can be freed, the allocator can hand that address to some
+    // button on another screen, and is_valid() then cheerfully says yes. Passing a button to
+    // lv_screen_load_anim() is what reboots it.
+    //
+    // A screen is an object with NO PARENT. Check validity FIRST - that call never dereferences
+    // the candidate, it only compares pointers - and only then ask for its parent.
+    //
+    // ⚠️ This is also exactly why I could not reproduce it: I tested with Settings and Maps, which
+    // are never freed. Jake uses Mail, Gemini and chess, which are. Choosing the convenient test
+    // subject chose away the bug.
+    // ⚠️ I DISABLED THIS ONCE ON EVIDENCE THAT TURNED OUT TO BE MY OWN TEST HARNESS. Two runs
+    // "rebooted" on wake, so resume was neutralised to isolate it - and then the same test
+    // rebooted with resume already off. The difference was that those runs CLOSED AND REOPENED
+    // the serial port across the sleep, which can toggle the reset line on this chip. Keeping the
+    // port open and silent, the same cycle passes and logs live=0 / isScreen=0: the freed Gemini
+    // screen correctly rejected, fall back to Home, no crash. Re-enabled.
     lv_obj_t *want = launcher_screen;
-    if (preLockScreen && lv_obj_is_valid(preLockScreen) && preLockScreen != lockpad_screen &&
-        preLockScreen != lockglance_screen)
+    const bool live = preLockScreen && lv_obj_is_valid(preLockScreen);
+    const bool isScreen = live && lv_obj_get_parent(preLockScreen) == NULL;
+    if (isScreen && preLockScreen != lockpad_screen && preLockScreen != lockglance_screen)
         want = preLockScreen;
-    ILOG_INFO("lock: restoring %p (saved=%p launcher=%p valid=%d)", (void *)want, (void *)preLockScreen,
-              (void *)launcher_screen, preLockScreen ? (int)lv_obj_is_valid(preLockScreen) : -1);
+    ILOG_INFO("lock: restoring %p (saved=%p launcher=%p live=%d isScreen=%d)", (void *)want, (void *)preLockScreen,
+              (void *)launcher_screen, (int)live, (int)isScreen);
     preLockScreen = nullptr; // one-shot: a later unlock must not resurrect an older screen
     if (want)
         lv_screen_load_anim(want, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
@@ -9830,9 +9852,15 @@ void TFTView_320x240::remoteService(void)
         else if (THIS->share_overlay) name = "share-picker";
         // Free INTERNAL heap rides along: it is the number that predicts a crash on this
         // device, and I want to see it before asking for a screenshot, not after.
-        snprintf(buf, sizeof(buf), "info screen=%s uptime=%lus lock=%d heap=%uk", name,
+        // ⭐ WHY IT LAST RESTARTED, on every @@info. Jake's colour deck reboots when he types his
+        // PIN and I cannot reproduce it over the cable - so the device has to be able to tell me
+        // what happened after the fact. esp_reset_reason() is already captured at boot in
+        // TDeckMemInfo; it just was not reachable from here. "panic" and "task watchdog" and
+        // "brownout" want three completely different investigations, and guessing between them
+        // has already cost a day.
+        snprintf(buf, sizeof(buf), "info screen=%s uptime=%lus lock=%d heap=%uk lastreset=%s", name,
                  (unsigned long)(lv_tick_get() / 1000), (int)THIS->lockState,
-                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), tdeck_prev_reason_str());
         tdeck_remote_reply(buf);
         break;
     }
