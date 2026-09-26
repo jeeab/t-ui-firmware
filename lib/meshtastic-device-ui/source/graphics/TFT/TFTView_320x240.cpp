@@ -9443,7 +9443,22 @@ void TFTView_320x240::rememberScreenBeforeLock(void)
     if (preLockScreen)
         return;
     lv_obj_t *cur = lv_screen_active();
-    if (cur && cur != lockpad_screen && cur != lockglance_screen) {
+    // ⛔ NEVER THE SPLASH OR THE BLANK SCREEN. JAKE DIAGNOSED THIS ONE: "Could it be not
+    // rebooting but just showing the splash screen?" - and that is exactly what it was.
+    //
+    // At boot the splash IS the active screen when showLockPad() puts the keypad over it. This
+    // function then dutifully recorded "the screen he was on" as the splash, and the very first
+    // unlock restored him to it. He typed his PIN and got the t-ui logo, every time, on every
+    // fresh boot - which from the outside is indistinguishable from a crash and reboot. I spent
+    // hours hunting a crash that was never happening; the device never restarted once, uptime
+    // read 19,628s straight through it.
+    //
+    // ⚠️ And I could not reproduce it because my testing always opened an app first, which
+    // overwrote the capture before I looked. It needed a FRESH BOOT then an unlock - the one
+    // sequence a person does every morning and a test script never did.
+    const bool notWorthIt = !cur || cur == lockpad_screen || cur == lockglance_screen ||
+                            cur == objects.boot_screen || cur == objects.blank_screen;
+    if (!notWorthIt) {
         preLockScreen = cur;
         ILOG_INFO("lock: remembered screen %p (launcher=%p)", (void *)cur, (void *)launcher_screen);
     } else {
