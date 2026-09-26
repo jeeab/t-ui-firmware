@@ -18492,11 +18492,26 @@ void TFTView_320x240::task_handler(void)
             lastrun1 = curtime;
             actTime++;
             tdeck_tft_where = "1s-tick";
-            updateTime();
+
+            // ⭐ TIME EVERY STEP IN HERE AND NAME THE SLOW ONE.
+            //
+            // 15 of the 16 stored freeze records say "in=1s-tick": the tft task burning 5-15s
+            // inside this block while holding spiLock, which is what stops the screen, the SD
+            // card and the radio all at once. The breadcrumb got us to the block and cannot get
+            // us any further, because one label covers a dozen calls.
+            //
+            // Waiting for another full freeze to narrow it costs Jake a reboot each time. This
+            // times each call instead, so a 400ms hiccup is reported the same as a 15s hang and
+            // the cause is named without anything having to break. Two millis() calls and a
+            // compare per step, once a second - nothing on the hot path.
+            uint32_t stepT0 = millis();
+#define TFT_STEP(name, call)                                                                                               do {                                                                                                                       tdeck_tft_where = name;                                                                                                call;                                                                                                                  const uint32_t took = millis() - stepT0;                                                                               if (took > 300)                                                                                                            ILOG_WARN("SLOWSTEP %s took %lums", name, (unsigned long)took);                                                    stepT0 = millis();                                                                                                 } while (0)
+
+            TFT_STEP("1s-time", updateTime());
 
             if (curtime - lastrun5 >= 5) { // call every 5s
                 lastrun5 = curtime;
-                retractService(); // keep asking for unshared pins to be dropped
+                TFT_STEP("5s-retract", retractService()); // keep asking for unshared pins to be dropped
                 if (scans > 0 && activePanel == objects.signal_scanner_panel) {
                     scanSignal(scans);
                     scans--;
@@ -18516,18 +18531,18 @@ void TFTView_320x240::task_handler(void)
             }
             if (curtime - lastrun10 >= 10) { // call every 10s
                 lastrun10 = curtime;
-                updateFreeMem();
+                TFT_STEP("10s-mem", updateFreeMem());
 
                 if ((db.config.network.wifi_enabled || db.module_config.mqtt.enabled) && !displaydriver->isPowersaving()) {
-                    controller->requestDeviceConnectionStatus();
+                    TFT_STEP("10s-connstatus", controller->requestDeviceConnectionStatus());
                 }
             }
             if (curtime - lastrun60 >= 60) { // call every 60s
                 lastrun60 = curtime;
-                updateAllLastHeard();
+                TFT_STEP("60s-lastheard", updateAllLastHeard());
 
                 if (detectorRunning) {
-                    controller->sendPing();
+                    TFT_STEP("60s-ping", controller->sendPing());
                 }
 
                 // if we didn't hear any node for 1h assume we have no signal
@@ -18539,9 +18554,16 @@ void TFTView_320x240::task_handler(void)
                 }
             }
         }
+#undef TFT_STEP
+
+        // Outside the 1s block, so it cannot borrow stepT0 - times itself.
         if (processingFilter || nodesChanged) {
             tdeck_tft_where = "node-filter";
+            const uint32_t nfT0 = millis();
             updateNodesFiltered(nodesChanged);
+            const uint32_t nfTook = millis() - nfT0;
+            if (nfTook > 300)
+                ILOG_WARN("SLOWSTEP node-filter took %lums", (unsigned long)nfTook);
         }
     }
 }

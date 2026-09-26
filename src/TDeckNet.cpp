@@ -60,8 +60,30 @@ void disableBluetooth();
 // record buffers between handshake phases. That is a full ESP-IDF rebuild and a much bigger
 // change than a fix for this bug warrants right now.
 // -----------------------------------------------------------------------------
-static void *s_tlsReserve = nullptr;
-static size_t s_tlsReserveBytes = 0;
+// ⭐ THE RESERVE IS SEVERAL BLOCKS, NOT ONE. MEASURED 2026-09-25, and this is the whole fix.
+//
+// The heap settles at ~27KB free with a LARGEST BLOCK OF ONLY ~16KB - not a leak, it stabilises
+// there; it is simply chopped up. So the old single 36KB reserve could be taken once at boot
+// while the heap was clean, and NEVER re-taken afterwards: the ladder bottomed out at 28KB and
+// nothing that big exists again. One failed re-take and HTTPS was dead for the rest of the
+// session - which is Jake's "Couldn't reach the app list: error -1" and Gemini failing on a
+// second question.
+//
+// ⛔ AND ONE BIG HOLE WAS NEVER WHAT WAS NEEDED. mbedTLS allocates its inbound and outbound
+// record buffers SEPARATELY, ~16.7KB each. The old comment even said so - "~16.7KB each, so
+// ~34KB" - and then reserved 34KB as a single block anyway. Two 18KB holes satisfy the
+// handshake exactly as well as one 36KB hole, and in a fragmented heap they are enormously
+// easier to find. That is the difference between recoverable and not.
+static const int kTlsBlocks = 2;
+static void *s_tlsReserve[kTlsBlocks] = {nullptr, nullptr};
+static size_t s_tlsReserveBytes = 0; // total currently held, for logging
+static size_t kTlsBlockBytes[kTlsBlocks] = {0, 0};
+// ⛔ SOMEBODY IS USING THE HOLE RIGHT NOW - DO NOT TAKE IT BACK. Set by release(), cleared by
+// take(). Without this the 5s opportunistic re-take added earlier today grabbed the reserve back
+// between the release and the handshake, and the handshake then failed for want of exactly the
+// memory that had just been freed for it. Get Apps releases through this path but does NOT go
+// through the NET_* state machine, so "is a fetch running" could not be answered by s_state.
+static volatile bool s_tlsLentOut = false;
 
 // What the heap was actually asked for when an allocation failed. Guessing the size TLS needs
 // has now been wrong twice (first "16KB", then "25KB is surely enough" - both failed), so let
@@ -96,7 +118,7 @@ extern "C" void tdeck_tls_report_alloc_fail(void)
     }
     LOG_INFO("tls: LAST FAILED ALLOC = %u bytes, caps=0x%08x, %u failure(s) total", (unsigned)s_lastFailSize,
              (unsigned)s_lastFailCaps, (unsigned)s_failCount);
-    LOG_INFO("tls: largest internal block available was %u", (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    LOG_INFO("tls: largest internal block available was %u", (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     s_failCount = 0;
 #endif
 }
@@ -108,23 +130,27 @@ extern "C" void tdeck_tls_report_alloc_fail(void)
 extern "C" void tdeck_tls_reserve_init(void)
 {
 #if HAS_WIFI
-    if (s_tlsReserve)
-        return;
-    // Step down rather than give up: a smaller reserve still helps, and failing to boot over
-    // this would be far worse than a slow download.
-    // Measured on hardware: a 25,588-byte run FAILS, a 47,092-byte run SUCCEEDS. The handshake
-    // takes its inbound and outbound record buffers together (~16.7KB each, so ~34KB). 36KB is
-    // the smallest reserve that clears that with margin -- every KB beyond it is taken from the
-    // mesh stack for the 99% of the time no download is running.
-    static const size_t kTry[] = {36 * 1024, 32 * 1024, 28 * 1024};
-    for (size_t i = 0; i < sizeof(kTry) / sizeof(kTry[0]); i++) {
-        s_tlsReserve = heap_caps_malloc(kTry[i], MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_tlsReserve) {
-            s_tlsReserveBytes = kTry[i];
-            return;
+    // Each block is taken INDEPENDENTLY, and each steps down on its own. Partial success is
+    // genuinely useful here: one 18KB hole covers one of the two record buffers, which can be
+    // the difference between a handshake that works and one that does not. The old all-or-
+    // nothing ladder threw that away.
+    static const size_t kTry[] = {18 * 1024, 17 * 1024, 16 * 1024, 12 * 1024};
+    s_tlsReserveBytes = 0;
+    for (int b = 0; b < kTlsBlocks; b++) {
+        if (s_tlsReserve[b]) { // already held
+            s_tlsReserveBytes += kTlsBlockBytes[b];
+            continue;
+        }
+        for (size_t i = 0; i < sizeof(kTry) / sizeof(kTry[0]); i++) {
+            void *p = heap_caps_malloc(kTry[i], MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (p) {
+                s_tlsReserve[b] = p;
+                kTlsBlockBytes[b] = kTry[i];
+                s_tlsReserveBytes += kTry[i];
+                break;
+            }
         }
     }
-    s_tlsReserveBytes = 0;
 #endif
 }
 
@@ -132,15 +158,24 @@ extern "C" void tdeck_tls_reserve_init(void)
 extern "C" void tdeck_tls_reserve_release(void)
 {
 #if HAS_WIFI
-    if (!s_tlsReserve) {
-        LOG_INFO("tls reserve: nothing held (reserve was %u bytes)", (unsigned)s_tlsReserveBytes);
+    s_tlsLentOut = true; // hands off until take() says the caller has finished
+    size_t freed = 0;
+    for (int b = 0; b < kTlsBlocks; b++) {
+        if (!s_tlsReserve[b])
+            continue;
+        heap_caps_free(s_tlsReserve[b]);
+        s_tlsReserve[b] = nullptr;
+        freed += kTlsBlockBytes[b];
+        kTlsBlockBytes[b] = 0;
+    }
+    s_tlsReserveBytes = 0;
+    if (!freed) {
+        LOG_INFO("tls reserve: nothing held to release");
         return;
     }
-    heap_caps_free(s_tlsReserve);
-    s_tlsReserve = nullptr;
     // Safe to log here: this only runs from the UI, long after the console is up.
-    LOG_INFO("tls reserve: released %u bytes, largest internal block now %u", (unsigned)s_tlsReserveBytes,
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    LOG_INFO("tls reserve: released %u bytes in %d blocks, largest internal block now %u", (unsigned)freed,
+             kTlsBlocks, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 #endif
 }
 
@@ -149,6 +184,7 @@ extern "C" void tdeck_tls_reserve_release(void)
 extern "C" void tdeck_tls_reserve_take(void)
 {
 #if HAS_WIFI
+    s_tlsLentOut = false;
     tdeck_tls_reserve_init();
 #endif
 }
@@ -394,12 +430,14 @@ extern "C" void tdeck_net_service(void)
     {
         static uint32_t s_nextTake = 0;
         const bool idle = (s_state != NET_START && s_state != NET_CONNECTING && s_state != NET_FETCH);
-        if (idle && !s_tlsReserve && (int32_t)(millis() - s_nextTake) > 0) {
+        if (idle && !s_tlsLentOut && (!s_tlsReserve[0] || !s_tlsReserve[1]) && (int32_t)(millis() - s_nextTake) > 0) {
             s_nextTake = millis() + 5000;
+            const size_t before = s_tlsReserveBytes;
             tdeck_tls_reserve_init();
-            if (s_tlsReserve)
-                LOG_INFO("tls reserve: re-acquired %u bytes - HTTPS will work again",
-                         (unsigned)s_tlsReserveBytes);
+            if (s_tlsReserveBytes != before)
+                LOG_INFO("tls reserve: now holding %u bytes in %d/%d blocks (largest free %u)",
+                         (unsigned)s_tlsReserveBytes, (s_tlsReserve[0] ? 1 : 0) + (s_tlsReserve[1] ? 1 : 0),
+                         kTlsBlocks, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
     }
 
