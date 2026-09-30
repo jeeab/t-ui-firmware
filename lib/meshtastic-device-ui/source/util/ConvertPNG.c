@@ -89,6 +89,19 @@ static void stbi_arena_reset(void)
     s_stbi_arena_used = 0;
 }
 
+/* Hand the arena back (920KB of PSRAM) when no map is on screen. Kept for the whole session before,
+ * which left chess, the node-DB save and everything else fighting over what remained. It is taken
+ * again on the next decode. Safe because decoding runs on the UI task, the same task that calls
+ * this, one tile at a time. */
+void tdeck_stbi_arena_release(void)
+{
+    if (s_stbi_arena) {
+        heap_caps_free(s_stbi_arena);
+        s_stbi_arena = NULL;
+        s_stbi_arena_used = 0;
+    }
+}
+
 #define STBI_MALLOC(sz) stbi_arena_malloc(sz)
 #define STBI_REALLOC(p, newsz) stbi_arena_realloc_sized(p, 0, newsz)
 #define STBI_REALLOC_SIZED(p, oldsz, newsz) stbi_arena_realloc_sized(p, oldsz, newsz)
@@ -98,6 +111,7 @@ static void stbi_arena_reset(void)
 
 static void stbi_arena_init(void) {}
 static void stbi_arena_reset(void) {}
+void tdeck_stbi_arena_release(void) {}
 
 #define STBI_MALLOC(sz) lv_malloc(sz)
 #define STBI_REALLOC(p, newsz) lv_realloc(p, newsz)

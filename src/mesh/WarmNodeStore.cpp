@@ -584,13 +584,30 @@ bool WarmNodeStore::save()
         return false;
     }
 
-    std::vector<WarmNodeEntry> packed(WARM_NODE_COUNT);
+    // ⛔ NOT A std::vector. This is one 80KB block (2000 x 40B) requested on every node-DB save,
+    // and std::vector THROWS when it cannot have it - uncaught, so the device aborts. Caught on
+    // Jake's colour T-Deck 2026-09-29 in a stress test: chess had taken 1.25MB of PSRAM, a new
+    // node arrived, NodeDB saved, and operator new -> __cxa_throw -> abort(). The warm store is
+    // a cache that is saved again on the next save anyway, so when the memory is not there right
+    // now, skip it: saveIfDirty() leaves it dirty and the caller already ignores the failure.
+    const size_t packedBytes = WARM_NODE_COUNT * sizeof(WarmNodeEntry);
+    WarmNodeEntry *packed = nullptr;
+#if defined(ARCH_ESP32) && defined(BOARD_HAS_PSRAM)
+    packed = static_cast<WarmNodeEntry *>(ps_malloc(packedBytes));
+#endif
+    if (!packed)
+        packed = static_cast<WarmNodeEntry *>(malloc(packedBytes));
+    if (!packed) {
+        LOG_WARN("WarmStore: no %u bytes free to save right now - will save next time", (unsigned)packedBytes);
+        return false;
+    }
+    memset(packed, 0, packedBytes);
     WarmStoreHeader h;
     h.magic = WARM_STORE_MAGIC;
     h.reserved = 0;
-    h.count = packEntries(entries, packed.data());
+    h.count = packEntries(entries, packed);
     h.entrySize = sizeof(WarmNodeEntry);
-    h.crc = crc32Buffer(packed.data(), h.count * sizeof(WarmNodeEntry));
+    h.crc = crc32Buffer(packed, h.count * sizeof(WarmNodeEntry));
 
     // SafeFile already does its own spiLock in its constructor and close().
     // Avoid nesting spiLocks, as this will hang until watchdog reset!
@@ -605,8 +622,9 @@ bool WarmNodeStore::save()
     {
         concurrency::LockGuard g(spiLock);
         f.write((const uint8_t *)&h, sizeof(h));
-        f.write((const uint8_t *)packed.data(), h.count * sizeof(WarmNodeEntry));
+        f.write((const uint8_t *)packed, h.count * sizeof(WarmNodeEntry));
     }
+    free(packed);
 
     bool ok = f.close();
     if (!ok)

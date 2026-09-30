@@ -173,8 +173,22 @@ static bool ensureBoard(void)
 // now shrinks the table to fit rather than giving up (see search.c).
 static bool engineReady(void)
 {
-    if (!search_ready())
-        search_init(psram, 1024UL * 1024UL);
+    if (!search_ready()) {
+        // ⛔ LEAVE 512KB FOR EVERYONE ELSE. Taking the biggest table that fitted left 132KB of
+        // PSRAM after Maps had been open, and 20 seconds later a node-DB save could not get its
+        // 80KB and the device aborted (stress test, 2026-09-29). Halve the table until what is left
+        // afterwards stays comfortable; a 256KB table plays a few percent weaker, which nobody at
+        // Club level will ever notice, and a crash everyone does.
+        const unsigned long kKeepFree = 512UL * 1024UL;
+        const unsigned long kOtherTables = 192UL * 1024UL; // move stack, history, killers, hashes
+        const unsigned long freePs = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        unsigned long table = 1024UL * 1024UL;
+        while (table > 64UL * 1024UL && freePs < table + kOtherTables + kKeepFree)
+            table /= 2;
+        if (freePs < 64UL * 1024UL + kOtherTables + kKeepFree)
+            return false; // not even a small table without crowding everything else out
+        search_init(psram, table);
+    }
     return search_ready();
 }
 

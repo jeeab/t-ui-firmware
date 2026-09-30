@@ -97,14 +97,34 @@ void tileCachePut(const char *key, const lv_img_dsc_t *dsc)
 {
     if (strlen(key) >= sizeof(s_tileCache[0].key))
         return;
-    TileCacheEntry *slot = &s_tileCache[0];
-    for (auto &e : s_tileCache) { // free slot first, else the least recently used
+    // ⛔ ONLY GROW WHILE THERE IS ROOM TO SPARE. Twelve full slots is 1.5MB, and with the decode
+    // arena and anything else resident that took PSRAM to within a few KB of empty - and the next
+    // ordinary allocation elsewhere (a node-DB save wants 80KB in one piece) failed and crashed the
+    // device. The old /diaglog.txt CRASH records show exactly that: psram_low=64k. Below the
+    // headroom mark the cache stops growing and recycles its least recently used slot instead.
+    bool roomToGrow = true;
+#ifdef ARDUINO_ARCH_ESP32
+    roomToGrow = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (768u * 1024u + dsc->data_size);
+#endif
+    TileCacheEntry *slot = nullptr;
+    TileCacheEntry *lru = nullptr;
+    for (auto &e : s_tileCache) {
         if (!e.px) {
-            slot = &e;
-            break;
+            if (!slot && roomToGrow)
+                slot = &e; // a free slot, and room to fill it
+            continue;
         }
-        if (e.stamp < slot->stamp)
-            slot = &e;
+        if (!lru || e.stamp < lru->stamp)
+            lru = &e;
+    }
+    if (!slot)
+        slot = lru; // full, or tight: recycle the least recently used
+    if (!slot)
+        return; // nothing cached yet and no room to start - just do not cache this one
+    if (slot->px && !roomToGrow) {
+        // Free the old pixels FIRST so the new ones can take their place rather than stack on top.
+        tileCacheFree(slot->px);
+        slot->px = nullptr;
     }
     uint8_t *px = tileCacheAlloc(dsc->data_size);
     if (!px)
@@ -126,8 +146,11 @@ void tileCachePut(const char *key, const lv_img_dsc_t *dsc)
 // (largest free block 1,015,796 bytes), so its search silently failed and left the game with
 // Black to move and nobody to move it. A cache is only worth what it saves, and nothing is
 // panning a map that is not on screen; reopening costs one decode per visible tile.
+extern "C" void tdeck_stbi_arena_release(void); // ConvertPNG.c - the 920KB decode arena
+
 extern "C" void tdeck_tile_cache_clear(void)
 {
+    tdeck_stbi_arena_release(); // and the decoder's scratch arena, which is the other 920KB
     for (auto &e : s_tileCache) {
         if (e.px)
             tileCacheFree(e.px);
