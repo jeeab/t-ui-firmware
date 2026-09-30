@@ -231,6 +231,7 @@ extern "C" void notes_open(void);
 extern "C" void gemini_open(void); // GeminiApp.cpp - ask Gemini a question over wi-fi
 extern "C" void gemini_idle_check(void); // frees its screen + buffers when unused
 extern "C" void chess_open(void);        // ChessApp.cpp - play the engine
+extern "C" void tdeck_tile_cache_clear(void); // SdFatService.cpp - frees ~1.5MB of decoded tiles
 extern "C" void chess_idle_check(void);  // 128 objects; hands them back when unused
 extern "C" void mail_open(void);       // MailApp.cpp - Gmail setup form + inbox count
 extern "C" void mail_service_ui(void); // polls the inbox check while that screen is up
@@ -262,6 +263,8 @@ extern "C" uint32_t tdeck_prev_heap_low(void);
 extern "C" uint32_t tdeck_prev_stall_ms(void);
 extern "C" const char *tdeck_prev_stall_thread(void);
 extern "C" const char *tdeck_prev_stall_lock(void); // spiLock holder + loop state at stall time
+extern "C" void tdeck_diag_set_version(const char *ver);  // TDeckMemInfo.cpp - names the build in the fault log
+extern "C" void tdeck_prev_when(char *buf, int cap);      // " up=..s seen=..Z fw=.." for the previous run
 void playBeep(); // buzz.cpp (C++ linkage) — completion chirp for the map downloader
 // Sound toggle (TDeckBeep.cpp): drives Meshtastic's buzzer_mode — one switch for game/timer
 // beeps AND message-notification sounds. Persists in the device config (no reboot).
@@ -372,9 +375,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.09.04.1-test"
+#define TUI_VERSION "2026.09.29.1-test"
 #else
-#define TUI_VERSION "2026.09.04.1"
+#define TUI_VERSION "2026.09.29.1"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -1358,6 +1361,7 @@ void TFTView_320x240::createLauncher(void)
     // to show "ram NNk/NNk" here permanently, which was crash-hunting scaffolding.
     // It still flips to a red "last: <reason>" for ~20s after a fault restart.
     tdeck_diag_boot();   // capture last restart reason + last session's memory lows (once)
+    tdeck_diag_set_version(TUI_VERSION); // after the boot read, so the previous run's version survives
     lua_seed_bundled();  // install bundled SD apps on first run of this firmware (once, then user-owned)
     // The strip itself. Flat, not a gradient - Jake, 2026-09-19: "maybe no status bar
     // gradient". Same height, same colour and same hairline as TuiStatusBar draws on every
@@ -4088,6 +4092,10 @@ void TFTView_320x240::openMaps(void)
                 THIS->closeMapsMenu();
                 if (THIS->userMap)
                     THIS->userMap->releaseTiles();
+                // ...and the decoded-JPEG cache behind them, which is the 1.5MB part.
+#if defined(HAS_SDCARD) && !defined(HAS_SD_MMC) && !defined(ARCH_PORTDUINO) // where SdFatService is built
+                tdeck_tile_cache_clear();
+#endif
             },
             LV_EVENT_SCREEN_UNLOADED, NULL);
     }
@@ -4374,6 +4382,7 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
         tdeck_tls_reserve_release();
         mapdlClient = new WiFiClientSecure();
         mapdlClient->setInsecure(); // public map data; no room for a CA bundle
+        mapdlClient->setHandshakeTimeout(15); // default 120s outlives the ~90s watchdog
     }
     char url[160];
     mapdlBuildUrl(url, sizeof(url), mapdlSrc().urlTemplate, z, x, y);
@@ -5277,6 +5286,7 @@ uint8_t *getappsGet(const char *url, int *outLen)
     if (!getappsClient) {
         getappsClient = new WiFiClientSecure();
         getappsClient->setInsecure(); // public, read-only content; no room for a CA bundle
+        getappsClient->setHandshakeTimeout(15); // default 120s outlives the ~90s watchdog
     }
     HTTPClient http;
     http.setReuse(true);
@@ -5369,6 +5379,7 @@ bool getappsGetToFile(const char *url, const char *path, int *outLen)
     if (!getappsClient) {
         getappsClient = new WiFiClientSecure();
         getappsClient->setInsecure(); // public, read-only content; no room for a CA bundle
+        getappsClient->setHandshakeTimeout(15); // default 120s outlives the ~90s watchdog
     }
     HTTPClient http;
     http.setReuse(true);
@@ -7897,16 +7908,18 @@ void TFTView_320x240::logDiagBoot(void)
     done = true;
     if (!tdeck_prev_reason_bad()) // only log real faults, not clean power-ons/restarts
         return;
-    char line[200];
+    char line[260];
+    char when[80];
+    tdeck_prev_when(when, sizeof(when)); // uptime, last-seen time and firmware of the run that died
     if (tdeck_prev_stall_ms())
         snprintf(line, sizeof(line),
-                 "restart=%s  stalled_in=%s  stalled_for=%lus  spilock=[%s]  psram_low=%luk  ram_low=%luk",
+                 "restart=%s  stalled_in=%s  stalled_for=%lus  spilock=[%s]  psram_low=%luk  ram_low=%luk %s",
                  tdeck_prev_reason_str(), tdeck_prev_stall_thread(), (unsigned long)(tdeck_prev_stall_ms() / 1000),
                  tdeck_prev_stall_lock(), (unsigned long)(tdeck_prev_psram_low() / 1024),
-                 (unsigned long)(tdeck_prev_heap_low() / 1024));
+                 (unsigned long)(tdeck_prev_heap_low() / 1024), when);
     else
-        snprintf(line, sizeof(line), "restart=%s  psram_low=%luk  ram_low=%luk", tdeck_prev_reason_str(),
-                 (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024));
+        snprintf(line, sizeof(line), "restart=%s  psram_low=%luk  ram_low=%luk %s", tdeck_prev_reason_str(),
+                 (unsigned long)(tdeck_prev_psram_low() / 1024), (unsigned long)(tdeck_prev_heap_low() / 1024), when);
     diagLog(line);
 }
 
@@ -9869,7 +9882,7 @@ void TFTView_320x240::remoteService(void)
     // re-lock every few seconds, and screens captured after a command were often the lock
     // screen rather than the thing just opened.
     lv_display_trigger_activity(NULL);
-    char buf[96];
+    char buf[176]; // @@info carries the LVGL pool figures too
     switch (cmd) {
     case 6: // ping
         tdeck_remote_reply("pong");
@@ -9898,9 +9911,18 @@ void TFTView_320x240::remoteService(void)
         // TDeckMemInfo; it just was not reachable from here. "panic" and "task watchdog" and
         // "brownout" want three completely different investigations, and guessing between them
         // has already cost a day.
-        snprintf(buf, sizeof(buf), "info screen=%s uptime=%lus lock=%d heap=%uk lastreset=%s", name,
+        // ⭐ AND LVGL'S OWN POOL. Every screen, label and button lives in a 5MB block LVGL carved out
+        // of PSRAM at boot, which heap_caps never sees - so an app that leaked its screen on every
+        // open would fill it with the device's other numbers all reading healthy, and then LVGL
+        // would hang on a failed allocation. Read HERE, on the UI task, because the pool is not
+        // safe to walk while LVGL is allocating from it on another.
+        lv_mem_monitor_t lvm;
+        lv_mem_monitor(&lvm);
+        snprintf(buf, sizeof(buf),
+                 "info screen=%s uptime=%lus lock=%d heap=%uk lastreset=%s lvfree=%uk lvbig=%uk lvfrag=%u%%", name,
                  (unsigned long)(lv_tick_get() / 1000), (int)THIS->lockState,
-                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), tdeck_prev_reason_str());
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), tdeck_prev_reason_str(),
+                 (unsigned)(lvm.free_size / 1024), (unsigned)(lvm.free_biggest_size / 1024), (unsigned)lvm.frag_pct);
         tdeck_remote_reply(buf);
         break;
     }
@@ -18378,11 +18400,17 @@ bool TFTView_320x240::updateSDCard(void)
         ILOG_DEBUG("SdCard init successful, card type: %d", sdCard->cardType());
         ISdCard::CardType cardType = sdCard->cardType();
         ISdCard::FatType fatType = sdCard->fatType();
-        uint32_t usedSpace = sdCard->usedBytes() / (1024 * 1024);
-        uint32_t totalSpace = sdCard->cardSize() / (1024 * 1024);
         uint32_t totalSpaceGB = (sdCard->cardSize() + 500000000ULL) / (1000ULL * 1000ULL * 1000ULL);
 
-        sprintf(buf, _("%s: %d GB (%s)\nUsed: %0.2f GB (%d%%)"),
+        // ⛔ NO "USED" FIGURE AT BOOT - IT FROZE THE DEVICE FOR 15 SECONDS EVERY START.
+        // usedBytes() is not a stored number: SdFat works it out by reading the card's ENTIRE
+        // allocation table, and this called it twice. Measured 2026-09-29: the log goes silent at
+        // "SdCard init successful" and the stall watcher fires 15.8s later with the UI task
+        // holding spiLock - which the SD card shares with the screen AND the LoRa radio, so every
+        // boot began with a 15-second radio blackout. The same record, left uncleared, then
+        // labelled a later crash as if it were the cause. Card size and format are instant; the
+        // used-space line on the Meshtastic home page was not worth that.
+        sprintf(buf, _("%s: %d GB (%s)"),
                 cardType == ISdCard::eMMC    ? "MMC"
                 : cardType == ISdCard::eSD   ? "SDSC"
                 : cardType == ISdCard::eSDHC ? "SDHC"
@@ -18392,9 +18420,7 @@ bool TFTView_320x240::updateSDCard(void)
                 fatType == ISdCard::eExFat   ? "exFAT"
                 : fatType == ISdCard::eFat32 ? "FAT32"
                 : fatType == ISdCard::eFat16 ? "FAT16"
-                                             : "???",
-                float(sdCard->usedBytes()) / 1024.0f / 1024.0f / 1024.0f,
-                totalSpace ? ((usedSpace * 100) + totalSpace / 2) / totalSpace : 0);
+                                             : "???");
         Themes::recolorButton(objects.home_sd_card_button, true);
         Themes::recolorText(objects.home_sd_card_label, true);
         cardDetected = true;

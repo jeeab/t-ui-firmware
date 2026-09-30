@@ -120,6 +120,24 @@ void tileCachePut(const char *key, const lv_img_dsc_t *dsc)
 }
 } // namespace
 
+// ⛔ HAND THE DECODED-TILE CACHE BACK WHEN MAPS CLOSES. Twelve 128KB slots is 1.5MB of PSRAM -
+// measured 2026-09-29 as the whole drop from 2.5MB free to 1.0MB on opening Maps - and it was
+// kept for the rest of the session. Chess then could not get the 1MB table it thinks with
+// (largest free block 1,015,796 bytes), so its search silently failed and left the game with
+// Black to move and nobody to move it. A cache is only worth what it saves, and nothing is
+// panning a map that is not on screen; reopening costs one decode per visible tile.
+extern "C" void tdeck_tile_cache_clear(void)
+{
+    for (auto &e : s_tileCache) {
+        if (e.px)
+            tileCacheFree(e.px);
+        e.px = nullptr;
+        e.size = 0;
+        e.key[0] = 0;
+        e.stamp = 0;
+    }
+}
+
 SdFatService::SdFatService() : ITileService(DRIVE_LETTER ":")
 {
     static lv_fs_drv_t drv;

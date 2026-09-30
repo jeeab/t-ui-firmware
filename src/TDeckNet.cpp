@@ -345,6 +345,11 @@ static bool netHttpGet(const char *url)
     if (!s_client) {
         s_client = new WiFiClientSecure();
         s_client->setInsecure(); // public, read-only APIs; no room for a CA bundle
+    // ⛔ 15-SECOND HANDSHAKE CAP. The library default is 120 SECONDS, and the task watchdog fires
+    // at ~90: a TLS handshake that stalls on a weak wi-fi link was rebooting the device before the
+    // library gave up. Caught 2026-09-29 - the log went silent at "net: GET api.open-meteo.com"
+    // (the lock-screen weather refresh) and the watchdog reset the device 77 seconds later.
+        s_client->setHandshakeTimeout(15);
     }
     HTTPClient http;
     http.setConnectTimeout(6000);

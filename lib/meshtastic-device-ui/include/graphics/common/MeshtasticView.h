@@ -6,6 +6,7 @@
 #include "lvgl.h"
 #include "mesh-pb-constants.h"
 #include "util/LogMessage.h"
+#include "util/PsramAlloc.h"
 #include <array>
 #include <stdint.h>
 #include <string>
@@ -171,9 +172,11 @@ class MeshtasticView : public DeviceGUI
 
     ViewController *controller;
     ResponseHandler requests;
-    std::unordered_map<uint32_t, lv_obj_t *> nodes;       // node panels
-    std::unordered_map<uint32_t, lv_obj_t *> messages;    // message containers (within ui_MessagesPanel)
-    std::unordered_map<uint32_t, lv_obj_t *> chats;       // active chats (within ui_ChatPanel)
+    // ⛔ PSRAM-backed: one entry per mesh node (~250 here), and every small allocation that stays
+    // in the internal heap is one Wi-Fi, TLS and the task stacks cannot have. See util/PsramAlloc.h.
+    PsramUnorderedMap<uint32_t, lv_obj_t *> nodes;        // node panels
+    PsramUnorderedMap<uint32_t, lv_obj_t *> messages;     // message containers (within ui_MessagesPanel)
+    PsramUnorderedMap<uint32_t, lv_obj_t *> chats;        // active chats (within ui_ChatPanel)
     std::array<lv_obj_t *, c_max_channels> channel;       // TODO channel name and info
     std::array<lv_obj_t *, c_max_channels> channelGroup;  // message containers for channel group
     uint32_t nodeCount = 1, nodesOnline = 1, ownNode = 0; // node info

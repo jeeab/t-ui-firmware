@@ -328,8 +328,11 @@ class TFTView_320x240 : public MeshtasticView
     };
     // Keyed by the id handed to userMap so the draw callback is a hash lookup, not a scan — a
     // busy mesh has enough nodes that a linear search per marker per redraw would show.
-    std::unordered_map<uint32_t /*markerId*/, NodeMarker> nodeMarkers;
-    std::unordered_map<uint32_t /*nodeNum*/, uint32_t /*markerId*/> nodeMarkerIdByNode;
+    // ⛔ PSRAM-backed. Measured 2026-09-29: with ~245 nodes, opening Maps took 27KB of the internal
+    // heap for these and userMap's objects, never returned, and app-hopping afterwards froze the
+    // device at 4KB free. See util/PsramAlloc.h.
+    PsramUnorderedMap<uint32_t /*markerId*/, NodeMarker> nodeMarkers;
+    PsramUnorderedMap<uint32_t /*nodeNum*/, uint32_t /*markerId*/> nodeMarkerIdByNode;
     // Marker ids live in a range pins can never reach (pins count up from 1 and are saved by id),
     // so the two kinds of marker can share userMap's id space without ever colliding.
     static constexpr uint32_t kNodeMarkerIdBase = 0xF0000000;
@@ -987,7 +990,7 @@ class TFTView_320x240 : public MeshtasticView
     meshtastic_Channel *channel_scratch;                  // temporary scratch copy of channel db
     lv_obj_t *qr;                                         // qr code
     MapPanel *map = nullptr;                              // map
-    std::unordered_map<uint32_t, lv_obj_t *> nodeObjects; // nodeObjects displayed on map
+    PsramUnorderedMap<uint32_t, lv_obj_t *> nodeObjects;  // nodeObjects displayed on map (PSRAM: one per node)
     // extended default device profile struct with additional required data
     struct meshtastic_DeviceProfile_ext : meshtastic_DeviceProfile {
         meshtastic_User user;

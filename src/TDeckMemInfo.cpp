@@ -19,7 +19,10 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <esp_system.h>
+#include <string.h> // strncmp
+#include <time.h>   // gmtime_r
 
+#include "gps/RTC.h" // getValidTime - "last seen alive" stamps for the fault log
 #include "concurrency/OSThread.h" // currentThread — names the thread a stalled main loop is stuck in
 #include "SPILock.h" // spiLock — the one lock every SPI/flash user waits on; a wedged holder = the freeze
 
@@ -74,6 +77,16 @@ static uint32_t s_prevStallMs = 0;         // read back at boot
 static char s_prevStallThread[24] = {0};
 static volatile void *s_loopTask = nullptr; // the main loop's task handle (for eTaskGetState)
 static char s_prevStallLock[64] = {0};      // spiLock holder + loop state at stall time
+
+// ⭐ WHEN, AND ON WHICH FIRMWARE. Until 2026-09-29 a /diaglog.txt line said what happened but not
+// when, so a crash from last month and one from this morning looked identical - and after a fix,
+// there was no telling whether a new line was the old bug or a new one. The previous run's
+// uptime and wall-clock time are refreshed in NVS every two minutes, so the fault line can say
+// "it had been up N seconds, and was last seen alive at T". The firmware version is recorded once
+// per boot, so the line names the build that actually crashed.
+static uint32_t s_prevUpSec = 0;   // uptime at the last "still alive" stamp of the previous run
+static uint32_t s_prevSeenEp = 0;  // UTC epoch at that stamp, 0 = the clock was not set yet
+static char s_prevVer[24] = {0};   // firmware version of the previous run
 
 // The UI task's own heartbeat, so the watcher below can tell WHICH side stopped. Set from
 // tdeck_diag_tick(), which the UI runs once a second.
@@ -133,6 +146,21 @@ static void recordStall(const char *who, uint32_t stuckMs)
 // task and could only see the main loop stall. When both wedge on spiLock together - which is
 // what the 26 unexplained "FROZE (task)" entries in /diaglog.txt are - the watcher went down
 // with them and the reboot recorded nothing at all. This one shares nothing with either.
+// A stall that RECOVERED must not be left in NVS. The record exists to explain a watchdog reset;
+// the boot always stalls once (see TFTView updateSDCard), and before this was cleared that boot
+// stall was carried to the end of the session and printed against whatever crash came hours
+// later - the last CRASH line in /diaglog.txt blamed "pkt-v17", which is the boot config sync.
+static void clearStallRecord(void)
+{
+    Preferences p;
+    if (p.begin("tdeckdiag", false)) {
+        p.remove("stlms");
+        p.remove("stlth");
+        p.remove("stlck");
+        p.end();
+    }
+}
+
 static void stallWatchTask(void *)
 {
     uint32_t writtenLoop = 0, writtenUi = 0;
@@ -147,6 +175,10 @@ static void stallWatchTask(void *)
                 writtenLoop = stuck;
                 recordStall("loop", stuck);
             } else if (stuck < 5000) {
+                if (writtenLoop) {
+                    LOG_INFO("STALL: loop recovered after %lums - record cleared", (unsigned long)writtenLoop);
+                    clearStallRecord();
+                }
                 writtenLoop = 0; // it recovered
             }
         }
@@ -157,6 +189,10 @@ static void stallWatchTask(void *)
                 // The UI stalling is the case that was invisible before; say so plainly.
                 recordStall("ui(tft)", stuck);
             } else if (stuck < 5000) {
+                if (writtenUi) {
+                    LOG_INFO("STALL: ui recovered after %lums - record cleared", (unsigned long)writtenUi);
+                    clearStallRecord();
+                }
                 writtenUi = 0;
             }
         }
@@ -230,6 +266,9 @@ extern "C" void tdeck_diag_boot(void)
         s_prevStallMs = p.getULong("stlms", 0);
         p.getString("stlth", s_prevStallThread, sizeof(s_prevStallThread));
         p.getString("stlck", s_prevStallLock, sizeof(s_prevStallLock));
+        s_prevUpSec = p.getULong("upt", 0);
+        s_prevSeenEp = p.getULong("seen", 0);
+        p.getString("ver", s_prevVer, sizeof(s_prevVer));
         p.end();
     }
     if (s_prevStallMs) { // consume the stall record so it only describes the LAST session
@@ -296,6 +335,21 @@ extern "C" void tdeck_diag_tick(void)
         }
     }
 
+    // "Still alive" stamp, every two minutes. Two small NVS writes; NVS wear-levels, and at this
+    // rate the flash outlives the device many times over.
+    static uint32_t lastStamp = 0;
+    if (millis() - lastStamp >= 120000 || !lastStamp) {
+        lastStamp = millis() | 1;
+        Preferences p;
+        if (p.begin("tdeckdiag", false)) {
+            p.putULong("upt", millis() / 1000);
+            const uint32_t ep = getValidTime(RTCQualityDevice);
+            if (ep)
+                p.putULong("seen", ep);
+            p.end();
+        }
+    }
+
     // Main-loop stall watch (runs on the UI task, which survives most stalls).
     // Arm only once the loop has heartbeat at least once (boot config-sync is slow
     // and would false-alarm), record at 15s stuck, refresh every further 15s so the
@@ -348,6 +402,38 @@ extern "C" void tdeck_diag_tick(void)
             }
         }
     }
+}
+
+// The UI tells us which firmware this is, once per boot. The previous value is read at boot (above)
+// before this overwrites it, so the fault line can name the build that crashed.
+extern "C" void tdeck_diag_set_version(const char *ver)
+{
+    static bool done = false;
+    if (done || !ver)
+        return;
+    done = true;
+    if (!strncmp(s_prevVer, ver, sizeof(s_prevVer)))
+        return; // unchanged - no write
+    Preferences p;
+    if (p.begin("tdeckdiag", false)) {
+        p.putString("ver", ver);
+        p.end();
+    }
+}
+
+// " up=1234s seen=2026-09-29 21:05Z fw=2026.09.29.1" - whatever is known, for the fault line.
+extern "C" void tdeck_prev_when(char *buf, int cap)
+{
+    int n = snprintf(buf, cap, " up=%lus", (unsigned long)s_prevUpSec);
+    if (s_prevSeenEp && n < cap) {
+        time_t t = (time_t)s_prevSeenEp;
+        struct tm tmv;
+        gmtime_r(&t, &tmv);
+        n += snprintf(buf + n, cap - n, " seen=%04d-%02d-%02d %02d:%02dZ", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                      tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
+    }
+    if (s_prevVer[0] && n < cap)
+        snprintf(buf + n, cap - n, " fw=%s", s_prevVer);
 }
 
 extern "C" int tdeck_prev_reason(void)

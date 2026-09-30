@@ -4,6 +4,7 @@
 #include "graphics/map/MapTile.h"
 #include "graphics/map/TileService.h"
 #include "lvgl.h"
+#include "util/PsramAlloc.h"
 
 #include <memory>
 #include <unordered_map>
@@ -78,10 +79,13 @@ class MapPanel
     ~MapPanel(void);
 
   protected:
+    // One per pin and per mesh node on the map, allocated with `new` - so in PSRAM, not the
+    // internal heap (see util/PsramAlloc.h; ~245 of these was a large part of 27KB).
     struct MapObject {
         uint32_t id;
         GeoPoint point;
         DrawCallback draw;
+        TUI_PSRAM_NEW_DELETE
     };
 
     void center(void);
@@ -100,7 +104,7 @@ class MapPanel
     // coordinates) they corrupted each other's progress and retry bookkeeping.
     int16_t redrawX = INT16_MAX;
     int16_t redrawY = INT16_MAX;
-    std::unordered_map<uint32_t, uint32_t> failedTilesRetryAt; // tile hash -> next retry (lv_tick ms)
+    PsramUnorderedMap<uint32_t, uint32_t> failedTilesRetryAt; // tile hash -> next retry (lv_tick ms)
 
     int16_t widthPixel;  // visible panel width
     int16_t heightPixel; // visible panel height
@@ -121,6 +125,6 @@ class MapPanel
     const lv_image_dsc_t *noTileImage; // lvgl image src for displaying "no tile"
     TileService *service;              // tile service provider
     uint32_t objectsOnMap;             // num of visible objcts on map
-    std::unordered_map<uint32_t, std::unique_ptr<MapTile>> tiles;
-    std::unordered_map<uintptr_t, std::unique_ptr<MapObject>> mapObjects;
+    PsramUnorderedMap<uint32_t, std::unique_ptr<MapTile>> tiles;
+    PsramUnorderedMap<uintptr_t, std::unique_ptr<MapObject>> mapObjects;
 };

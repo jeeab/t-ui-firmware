@@ -22,9 +22,17 @@
 // The real constraint is memory, so say memory. Below the floor we stop accepting, which is
 // the crash this exists to prevent. Above it we behave as upstream always did, so there is
 // no backpressure and nothing upstream overflows.
+//
+// ⛔ AND IT MUST BE THE MEMORY THE QUEUE ACTUALLY USES. Until 2026-09-29 this measured the
+// INTERNAL heap, with a 40KB floor - but a settled device sits at 28-40KB internal, so the
+// queue held almost permanently: measured holding from 46 seconds after boot, the screen fed
+// nothing, and Meshtastic's toPhoneQueue full and discarding ("ToPhone queue is full, drop
+// packet") every few seconds. That is missed messages, and the discarded backlog sat in the
+// same internal heap, pushing it lower still. The entries now live in PSRAM (util/Packet.h),
+// so the internal heap is no longer this queue's business; PSRAM is what it spends.
 const uint32_t max_packet_queue_size = 300;             // upstream's ceiling, unchanged
-const uint32_t kQueueHeapFloor = 40 * 1024;             // keep this much internal heap free
-const uint32_t kQueueHeapResume = 48 * 1024;            // ...and this much before accepting again
+const uint32_t kQueuePsramFloor = 256 * 1024;           // keep this much PSRAM free for everyone else
+const uint32_t kQueuePsramResume = 320 * 1024;          // ...and this much before accepting again
 
 SharedQueue *sharedQueue = nullptr;
 
@@ -89,16 +97,21 @@ bool PacketServer::available() const
     assert(queue);
     if (queue->serverQueueSize() >= max_packet_queue_size)
         return false;
-    // Hysteresis, so we do not sit on the floor flapping open and shut once per packet:
-    // stop at 40KB free, and do not start again until 48KB.
+    // Hysteresis, so we do not sit on the floor flapping open and shut once per packet.
     static bool holding = false;
-    const uint32_t freeNow = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+#ifdef BOARD_HAS_PSRAM
+    const uint32_t freeNow = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#else
+    const uint32_t freeNow = kQueuePsramResume; // no PSRAM: the count ceiling is the only limit
+#endif
     if (holding) {
-        if (freeNow >= kQueueHeapResume)
+        if (freeNow >= kQueuePsramResume) {
             holding = false;
-    } else if (freeNow < kQueueHeapFloor) {
+            LOG_INFO("[PacketServer] UI queue flowing again, %u bytes PSRAM free", (unsigned)freeNow);
+        }
+    } else if (freeNow < kQueuePsramFloor) {
         holding = true;
-        LOG_INFO("[PacketServer] holding the UI queue at %u deep, %u bytes free",
+        LOG_INFO("[PacketServer] holding the UI queue at %u deep, %u bytes PSRAM free",
                  (unsigned)queue->serverQueueSize(), (unsigned)freeNow);
     }
     return !holding;

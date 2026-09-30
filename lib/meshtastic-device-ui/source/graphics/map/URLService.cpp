@@ -66,6 +66,7 @@ bool URLService::load(const char *name, void *img)
         // map data, and the S3 has no room for a CA bundle here.
         static WiFiClientSecure secureClient;
         secureClient.setInsecure();
+        secureClient.setHandshakeTimeout(15); // default 120s outlives the ~90s watchdog
         began = http.begin(secureClient, url.c_str());
     } else {
         began = http.begin(url.c_str());
