@@ -355,7 +355,23 @@ static bool netHttpGet(const char *url)
     http.setConnectTimeout(6000);
     http.setTimeout(6000);
     http.setUserAgent("t-ui-tdeck"); // some APIs reject a blank/odd user-agent
-    LOG_INFO("net: GET %s", url);
+    {
+        // ⛔ NEVER LOG A KEY. Gemini carries the user's API key in the query string, and this line
+        // printed the whole URL to the USB log - found 2026-09-29 reading a capture. Everything
+        // from "key=" to the next '&' is masked; the rest of the URL is still worth seeing.
+        char shown[160];
+        snprintf(shown, sizeof(shown), "%s", url);
+        char *k = strstr(shown, "key=");
+        if (k) {
+            char *v = k + 4;
+            char *amp = strchr(v, '&');
+            const char *tail = amp ? amp : "";
+            char rest[64];
+            snprintf(rest, sizeof(rest), "%s", tail);
+            snprintf(v, sizeof(shown) - (v - shown), "***%s", rest);
+        }
+        LOG_INFO("net: GET %s", shown);
+    }
     if (!http.begin(*s_client, url)) {
         LOG_INFO("net: http.begin() failed");
         return false;
