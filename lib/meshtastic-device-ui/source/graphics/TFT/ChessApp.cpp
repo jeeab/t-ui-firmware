@@ -37,6 +37,9 @@ const char *tdeck_chess_level_name(void);
 void chess_open(void);
 void chess_idle_check(void);
 void tdeck_chess_release(void);
+void tdeck_chess_resume(void);
+void tdeck_chess_service(void);
+uint32_t tdeck_chess_version(void);
 }
 
 namespace
@@ -63,7 +66,7 @@ lv_timer_t *tick = nullptr;
 int selected = -1;                 // square the player has picked up, or -1
 unsigned char dests[32];
 int destN = 0;
-bool wasThinking = false;
+uint32_t shownVersion = 0;         // the game version last painted - see the tick below
 
 // Light and dark squares, and the two "something is happening here" tints.
 const uint32_t kLight = 0xE8D4B0, kDark = 0x9A7248;
@@ -164,6 +167,13 @@ void onSquare(lv_event_t *e)
 {
     if (menuOpen() || tdeck_chess_thinking() || tdeck_chess_result())
         return;
+    // Its turn but nothing is thinking: a reloaded game, or a think that could not start for
+    // want of memory (the status line says so). Any tap on the board is "try again".
+    if (!tdeck_chess_player_turn()) {
+        tdeck_chess_request_engine();
+        refreshBoard();
+        return;
+    }
     const int i = (int)(intptr_t)lv_event_get_user_data(e);
     if (selected < 0) {
         destN = tdeck_chess_moves_from(i, dests, sizeof(dests));
@@ -324,13 +334,16 @@ extern "C" void chess_open(void)
         if (lv_group_get_default())
             lv_group_add_obj(lv_group_get_default(), keyCatcher);
 
-        // Repaint when the engine finishes. It moves on the main loop, so the UI has to notice
-        // rather than be told - polling four times a second is cheap and cannot miss it.
+        // Repaint when the game changes. The engine's move lands from the UI poll
+        // (chess_idle_check -> tdeck_chess_service), so this has to notice rather than be told.
+        // ⛔ BY VERSION, NOT BY THE THINKING FLAG. Watching "thinking" go true -> false can miss a
+        // move entirely if both edges fall between two ticks, and then the board sat on the old
+        // position until you touched it.
         tick = lv_timer_create(
             [](lv_timer_t *) {
-                const bool t = tdeck_chess_thinking();
-                if (t != wasThinking) {
-                    wasThinking = t;
+                const uint32_t v = tdeck_chess_version();
+                if (v != shownVersion) {
+                    shownVersion = v;
                     refreshBoard();
                 }
                 // Hold onto keyboard focus while this screen is up, or the spacebar stops
@@ -351,7 +364,11 @@ extern "C" void chess_open(void)
     }
     showMenu(false);
     refreshBoard();
+    shownVersion = tdeck_chess_version();
     lv_screen_load(screen);
+    // A game saved with the engine to move - left mid-think, or a device that restarted - picks up
+    // where it was: it is ITS move, so it thinks. Deferred so the board is on screen first.
+    lv_async_call([](void *) { tdeck_chess_resume(); }, nullptr);
     // ⛔ ADDING THE SINK TO THE GROUP IS NOT ENOUGH - LVGL delivers keys to the FOCUSED object,
     // and without this the spacebar went to whatever was focused on some other screen. The tick
     // below re-takes focus too, because TFTView's poll has its own focus keeper that repoints
@@ -364,6 +381,12 @@ extern "C" void chess_open(void)
 // and 64 piece labels is the largest object count of any app here, so this one matters most.
 extern "C" void chess_idle_check(void)
 {
+    // FIRST, and whether or not the board is on screen: land a finished think. This runs on the
+    // UI task, which is the only task that touches the game - and the one that already holds the
+    // SPI lock the save file needs. A move finished while the app is put away is still played and
+    // saved, and only then can the teardown below go ahead.
+    tdeck_chess_service();
+
     static uint32_t idleSince = 0;
     if (!screen)
         return;

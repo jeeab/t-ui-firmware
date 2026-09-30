@@ -1316,9 +1316,8 @@ extern "C" void tdeck_mail_service(void);
 // deliberately a hash insert and nothing more. See src/TDeckCoverage.cpp.
 extern "C" void tdeck_coverage_service(void);
 extern "C" void tdeck_connstatus_service(void);
-// The chess search. Same rule and the same thread as the others: two seconds of
-// thinking on the UI task would freeze the screen and stall the radio with it.
-extern "C" void tdeck_chess_service(void);
+// (Chess used to be serviced here. Its move is now applied on the UI task - see TDeckChess.h -
+// because from here it wrote the save file with no SPI lock and could lose the move outright.)
 
 // DIAGNOSTIC ONLY - comment out for anything that ships.
 // Runs the app internet door exactly the way the Weather app does: two fetches back to back
@@ -1422,7 +1421,6 @@ void loop()
     tdeck_mail_service();
     tdeck_coverage_service();
     tdeck_connstatus_service(); // 10s wifi/MQTT status poll, off the UI task - see TFTView
-    tdeck_chess_service();
 #ifdef NETDOOR_SELFTEST
     netDoorSelfTest();
 #endif

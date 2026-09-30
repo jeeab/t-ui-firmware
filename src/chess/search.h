@@ -52,6 +52,13 @@ void search_last_info(SearchInfo *info);
 void search_history_clear(void);
 void search_history_push(uint64_t hash);
 void search_history_pop(void);
+// How many times this position has occurred in the game history - 3 is a draw by repetition.
+int search_history_count(uint64_t hash);
+
+// True once search_init() has everything the search needs. The transposition table is optional
+// (it shrinks to fit, or is skipped) so this is the one question that matters to a caller.
+bool search_ready(void);
+unsigned long search_table_entries(void); // for diagnostics: 0 means it is playing without one
 
 // Static evaluation, centipawns, positive = good for the side to move. Exposed for tests.
 int eval_position(const Board *b);
@@ -64,6 +71,8 @@ void search_release(void);
 // Abort the current search from another thread/task. On the device the UI sets this so a long
 // think can be cancelled by the user rather than freezing the app.
 void search_stop(void);
+// Re-arm after a stop. Call before starting a search (search_best_move does not, on purpose).
+void search_clear_stop(void);
 
 #ifdef __cplusplus
 }

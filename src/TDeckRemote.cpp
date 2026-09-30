@@ -46,6 +46,7 @@
 extern "C" void tdeck_fps_set(bool on); // @@fps - LGFXDriver.h
 #include "chess/chess.h"  // @@chess - benchmark the engine on the real chip
 #include "chess/search.h"
+#include "TDeckChess.h" // tdeck_chess_engine_busy - @@chess must not collide with a game in progress
 #include <Arduino.h>
 #include <cstdio>
 #include <cstring>
@@ -137,24 +138,35 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                 int ms = atoi(s_line + 5);
                 if (ms < 200 || ms > 8000)
                     ms = 2000;
-                // The transposition table lives in PSRAM: it is big, cold, and internal RAM is
-                // the scarce thing here (largest free block measured at 20KB). 1MB = 64k entries.
-                search_init([](unsigned long n) -> void * { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); },
-                            1024UL * 1024UL);
-                Board b;
-                chess_init(&b);
-                search_history_clear();
-                Move mv;
-                uint32_t t0 = millis();
-                bool ok = search_best_move(&b, CHESS_MAX, (uint32_t)ms, &mv);
-                uint32_t took = millis() - t0;
-                SearchInfo in;
-                search_last_info(&in);
-                char mbuf[8] = "----";
-                if (ok)
-                    chess_move_str(&mv, mbuf);
-                LOG_INFO("@@ok chess depth=%d nodes=%u ms=%u knps=%u best=%s score=%d", in.depth,
-                         (unsigned)in.nodes, (unsigned)took, (unsigned)(took ? in.nodes / took : 0), mbuf, in.score);
+                // ⛔ NOT WHILE THE CHESS APP OWNS THE ENGINE. The search keeps its state in statics,
+                // and this runs on a different task from the game's search - running both at once
+                // would scribble over the game's tables mid-think. And afterwards, give the
+                // 1.25MB back: a diagnostic must not leave the device poorer than it found it.
+                if (tdeck_chess_engine_busy()) {
+                    LOG_INFO("@@err chess the chess app is using the engine - close it and wait 5s");
+                } else {
+                    // The transposition table lives in PSRAM: it is big, cold, and internal RAM is
+                    // the scarce thing here (largest free block measured at 20KB). 1MB = 64k entries.
+                    search_init([](unsigned long n) -> void * { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); },
+                                1024UL * 1024UL);
+                    Board b;
+                    chess_init(&b);
+                    search_history_clear();
+                    search_clear_stop();
+                    Move mv;
+                    uint32_t t0 = millis();
+                    bool ok = search_ready() && search_best_move(&b, CHESS_MAX, (uint32_t)ms, &mv);
+                    uint32_t took = millis() - t0;
+                    SearchInfo in;
+                    search_last_info(&in);
+                    char mbuf[8] = "----";
+                    if (ok)
+                        chess_move_str(&mv, mbuf);
+                    LOG_INFO("@@ok chess depth=%d nodes=%u ms=%u knps=%u best=%s score=%d tt=%lu", in.depth,
+                             (unsigned)in.nodes, (unsigned)took, (unsigned)(took ? in.nodes / took : 0), mbuf,
+                             in.score, search_table_entries());
+                    search_release();
+                }
             } else if (!strncmp(s_line, "cov", 3)) {
                 // @@cov on | off | clear | stat - drive the coverage mapper over the cable, so
                 // it can be tested without walking around tapping the screen.

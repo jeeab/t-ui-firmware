@@ -191,6 +191,9 @@ static int16_t (*s_history)[128]; // [128][128], int16 is ample for a move-order
 // CONTIGUOUS; every static kilobyte here is one the radio and wi-fi cannot have.
 static uint64_t *s_gameHist = NULL;
 static int s_gameHistN = 0;
+// Pushes that did not fit. Counted so the matching pops cancel THEM rather than eating real
+// entries - otherwise a very long game would silently lose the positions repetition needs.
+static int s_gameHistLost = 0;
 
 // PSRAM with the rest of the search tables: internal RAM is what the TLS handshake
 // needs contiguously, and 768 bytes of it for move ordering is a bad trade.
@@ -200,8 +203,17 @@ static Move (*s_killers)[2];
 
 void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes)
 {
-    if (s_tt)
+    // ⛔ "ALREADY SET UP" MEANS THE MOVE STACK, NOT THE TABLE. The search cannot run without the
+    // stack; it plays perfectly well (a little weaker) without the table. This used to key off
+    // the table and bail out the moment the 1MB allocation failed - which after the map tile
+    // cache had taken 1.5MB of PSRAM it did, every time (largest free block 1,015,796 bytes,
+    // measured 2026-09-29) - leaving NOTHING allocated and the engine answering "No move".
+    if (s_moveStack)
         return;
+    // The rules half needs an allocator too, for its Zobrist tables. First, so a failure below
+    // cannot leave it on the default.
+    chess_set_alloc(allocFn);
+
     if (tableBytes < sizeof(TTEntry) * 1024)
         tableBytes = sizeof(TTEntry) * 1024;
     uint32_t n = (uint32_t)(tableBytes / sizeof(TTEntry));
@@ -210,13 +222,19 @@ void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes
     uint32_t p = 1;
     while (p * 2 <= n)
         p *= 2;
-    s_tt = (TTEntry *)(allocFn ? allocFn((unsigned long)p * sizeof(TTEntry)) : calloc(p, sizeof(TTEntry)));
-    if (!s_tt) {
-        s_ttCount = 0;
-        return;
+    // Take the biggest table there is room for, halving down to 16K entries rather than giving up.
+    // A quarter-size table costs a few percent of strength; no table at all still plays.
+    s_tt = NULL;
+    s_ttCount = 0;
+    for (; p >= 1024; p /= 2) {
+        s_tt = (TTEntry *)(allocFn ? allocFn((unsigned long)p * sizeof(TTEntry)) : calloc(p, sizeof(TTEntry)));
+        if (s_tt)
+            break;
     }
-    memset(s_tt, 0, (size_t)p * sizeof(TTEntry));
-    s_ttCount = p;
+    if (s_tt) {
+        memset(s_tt, 0, (size_t)p * sizeof(TTEntry));
+        s_ttCount = p;
+    }
 
     // One list per ply, plus a margin: quiescence can extend past MAX_PLY in a wild position and
     // running off the end of this would corrupt whatever follows it rather than simply playing
@@ -231,8 +249,20 @@ void search_init(void *(*allocFn)(unsigned long bytes), unsigned long tableBytes
                                      : calloc((size_t)MAX_PLY * 2, sizeof(Move)));
     if (s_history)
         memset(s_history, 0, 128UL * 128UL * sizeof(int16_t));
-    // The rules half needs an allocator too, for its Zobrist tables.
-    chess_set_alloc(allocFn);
+    // All or nothing for the parts the search indexes without checking. A half-built set would be
+    // worse than none: search_ready() would say yes and the search would walk off a null pointer.
+    if (!s_moveStack || !s_gameHist || !s_killers || !s_history)
+        search_release();
+}
+
+bool search_ready(void)
+{
+    return s_moveStack != NULL;
+}
+
+unsigned long search_table_entries(void)
+{
+    return s_ttCount;
 }
 
 // ---- search state ----------------------------------------------------------------------------
@@ -243,6 +273,10 @@ static bool s_timeUp;
 static SearchInfo s_info;
 
 void search_stop(void) { s_abort = true; }
+// ⛔ CLEARED BY THE CALLER BEFORE A SEARCH, NOT BY THE SEARCH ITSELF. search_best_move() used to
+// reset the flag on entry, so a Stop that arrived between "start thinking" and the search task
+// actually starting was wiped out, and a cancelled think ran its full ten seconds.
+void search_clear_stop(void) { s_abort = false; }
 
 // ⭐ GIVE THE TABLES BACK. Measured on the device: opening chess takes 1,250,764 bytes of PSRAM
 // - a 1MB transposition table, a 96KB move stack, a 32KB history table - and before this it was
@@ -275,22 +309,39 @@ void search_release(void)
         free(s_gameHist);
         s_gameHist = NULL;
         s_gameHistN = 0;
+        s_gameHistLost = 0;
     }
     if (s_killers) {
         free(s_killers);
         s_killers = NULL;
     }
 }
-void search_history_clear(void) { s_gameHistN = 0; }
+void search_history_clear(void)
+{
+    s_gameHistN = 0;
+    s_gameHistLost = 0;
+}
 void search_history_push(uint64_t h)
 {
-    if (s_gameHist && s_gameHistN < 512)
+    if (s_gameHist && s_gameHistN < 512 && !s_gameHistLost)
         s_gameHist[s_gameHistN++] = h;
+    else
+        s_gameHistLost++;
 }
 void search_history_pop(void)
 {
-    if (s_gameHistN)
+    if (s_gameHistLost)
+        s_gameHistLost--;
+    else if (s_gameHistN)
         s_gameHistN--;
+}
+int search_history_count(uint64_t h)
+{
+    int n = 0;
+    for (int i = 0; s_gameHist && i < s_gameHistN; i++)
+        if (s_gameHist[i] == h)
+            n++;
+    return n;
 }
 
 static bool isRepetition(const Board *b)
@@ -582,7 +633,6 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     }
 
     s_nodes = 0;
-    s_abort = false;
     s_timeUp = false;
     if (s_killers)
         memset(s_killers, 0, (size_t)MAX_PLY * 2 * sizeof(Move));
@@ -593,9 +643,12 @@ bool search_best_move(Board *b, ChessLevel lv, uint32_t msBudget, Move *out)
     s_deadline = start + budget;
 
     // Root scores are kept so the weak levels can choose a slightly-worse move on purpose.
-    static int16_t *rootScore = NULL;
-    if (!rootScore)
-        rootScore = (int16_t *)((char *)PLY_LIST(MAX_PLY + 4)); // a spare slot, reused as scores
+    // ⛔ WORKED OUT FRESH EVERY CALL - NEVER CACHED IN A STATIC. It points into the move stack,
+    // and search_release() frees that stack whenever the chess app is put away. The cached
+    // version kept aiming at the FIRST stack ever allocated, so every game after the first wrote
+    // up to 512 bytes of scores into PSRAM that had been handed back - to the map's tile cache,
+    // a Lua app, whatever took it next. Heap corruption that crashes something else, later.
+    int16_t *rootScore = (int16_t *)((char *)PLY_LIST(MAX_PLY + 4)); // a spare slot, reused as scores
     Move *rootMove = PLY_LIST(MAX_PLY + 5); // borrow a reserved slot rather than 1.5KB of .bss
     int rootN = 0;
     int completedDepth = 0, bestScore = 0;
