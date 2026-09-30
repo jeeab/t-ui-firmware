@@ -37,6 +37,11 @@ extern "C" bool tdeck_mail_item(int i, unsigned *seq, const char **from, const c
 extern "C" bool tdeck_mail_read(unsigned seq);
 extern "C" const char *tdeck_mail_body(void);
 extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char *body);
+extern "C" bool tdeck_mail_send_ex(const char *to, const char *subject, const char *body, bool asReply);
+extern "C" const char *tdeck_mail_read_reply_addr(void);
+extern "C" const char *tdeck_mail_read_from(void);
+extern "C" const char *tdeck_mail_read_date(void);
+extern "C" const char *tdeck_mail_read_subject(void);
 
 static lv_obj_t *screen = nullptr;
 static lv_obj_t *addrArea = nullptr;
@@ -63,6 +68,22 @@ static lv_obj_t *toArea = nullptr, *subjArea = nullptr, *bodyArea = nullptr, *co
 enum UiWant { WANT_NONE = 0, WANT_COUNT, WANT_LIST, WANT_BODY, WANT_SEND };
 static int uiWant = WANT_NONE;
 static unsigned rowSeq[MAIL_ROWS] = {0};
+
+// ---- Reply / Forward / Who? ----------------------------------------------------------------
+// Jake, 2026-09-26: "In the mail app, can there be a forward, reply buttons? Maybe be able to pull
+// from your contacts on gmail when writing an email".
+//
+// ⛔ CONTACTS ARE NOT GOOGLE CONTACTS, AND SAY SO. The address book needs Google's OAuth and
+// People API; an app password unlocks mail and nothing else. What is offered instead is the
+// useful part of it: the people you have written to from this device (kept in /mailto.txt, one
+// address a line, newest first) and the senders on the inbox page you last opened.
+enum ComposeKind { COMPOSE_NEW = 0, COMPOSE_REPLY, COMPOSE_FORWARD };
+static int composeKind = COMPOSE_NEW;
+static int composeReturn = 2;     // VIEW_STATUS - where Cancel goes (the read view, for a reply)
+static bool bodyLoaded = false;    // Reply/Forward quote the body, so they wait for it
+static lv_obj_t *whoBox = nullptr; // the address picker, built each time it opens
+static const char *kSentFile = "/mailto.txt";
+static const int kSentMax = 12;
 
 // Read back just the address line. ⛔ Deliberately does NOT read line 2 - nothing outside
 // onSave has any business holding the password, and a helper that returns it would get reused.
@@ -445,10 +466,238 @@ static void onRow(lv_event_t *e)
     if (readTxt)
         lv_label_set_text(readTxt, "loading...");
     showView(VIEW_READ);
+    bodyLoaded = false;
     uiWant = WANT_BODY;
     checking = tdeck_mail_read(rowSeq[i]);
     if (!checking && readTxt)
         lv_label_set_text(readTxt, "busy - try again in a moment");
+}
+
+// The address inside "Name <addr>", or the whole thing. False if what is left does not look like
+// an address - including one the inbox list cut short, which has a '<' and no '>'.
+static bool bareAddr(const char *in, char *out, int cap)
+{
+    out[0] = 0;
+    if (!in)
+        return false;
+    const char *lt = strchr(in, '<');
+    const char *gt = lt ? strchr(lt, '>') : nullptr;
+    if (lt && !gt)
+        return false; // truncated
+    const char *s = lt ? lt + 1 : in;
+    int n = lt ? (int)(gt - s) : (int)strlen(in);
+    while (n > 0 && (*s == ' ' || *s == '"'))
+        s++, n--;
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '"' || s[n - 1] == '\r' || s[n - 1] == '\n'))
+        n--;
+    if (n <= 0 || n >= cap)
+        return false;
+    memcpy(out, s, n);
+    out[n] = 0;
+    const char *at = strchr(out, '@');
+    return at && at != out && strchr(at, '.') && !strchr(out, ' ');
+}
+
+// Keep the newest kSentMax distinct recipients, newest first. UI task: it holds the SPI lock the
+// card needs.
+static void rememberRecipient(const char *to)
+{
+    char addr[96];
+    if (!bareAddr(to, addr, sizeof(addr)))
+        return;
+    char list[kSentMax][96];
+    int n = 0;
+    FsFile f = SDFs.open(kSentFile, O_RDONLY);
+    if (f) {
+        char line[96];
+        while (n < kSentMax && f.fgets(line, sizeof(line)) > 0) {
+            char a[96];
+            if (bareAddr(line, a, sizeof(a)) && strcasecmp(a, addr))
+                strcpy(list[n++], a);
+        }
+        f.close();
+    }
+    FsFile w = SDFs.open(kSentFile, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!w)
+        return;
+    w.println(addr);
+    for (int i = 0; i < n && i < kSentMax - 1; i++)
+        w.println(list[i]);
+    w.close();
+}
+
+static void closeWho(void)
+{
+    if (whoBox) {
+        lv_obj_delete(whoBox);
+        whoBox = nullptr;
+    }
+}
+
+static void onWhoPick(lv_event_t *e)
+{
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl && toArea)
+        lv_textarea_set_text(toArea, lv_label_get_text(lbl));
+    // ⛔ NOT closeWho() HERE: that deletes the button whose handler is running, the shape that
+    // has hung this device before. Deferred to after the event returns.
+    lv_async_call([](void *) { closeWho(); }, nullptr);
+}
+
+static void openWho(lv_event_t *)
+{
+    closeWho();
+    // Collect: people written to from here first, then this inbox page's senders. Distinct.
+    char seen[16][96];
+    int n = 0;
+    auto add = [&](const char *raw) {
+        char a[96];
+        if (n >= 16 || !bareAddr(raw, a, sizeof(a)))
+            return;
+        for (int i = 0; i < n; i++)
+            if (!strcasecmp(seen[i], a))
+                return;
+        strcpy(seen[n++], a);
+    };
+    FsFile f = SDFs.open(kSentFile, O_RDONLY);
+    if (f) {
+        char line[96];
+        while (f.fgets(line, sizeof(line)) > 0)
+            add(line);
+        f.close();
+    }
+    for (int i = 0; i < tdeck_mail_list_count(); i++) {
+        unsigned seq;
+        const char *from = "", *subj = "", *date = "";
+        bool s;
+        if (tdeck_mail_item(i, &seq, &from, &subj, &date, &s))
+            add(from);
+    }
+
+    whoBox = lv_obj_create(composeBox);
+    lv_obj_set_pos(whoBox, 4, 30);
+    lv_obj_set_size(whoBox, 312, 158);
+    lv_obj_set_style_bg_color(whoBox, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
+    lv_obj_set_style_border_color(whoBox, lv_color_hex(0x48484a), LV_PART_MAIN);
+    lv_obj_set_style_border_width(whoBox, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(whoBox, 4, LV_PART_MAIN);
+    lv_obj_set_flex_flow(whoBox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(whoBox, 3, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(whoBox, LV_DIR_VER);
+    if (!n) {
+        lv_obj_t *l = lv_label_create(whoBox);
+        lv_obj_set_width(l, 296);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_label_set_text(l, "Nobody yet. People you write to appear here, and so do the senders "
+                             "on the inbox page you last opened. (Google contacts need a sign-in "
+                             "an app password cannot give.)");
+    }
+    for (int i = 0; i < n; i++) {
+        lv_obj_t *b = lv_btn_create(whoBox);
+        lv_obj_set_size(b, 296, 26);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_radius(b, 6, LV_PART_MAIN);
+        lv_obj_t *l = lv_label_create(b);
+        lv_obj_set_width(l, 284);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(l, &ui_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(l, seen[i]);
+        lv_obj_center(l);
+        lv_obj_add_event_cb(b, onWhoPick, LV_EVENT_CLICKED, nullptr);
+    }
+    lv_obj_t *c = lv_btn_create(whoBox);
+    lv_obj_set_size(c, 296, 26);
+    lv_obj_set_style_bg_color(c, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_t *cl = lv_label_create(c);
+    lv_label_set_text(cl, "Close");
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(
+        c, [](lv_event_t *) { lv_async_call([](void *) { closeWho(); }, nullptr); }, LV_EVENT_CLICKED, nullptr);
+}
+
+// Start a fresh compose of the given kind. `back` is the view Cancel returns to.
+static void beginCompose(int kind, int back)
+{
+    closeWho();
+    // A draft of the SAME kind survives (Write, Cancel, Write again keeps what you typed); a
+    // switch of kind starts clean, so a reply's quoted text never turns up in a new message.
+    if (kind != composeKind || kind != COMPOSE_NEW) {
+        lv_textarea_set_text(toArea, "");
+        lv_textarea_set_text(subjArea, "");
+        lv_textarea_set_text(bodyArea, "");
+    }
+    composeKind = kind;
+    composeReturn = back;
+    lv_label_set_text(composeMsg, "");
+    showView(VIEW_COMPOSE);
+}
+
+static bool startsWithNoCase(const char *s, const char *prefix)
+{
+    return s && !strncasecmp(s, prefix, strlen(prefix));
+}
+
+// Reply and Forward both start from the message on screen. The quoted text is capped: the
+// compose box is for writing, and a whole newsletter quoted back is only weight on the send.
+static void onReplyOrForward(bool forward)
+{
+    if (!bodyLoaded)
+        return; // still loading - there is nothing to quote yet
+    const char *subj = tdeck_mail_read_subject();
+    const char *from = tdeck_mail_read_from();
+    const char *date = tdeck_mail_read_date();
+    const char *body = readTxt ? lv_label_get_text(readTxt) : "";
+    beginCompose(forward ? COMPOSE_FORWARD : COMPOSE_REPLY, VIEW_READ);
+
+    char s[140];
+    if (forward)
+        snprintf(s, sizeof(s), "%s%s", startsWithNoCase(subj, "fwd:") ? "" : "Fwd: ", subj);
+    else
+        snprintf(s, sizeof(s), "%s%s", startsWithNoCase(subj, "re:") ? "" : "Re: ", subj);
+    lv_textarea_set_text(subjArea, s);
+
+    const int kQuote = forward ? 6000 : 1500;
+    const size_t cap = (size_t)kQuote + 512;
+    char *buf = (char *)lv_malloc(cap); // LVGL's pool is PSRAM on this board
+    if (!buf)
+        return;
+    int o;
+    if (forward) {
+        o = snprintf(buf, cap, "\n\n---------- Forwarded message ---------\nFrom: %s\nDate: %s\nSubject: %s\n\n",
+                     from, date, subj);
+        for (const char *p = body; *p && o < (int)cap - 1 && (p - body) < kQuote; p++)
+            buf[o++] = *p;
+    } else {
+        o = snprintf(buf, cap, "\n\nOn %s, %s wrote:\n> ", date, from);
+        // Quote it the way mail does: every line starts "> ".
+        for (const char *p = body; *p && o < (int)cap - 4 && (p - body) < kQuote; p++) {
+            buf[o++] = *p;
+            if (*p == '\n' && p[1]) {
+                buf[o++] = '>';
+                buf[o++] = ' ';
+            }
+        }
+    }
+    buf[o < (int)cap ? o : (int)cap - 1] = 0;
+    lv_textarea_set_text(bodyArea, buf);
+    lv_free(buf);
+
+    if (forward) {
+        lv_textarea_set_text(toArea, "");
+        if (lv_group_get_default())
+            lv_group_focus_obj(toArea);
+    } else {
+        char addr[96];
+        const char *ra = tdeck_mail_read_reply_addr();
+        lv_textarea_set_text(toArea, (ra && ra[0]) ? ra : (bareAddr(from, addr, sizeof(addr)) ? addr : ""));
+        // The cursor goes ABOVE the quote, where the reply is written.
+        lv_textarea_set_cursor_pos(bodyArea, 0);
+        if (lv_group_get_default())
+            lv_group_focus_obj(bodyArea);
+    }
 }
 
 static void onSend(lv_event_t *)
@@ -458,9 +707,11 @@ static void onSend(lv_event_t *)
         lv_label_set_text(composeMsg, "Who is it going to?");
         return;
     }
+    closeWho();
     lv_label_set_text(composeMsg, "Sending...");
     uiWant = WANT_SEND;
-    checking = tdeck_mail_send(to, lv_textarea_get_text(subjArea), lv_textarea_get_text(bodyArea));
+    checking = tdeck_mail_send_ex(to, lv_textarea_get_text(subjArea), lv_textarea_get_text(bodyArea),
+                                  composeKind == COMPOSE_REPLY);
     if (!checking)
         lv_label_set_text(composeMsg, "Busy - try again in a moment");
 }
@@ -512,9 +763,12 @@ extern "C" void mail_service_ui(void)
             const char *b = tdeck_mail_body();
             lv_label_set_text(readTxt, (b && *b) ? b : "(no readable text in this message)");
         }
+        bodyLoaded = true;
         break;
     case WANT_SEND:
         lv_label_set_text(composeMsg, "Sent");
+        rememberRecipient(lv_textarea_get_text(toArea)); // for the Who? list next time
+        composeKind = COMPOSE_NEW;
         lv_textarea_set_text(toArea, "");
         lv_textarea_set_text(subjArea, "");
         lv_textarea_set_text(bodyArea, "");
@@ -765,10 +1019,8 @@ extern "C" void mail_open(void)
         });
         lv_obj_set_size(inbx, 150, 32);
         lv_obj_set_pos(inbx, 4, 92);
-        lv_obj_t *wr = makeButton(statusBox, "Write", 0xff9f0a, [](lv_event_t *) {
-            lv_label_set_text(composeMsg, "");
-            showView(VIEW_COMPOSE);
-        });
+        lv_obj_t *wr = makeButton(statusBox, "Write", 0xff9f0a,
+                                  [](lv_event_t *) { beginCompose(COMPOSE_NEW, VIEW_STATUS); });
         lv_obj_set_size(wr, 158, 32);
         lv_obj_set_pos(wr, 158, 92);
 
@@ -867,10 +1119,15 @@ extern "C" void mail_open(void)
             lv_obj_set_style_text_font(readTxt, &ui_font_montserrat_12, LV_PART_MAIN);
             lv_obj_set_style_text_color(readTxt, lv_color_hex(0xffffff), LV_PART_MAIN);
             lv_label_set_text(readTxt, "");
-            lv_obj_t *bk = makeButton(readBox, "Back to inbox", 0x3a3a3c,
-                                      [](lv_event_t *) { showView(VIEW_LIST); });
-            lv_obj_set_size(bk, 150, 28);
+            lv_obj_t *bk = makeButton(readBox, "Back", 0x3a3a3c, [](lv_event_t *) { showView(VIEW_LIST); });
+            lv_obj_set_size(bk, 88, 28);
             lv_obj_set_pos(bk, 4, 182);
+            lv_obj_t *rp = makeButton(readBox, "Reply", 0x0a84ff, [](lv_event_t *) { onReplyOrForward(false); });
+            lv_obj_set_size(rp, 108, 28);
+            lv_obj_set_pos(rp, 96, 182);
+            lv_obj_t *fw = makeButton(readBox, "Forward", 0x3a3a3c, [](lv_event_t *) { onReplyOrForward(true); });
+            lv_obj_set_size(fw, 108, 28);
+            lv_obj_set_pos(fw, 208, 182);
         }
 
         // ---------- compose ----------
@@ -901,13 +1158,19 @@ extern "C" void mail_open(void)
                 return t;
             };
             toArea = field("To: someone@example.com", 0, 28, true);
+            lv_obj_set_width(toArea, 254);
+            lv_obj_t *who = makeButton(composeBox, "Who?", 0x3a3a3c, openWho);
+            lv_obj_set_size(who, 54, 28);
+            lv_obj_set_pos(who, 262, 0);
             subjArea = field("Subject", 32, 28, true);
             bodyArea = field("Message", 64, 88, false);
             lv_obj_t *sb = makeButton(composeBox, "Send", 0x30d158, onSend);
             lv_obj_set_size(sb, 150, 30);
             lv_obj_set_pos(sb, 4, 158);
-            lv_obj_t *cb = makeButton(composeBox, "Cancel", 0x3a3a3c,
-                                      [](lv_event_t *) { showView(VIEW_STATUS); });
+            lv_obj_t *cb = makeButton(composeBox, "Cancel", 0x3a3a3c, [](lv_event_t *) {
+                closeWho();
+                showView(composeReturn);
+            });
             lv_obj_set_size(cb, 158, 30);
             lv_obj_set_pos(cb, 158, 158);
             composeMsg = lv_label_create(composeBox);

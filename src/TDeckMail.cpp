@@ -137,6 +137,26 @@ static char s_sendTo[96] = {0};
 static char s_sendSubj[120] = {0};
 static char *s_sendBody = nullptr;
 
+// ⭐ THE MESSAGE BEING READ, as Reply and Forward need it. Taken from the RAW headers of the
+// fetched message rather than the inbox list, because the list keeps only 54 characters of the
+// From line for display - enough to show a name, not always enough to hold the whole address.
+static char s_rdReplyTo[96] = {0};  // Reply-To if the sender set one, otherwise From - the ADDRESS only
+static char s_rdFrom[120] = {0};    // the full From line, for "On <date>, <from> wrote:"
+static char s_rdDate[64] = {0};
+static char s_rdSubj[120] = {0};
+static char s_rdMsgId[160] = {0};   // for In-Reply-To, so Gmail threads the reply with the original
+static char s_rdRefs[320] = {0};    // References of the original, extended with its Message-ID
+// Set for one send: thread it under the message last read.
+static bool s_sendAsReply = false;
+static char s_sendInReplyTo[160] = {0};
+static char s_sendRefs[320] = {0};
+
+// Why the last IMAP command failed, so a DROPPED CONNECTION is never reported as a WRONG
+// PASSWORD. imapCmd() used to return one false for both, and LOGIN turned every false into
+// "login rejected - check the app password" - Jake was sent to check a password that was fine.
+static bool s_imapIoFail = false;   // the connection went quiet or closed mid-command
+static char s_imapTagged[120] = {0}; // the server's tagged reply, e.g. "a1 NO [AUTHENTICATIONFAILED] ..."
+
 static void mailFail(const char *why)
 {
     strncpy(s_err, why, sizeof(s_err) - 1);
@@ -332,8 +352,9 @@ static void decodeWords(char *s)
     strncpy(s, out, o + 1);
 }
 
-// Pull one header out of a fetched header blob, unfolding continuation lines.
-static void hdrField(const char *blob, const char *name, char *out, int cap)
+// Pull one header out of a fetched header blob, unfolding continuation lines. `decode` turns
+// MIME encoded words into text - right for a subject or a name, wrong for an id.
+static void hdrField(const char *blob, const char *name, char *out, int cap, bool decode = true)
 {
     out[0] = 0;
     const int nlen = (int)strlen(name);
@@ -352,7 +373,8 @@ static void hdrField(const char *blob, const char *name, char *out, int cap)
                 out[o++] = *p++;
             }
             out[o] = 0;
-            decodeWords(out);
+            if (decode)
+                decodeWords(out);
             return;
         }
         while (*p && *p != '\n')
@@ -369,17 +391,25 @@ static bool imapCmd(WiFiClientSecure &c, const char *tag, const char *cmd, const
 {
     c.printf("%s %s\r\n", tag, cmd);
     char line[320];
+    s_imapIoFail = false;
+    s_imapTagged[0] = 0;
     for (int guard = 0; guard < 60; guard++) {
-        if (!imapLine(c, line, sizeof(line)))
+        if (!imapLine(c, line, sizeof(line))) {
+            s_imapIoFail = true;
             return false;
+        }
         if (want && capture && strstr(line, want)) {
             strncpy(capture, line, capN - 1);
             capture[capN - 1] = 0;
         }
         // The tagged response ends the command. Anything before it is untagged chatter.
-        if (!strncmp(line, tag, strlen(tag)) && line[strlen(tag)] == ' ')
+        if (!strncmp(line, tag, strlen(tag)) && line[strlen(tag)] == ' ') {
+            strncpy(s_imapTagged, line, sizeof(s_imapTagged) - 1);
+            s_imapTagged[sizeof(s_imapTagged) - 1] = 0;
             return strstr(line + strlen(tag), " OK") == line + strlen(tag);
+        }
     }
+    s_imapIoFail = true; // 60 lines and never the tagged reply: the conversation is out of step
     return false;
 }
 
@@ -569,8 +599,66 @@ static void extractText(char *raw, int len)
     s_bodyLen = o;
 }
 
+// The address inside "Name <addr>", or the whole thing if there are no angle brackets.
+static void bareAddress(const char *in, char *out, int cap)
+{
+    const char *lt = strchr(in, '<');
+    const char *gt = lt ? strchr(lt, '>') : nullptr;
+    const char *s = lt && gt ? lt + 1 : in;
+    int n = lt && gt ? (int)(gt - s) : (int)strlen(in);
+    while (n > 0 && (*s == ' ' || *s == '"')) {
+        s++;
+        n--;
+    }
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '"'))
+        n--;
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(out, s, n);
+    out[n] = 0;
+}
+
+// ⭐ HEADERS ONLY. The search stops at the blank line that ends them: a forwarded message quoted
+// in the BODY has its own "From:" lines, and replying to one of those instead of the sender would
+// be a quiet, embarrassing misdelivery.
+static void captureReplyHeaders(char *raw)
+{
+    char *end = strstr(raw, "\r\n\r\n");
+    if (!end)
+        end = strstr(raw, "\n\n");
+    char saved = 0;
+    if (end) {
+        saved = *end;
+        *end = 0;
+    }
+    char tmp[160];
+    hdrField(raw, "Reply-To:", tmp, sizeof(tmp));
+    if (!tmp[0])
+        hdrField(raw, "From:", tmp, sizeof(tmp));
+    bareAddress(tmp, s_rdReplyTo, sizeof(s_rdReplyTo));
+    hdrField(raw, "From:", s_rdFrom, sizeof(s_rdFrom));
+    hdrField(raw, "Date:", s_rdDate, sizeof(s_rdDate));
+    hdrField(raw, "Subject:", s_rdSubj, sizeof(s_rdSubj));
+    // ⛔ RAW, NOT DECODED: hdrField() runs every value through decodeWords(), whose buffer is 160
+    // characters - a long References chain came back cut off mid-id, and a broken id threads
+    // nothing. These are ids, never encoded words, so they are copied as they are.
+    hdrField(raw, "Message-ID:", s_rdMsgId, sizeof(s_rdMsgId), false);
+    char refs[320];
+    hdrField(raw, "References:", refs, sizeof(refs), false);
+    // References = the original's References plus its own Message-ID. If the chain is too long
+    // to carry whole, the parent's id alone is what RFC 5322 falls back to - a truncated chain
+    // would have lost the NEWEST ids, which are the ones threading matches on.
+    if (strlen(refs) < sizeof(refs) - 2 && strlen(refs) + strlen(s_rdMsgId) + 2 < sizeof(s_rdRefs))
+        snprintf(s_rdRefs, sizeof(s_rdRefs), "%s%s%s", refs, refs[0] ? " " : "", s_rdMsgId);
+    else
+        strncpy(s_rdRefs, s_rdMsgId, sizeof(s_rdRefs) - 1);
+    if (end)
+        *end = saved;
+}
+
 static bool imapReadOne(WiFiClientSecure &c)
 {
+    s_rdReplyTo[0] = s_rdFrom[0] = s_rdDate[0] = s_rdSubj[0] = s_rdMsgId[0] = s_rdRefs[0] = 0;
     if (!imapCmd(c, "c1", "SELECT INBOX")) {
         mailFail("could not open the inbox");
         return false;
@@ -607,6 +695,7 @@ static bool imapReadOne(WiFiClientSecure &c)
             return false;
         }
         const int kept = readLiteral(c, n, raw, kBodyCap);
+        captureReplyHeaders(raw);
         extractText(raw, kept);
         heap_caps_free(raw);
         if (n > kBodyCap)
@@ -659,6 +748,7 @@ static bool smtpSend(void)
     }
     c->setCACert(kGtsRootR1);
     c->setTimeout(10000);
+    c->setHandshakeTimeout(15); // library default is 120s, past the ~90s watchdog - see TDeckNet.cpp
     LOG_INFO("smtp: connecting to %s:%d", kSmtpHost, kSmtpPort);
     if (!c->connect(kSmtpHost, kSmtpPort)) {
         mailFail("could not reach the mail server");
@@ -715,20 +805,51 @@ static bool smtpSend(void)
     }
     c->printf("From: <%s>\r\n", s_user);
     c->printf("To: <%s>\r\n", s_sendTo);
-    c->printf("Subject: %s\r\n", s_sendSubj);
-    c->print("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+    {
+        // ⚠️ A HEADER MUST BE 7-BIT. A reply copies the original subject, and that is often
+        // UTF-8 (an emoji, an accented name); sent raw, some servers reject it and some mangle it.
+        // RFC 2047 "encoded word" when anything is outside ASCII - the same form decodeWords()
+        // reads on the way in.
+        bool ascii = true;
+        for (const char *p = s_sendSubj; *p; p++)
+            if ((unsigned char)*p > 126)
+                ascii = false;
+        if (ascii) {
+            c->printf("Subject: %s\r\n", s_sendSubj);
+        } else {
+            char b64[180];
+            b64encode(s_sendSubj, (int)strlen(s_sendSubj), b64, sizeof(b64));
+            c->printf("Subject: =?UTF-8?B?%s?=\r\n", b64);
+        }
+    }
+    if (s_sendAsReply && s_sendInReplyTo[0]) {
+        // What makes Gmail file the reply in the same conversation as the original.
+        c->printf("In-Reply-To: %s\r\n", s_sendInReplyTo);
+        c->printf("References: %s\r\n", s_sendRefs[0] ? s_sendRefs : s_sendInReplyTo);
+    }
+    c->print("MIME-Version: 1.0\r\n");
+    c->print("Content-Type: text/plain; charset=utf-8\r\n");
+    c->print("Content-Transfer-Encoding: 8bit\r\n\r\n");
     if (s_sendBody) {
         // ⚠️ DOT-STUFFING. A line consisting of a single "." ends the message, so a body
         // containing one would truncate the mail and leave the rest as garbage commands. Any
         // line starting with "." gets a second one, which the receiver strips. Rare, and
         // silently corrupting when missed.
+        //
+        // ⚠️ AND CRLF. The textarea gives bare "\n", and SMTP lines end "\r\n". Gmail has been
+        // forgiving; plenty of servers now reject a bare LF outright (it is how SMTP smuggling
+        // works), and a reply goes wherever the other person's mail lives.
         const char *p = s_sendBody;
         bool lineStart = true;
+        char prev = 0;
         while (*p) {
             if (lineStart && *p == '.')
                 c->print('.');
+            if (*p == '\n' && prev != '\r')
+                c->print('\r');
             c->print(*p);
             lineStart = (*p == '\n');
+            prev = *p;
             p++;
         }
     }
@@ -763,6 +884,7 @@ static bool imapCheck(void)
     // ⭐ THE WHOLE POINT. Not setInsecure(): a password is going over this socket.
     c->setCACert(kGtsRootR1);
     c->setTimeout(8000);
+    c->setHandshakeTimeout(15); // library default is 120s, past the ~90s watchdog - see TDeckNet.cpp
     // ⭐ RETRY THE CONNECT. The FIRST TLS connect after wi-fi has just come up fails often enough
     // that one attempt is not a fair test of anything - measured on this device with Get Apps,
     // where attempt 1 returned -11 and attempt 2 returned the catalog, seconds apart. Jake hit
@@ -790,6 +912,7 @@ static bool imapCheck(void)
             }
             c->setCACert(kGtsRootR1);
             c->setTimeout(8000);
+            c->setHandshakeTimeout(15);
         }
         LOG_INFO("mail: connecting to %s:%d, attempt %d (largest usable internal block %u)", kImapHost, kImapPort, attempt,
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -854,7 +977,21 @@ static bool imapCheck(void)
             bool li = imapCmd(*c, "a1", cmd);
             memset(cmd, 0, sizeof(cmd)); // do not leave it on the stack
             if (!li) {
-                mailFail("login rejected - check the app password, and that 2FA is on");
+                // ⛔ THREE DIFFERENT FAILURES, THREE DIFFERENT MESSAGES. Only Gmail saying
+                // AUTHENTICATIONFAILED means the password is wrong; a connection that dropped
+                // mid-login is a retry, and anything else is Gmail's own words, which say more
+                // than a guess would. (The tagged reply never contains the password - it is the
+                // SERVER's line, "a1 NO [...] text".)
+                if (s_imapIoFail) {
+                    mailFail("connection dropped while signing in - try again");
+                } else if (strstr(s_imapTagged, "AUTHENTICATIONFAILED")) {
+                    mailFail("login rejected - check the app password, and that 2FA is on");
+                } else {
+                    char why[96];
+                    const char *t = strchr(s_imapTagged, ' ');
+                    snprintf(why, sizeof(why), "Gmail said:%s", t ? t : " (nothing)");
+                    mailFail(why);
+                }
                 goto done;
             }
         }
@@ -1011,7 +1148,7 @@ extern "C" bool tdeck_mail_send_selftest(void)
     return true;
 }
 
-extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char *body)
+extern "C" bool tdeck_mail_send_ex(const char *to, const char *subject, const char *body, bool asReply)
 {
     if (s_state == MAIL_START || s_state == MAIL_CONNECTING || s_state == MAIL_WORK)
         return false;
@@ -1022,14 +1159,43 @@ extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char 
     s_op = OP_SEND;
     strncpy(s_sendTo, to, sizeof(s_sendTo) - 1);
     s_sendTo[sizeof(s_sendTo) - 1] = 0;
+    // A pasted or typed address can carry spaces or a trailing newline; RCPT TO will not have them.
+    {
+        char *w = s_sendTo;
+        for (const char *r = s_sendTo; *r; r++)
+            if (*r != ' ' && *r != '\r' && *r != '\n' && *r != '<' && *r != '>')
+                *w++ = *r;
+        *w = 0;
+    }
     strncpy(s_sendSubj, subject ? subject : "", sizeof(s_sendSubj) - 1);
     s_sendSubj[sizeof(s_sendSubj) - 1] = 0;
+    s_sendAsReply = asReply && s_rdMsgId[0];
+    strncpy(s_sendInReplyTo, s_sendAsReply ? s_rdMsgId : "", sizeof(s_sendInReplyTo) - 1);
+    strncpy(s_sendRefs, s_sendAsReply ? s_rdRefs : "", sizeof(s_sendRefs) - 1);
     if (s_sendBody)
         free(s_sendBody);
-    s_sendBody = strdup(body ? body : "");
+    // PSRAM: a reply quoting the original is a few KB, which malloc would put in the internal heap.
+    const size_t n = strlen(body ? body : "") + 1;
+    s_sendBody = (char *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+    if (!s_sendBody)
+        s_sendBody = (char *)malloc(n);
+    if (!s_sendBody)
+        return false;
+    memcpy(s_sendBody, body ? body : "", n);
     s_pending = true;
     return true;
 }
+
+extern "C" bool tdeck_mail_send(const char *to, const char *subject, const char *body)
+{
+    return tdeck_mail_send_ex(to, subject, body, false);
+}
+
+// The message last opened, for Reply and Forward. Empty strings until one has been read.
+extern "C" const char *tdeck_mail_read_reply_addr(void) { return s_rdReplyTo; }
+extern "C" const char *tdeck_mail_read_from(void) { return s_rdFrom; }
+extern "C" const char *tdeck_mail_read_date(void) { return s_rdDate; }
+extern "C" const char *tdeck_mail_read_subject(void) { return s_rdSubj; }
 
 extern "C" int tdeck_mail_poll(void)
 {
@@ -1134,6 +1300,11 @@ extern "C" bool tdeck_mail_item(int, unsigned *, const char **, const char **, c
 extern "C" bool tdeck_mail_read(unsigned) { return false; }
 extern "C" const char *tdeck_mail_body(void) { return ""; }
 extern "C" bool tdeck_mail_send(const char *, const char *, const char *) { return false; }
+extern "C" bool tdeck_mail_send_ex(const char *, const char *, const char *, bool) { return false; }
+extern "C" const char *tdeck_mail_read_reply_addr(void) { return ""; }
+extern "C" const char *tdeck_mail_read_from(void) { return ""; }
+extern "C" const char *tdeck_mail_read_date(void) { return ""; }
+extern "C" const char *tdeck_mail_read_subject(void) { return ""; }
 extern "C" bool tdeck_mail_send_selftest(void) { return false; }
 extern "C" int tdeck_mail_poll(void) { return -1; }
 extern "C" void tdeck_mail_counts(int *t, int *u)

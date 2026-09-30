@@ -49,6 +49,14 @@ const char *tdeck_mail_body(void);
 
 // ---- sending ---------------------------------------------------------------------------
 bool tdeck_mail_send(const char *to, const char *subject, const char *body);
+// asReply: thread it under the message last read (In-Reply-To / References), as Reply does.
+bool tdeck_mail_send_ex(const char *to, const char *subject, const char *body, bool asReply);
+
+// The message last read, for Reply and Forward. The address is Reply-To if set, else From.
+const char *tdeck_mail_read_reply_addr(void);
+const char *tdeck_mail_read_from(void);
+const char *tdeck_mail_read_date(void);
+const char *tdeck_mail_read_subject(void);
 
 // Send a fixed test message to the signed-in account itself. Takes no recipient on
 // purpose - see the note in the .cpp.
