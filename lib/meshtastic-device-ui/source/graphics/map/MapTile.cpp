@@ -2,13 +2,96 @@
 #include "graphics/map/MapTileSettings.h"
 #include "graphics/map/TileService.h"
 #include "lvgl.h"
+#include "lvgl_private.h" // lv_image_decoder_dsc_t - to read the parent tile's pixels for overzoom
 #include "util/ILog.h"
 
 #include <assert.h>
+#include <string.h>
 
 LV_IMAGE_DECLARE(img_no_tile_image);
 
 OSMTiles<lv_obj_t> *osm = nullptr;
+
+// Drop the image's source, freeing it when the tile owns it (LV_IMAGE_FLAGS_USER1 - a decoded or
+// cached tile handed over by the tile service). The object itself stays.
+static void releaseSrc(lv_obj_t *img)
+{
+    const void *src = lv_image_get_src(img);
+    lv_image_set_src(img, NULL);
+    if (src && lv_image_src_get_type(src) == LV_IMAGE_SRC_VARIABLE) {
+        const lv_image_dsc_t *d = (const lv_image_dsc_t *)src;
+        if (d->header.magic == LV_IMAGE_HEADER_MAGIC && (d->header.flags & LV_IMAGE_FLAGS_USER1)) {
+            lv_image_cache_drop(src); // the pointer is about to be reused - no stale cache entry
+            if (d->data)
+                lv_free((void *)d->data);
+            lv_free((void *)d);
+        }
+    }
+}
+
+// ⭐ OVERZOOM, DONE ONCE. Cut this tile's share of the loaded parent out and enlarge it into an
+// ordinary tile-sized image, nearest neighbour. Jake, 2026-09-29: "maps gets slow at max zoom with
+// its doing its 'artificial zoom'". The first version handed LVGL the WHOLE parent, scaled by 2-8x,
+// in an object up to 2048x2048 - and every visible slot did the same, so ~9-12 identical enlarged
+// images were stacked on top of each other and all of them re-scaled in software on every frame
+// of a pan. This costs one 128KB copy when the tile loads and then draws like any other tile.
+//
+// Returns nullptr for anything it does not handle (odd size, a format with a separate alpha plane,
+// no memory); the caller then falls back to the old scaled path, which is slow but correct.
+static lv_image_dsc_t *cropUpscale(const void *src, int subX, int subY, int factor, int tileSize)
+{
+    lv_image_decoder_dsc_t dd;
+    memset(&dd, 0, sizeof(dd));
+    if (lv_image_decoder_open(&dd, src, NULL) != LV_RESULT_OK)
+        return nullptr;
+    lv_image_dsc_t *out = nullptr;
+    const lv_draw_buf_t *db = dd.decoded;
+    if (db && db->data) {
+        const lv_color_format_t cf = (lv_color_format_t)db->header.cf;
+        const bool plainFormat = cf == LV_COLOR_FORMAT_RGB565 || cf == LV_COLOR_FORMAT_RGB888 ||
+                                 cf == LV_COLOR_FORMAT_ARGB8888 || cf == LV_COLOR_FORMAT_XRGB8888 ||
+                                 cf == LV_COLOR_FORMAT_L8;
+        const uint32_t bpp = lv_color_format_get_size(cf);
+        const int part = tileSize / factor; // source pixels this tile covers along each side
+        if (plainFormat && bpp >= 1 && bpp <= 4 && part > 0 && (int)db->header.w == tileSize &&
+            (int)db->header.h == tileSize) {
+            const uint32_t stride = (uint32_t)tileSize * bpp;
+            const uint32_t srcStride = db->header.stride ? db->header.stride : stride;
+            uint8_t *data = (uint8_t *)lv_malloc(stride * tileSize);
+            out = data ? (lv_image_dsc_t *)lv_malloc_zeroed(sizeof(lv_image_dsc_t)) : nullptr;
+            if (!out) {
+                if (data)
+                    lv_free(data);
+            } else {
+                const int x0 = subX * part, y0 = subY * part;
+                for (int y = 0; y < tileSize; y++) {
+                    uint8_t *d = data + (uint32_t)y * stride;
+                    if (y % factor) { // same source row as the one above: copy it whole
+                        memcpy(d, d - stride, stride);
+                        continue;
+                    }
+                    const uint8_t *row = db->data + (uint32_t)(y0 + y / factor) * srcStride + (uint32_t)x0 * bpp;
+                    for (int x = 0; x < part; x++) {
+                        for (int k = 0; k < factor; k++) {
+                            memcpy(d, row + (uint32_t)x * bpp, bpp);
+                            d += bpp;
+                        }
+                    }
+                }
+                out->header.magic = LV_IMAGE_HEADER_MAGIC;
+                out->header.cf = cf;
+                out->header.w = tileSize;
+                out->header.h = tileSize;
+                out->header.stride = stride;
+                out->header.flags = LV_IMAGE_FLAGS_USER1; // ours to free - see releaseSrc()
+                out->data = data;
+                out->data_size = stride * tileSize;
+            }
+        }
+    }
+    lv_image_decoder_close(&dd);
+    return out;
+}
 
 MapTile::MapTile(uint32_t xTile, uint32_t yTile)
     : OSMTiles<lv_obj_t>::Tile(xTile, yTile, MapTileSettings::getZoomLevel()), img(nullptr), lbl(nullptr)
@@ -92,6 +175,21 @@ bool MapTile::load(lv_obj_t *p, int16_t posx, int16_t posy, const lv_image_dsc_t
             const int factor = 1 << up;
             const int subX = (int)(xTile & (uint32_t)(factor - 1));
             const int subY = (int)(yTile & (uint32_t)(factor - 1));
+            // The fast path: an ordinary tile holding just our enlarged piece (see cropUpscale).
+            {
+                const void *psrc = lv_image_get_src(img);
+                lv_image_dsc_t *piece = psrc ? cropUpscale(psrc, subX, subY, factor, tileSize) : nullptr;
+                if (piece) {
+                    releaseSrc(img);
+                    lv_image_set_src(img, piece);
+                    lv_obj_set_style_opa(img, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                    ILOG_DEBUG("overzoom %d/%d/%d cut from parent %d/%d/%d (%dx)", zoomLevel, xTile, yTile,
+                               (int)zoomLevel - up, xTile >> up, yTile >> up, factor);
+                    result = true;
+                    break;
+                }
+            }
+            // Fallback: the whole parent, scaled at draw time. Correct, and slow.
             ozdx = (int16_t)(-subX * tileSize);
             ozdy = (int16_t)(-subY * tileSize);
             lv_obj_set_size(img, tileSize * factor, tileSize * factor);
@@ -148,25 +246,7 @@ void MapTile::removeImage(void)
         return;
     }
 
-    const void *src = lv_image_get_src(img);
-    /* clear the source first so LVGL stops referencing it */
-    lv_image_set_src(img, NULL);
-
-    if (src && lv_image_src_get_type(src) == LV_IMAGE_SRC_VARIABLE) {
-        const lv_image_dsc_t *img_dsc = (const lv_image_dsc_t *)src;
-        const bool ownedByMapTile =
-            (img_dsc->header.magic == LV_IMAGE_HEADER_MAGIC) && (img_dsc->header.flags & LV_IMAGE_FLAGS_USER1);
-        if (ownedByMapTile) {
-            // ILOG_INFO("%d/%d: free tile image %d bytes", xTile, yTile, img_dsc->data_size);
-            if (img_dsc->data) {
-                lv_free((void *)img_dsc->data);
-            }
-            lv_free((void *)img_dsc);
-        } else {
-            // ILOG_INFO("%d/%d: tile image %d bytes -> not owned", xTile, yTile, img_dsc->data_size);
-        }
-    }
-
+    releaseSrc(img); // clears the source first so LVGL stops referencing it, then frees it if ours
     lv_obj_delete(img);
     img = nullptr;
 }
