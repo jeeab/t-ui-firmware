@@ -38,6 +38,28 @@ bool URLService::load(const char *name, void *img)
         if (lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED)
             return false;
     }
+    // ⛔ DO NOT KEEP ASKING FOR A ZOOM LEVEL THE SERVER DOES NOT HAVE. USGS stops at z16; past that
+    // every visible square tried an HTTPS fetch - a TLS handshake ON THE UI TASK - and got 4xx,
+    // over and over as you panned. That is a large part of "maps gets slow at max zoom" (Jake,
+    // 2026-09-29). Three 4xx answers in a row at one zoom and that zoom is left alone for the rest
+    // of the session; any success resets the count, so one missing square in a covered area does
+    // not switch a real zoom level off. Memory or network failures never count.
+    static uint8_t s_zoomMisses[32] = {0};
+    int zoom = -1;
+    if (name) { // ".../<z>/<x>/<y>.<ext>" - the third number from the end
+        const char *slash[3] = {nullptr, nullptr, nullptr};
+        for (const char *p = name; *p; p++)
+            if (*p == '/') {
+                slash[0] = slash[1];
+                slash[1] = slash[2];
+                slash[2] = p;
+            }
+        if (slash[0] && slash[0][1] >= '0' && slash[0][1] <= '9')
+            zoom = atoi(slash[0] + 1);
+    }
+    if (zoom >= 0 && zoom < 32 && s_zoomMisses[zoom] >= 3)
+        return false;
+
     static uint32_t s_lastAttempt = 0;
     uint32_t now = lv_tick_get();
     if (now - s_lastAttempt < 500)
@@ -79,8 +101,13 @@ bool URLService::load(const char *name, void *img)
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
         ILOG_ERROR("ERROR GET %s : %d", url.c_str(), httpCode);
+        if (httpCode >= 400 && httpCode < 500 && zoom >= 0 && zoom < 32 && s_zoomMisses[zoom] < 3 &&
+            ++s_zoomMisses[zoom] == 3)
+            ILOG_INFO("tile server has nothing at z%d - not asking again this session", zoom);
         return false;
     }
+    if (zoom >= 0 && zoom < 32)
+        s_zoomMisses[zoom] = 0;
 
     WiFiClient *stream = http.getStreamPtr();
     int contentLen = http.getSize();

@@ -3788,8 +3788,14 @@ void TFTView_320x240::mapsInitTileStyle(void)
     mapsStyleInited = savedOnCard || haveSaved;
 }
 
+extern "C" void tdeck_chess_release(void); // TDeckChess.cpp - no-op while it is thinking
+
 void TFTView_320x240::openMaps(void)
 {
+    // Chess keeps its 1.25MB of tables for 5 seconds after you leave it; Maps wants ~2.4MB of the
+    // same PSRAM for its decode arena and tile cache. Opened back to back, the two left 130KB for
+    // everything else (stress test, 2026-09-29). Nothing needs chess's tables while Maps is up.
+    tdeck_chess_release();
     if (!maps_screen) {
         maps_screen = lv_obj_create(NULL);
         lv_obj_set_style_bg_color(maps_screen, lv_color_hex(0x000000), LV_PART_MAIN);

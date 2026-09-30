@@ -26,6 +26,11 @@ static size_t s_stbi_arena_used = 0;
 
 static void stbi_arena_init(void)
 {
+    /* Not at the cost of everything else: taking 920KB when that leaves under 512KB of PSRAM is how
+     * the device got to 130KB free. Decoding then fails, the tile shows its placeholder, and
+     * MapPanel retries it a few seconds later - when whatever held the memory has usually let go. */
+    if (!s_stbi_arena && heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < STBI_ARENA_SIZE + 512u * 1024u)
+        return;
     if (!s_stbi_arena) {
         s_stbi_arena = (uint8_t *)heap_caps_aligned_alloc(32, STBI_ARENA_SIZE, MALLOC_CAP_SPIRAM);
         if (!s_stbi_arena) {
