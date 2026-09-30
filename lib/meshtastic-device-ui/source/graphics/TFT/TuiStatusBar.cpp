@@ -86,11 +86,29 @@ void tui_statusbar_init(void)
     lv_obj_align(batLbl, LV_ALIGN_RIGHT_MID, -6, 0);
 }
 
+// ⛔ A DELETED SCREEN MUST LEAVE THE LIST. Chess and Gemini delete their screens a few seconds
+// after you leave them (to give the memory back) and build new ones when you return - and each new
+// one registered here while the old entry stayed. After ~16 visits in one boot the list was full,
+// and the next chess screen got neither the bar nor its 20px of top padding: found by a 51-minute
+// stress test (2026-09-30), where chess came back with no bar and everything shifted up.
+static void onReservedScreenDeleted(lv_event_t *e)
+{
+    lv_obj_t *scr = (lv_obj_t *)lv_event_get_current_target(e);
+    for (int i = 0; i < wantedN; i++) {
+        if (wanted[i] == scr) {
+            wanted[i] = wanted[--wantedN];
+            wanted[wantedN] = nullptr;
+            return;
+        }
+    }
+}
+
 void tui_statusbar_reserve(lv_obj_t *screen)
 {
     if (!screen || wantedN >= kMaxScreens || wantsBar(screen))
         return;
     wanted[wantedN++] = screen;
+    lv_obj_add_event_cb(screen, onReservedScreenDeleted, LV_EVENT_DELETE, nullptr);
     // The whole trick: LVGL aligns children to the parent's CONTENT area, so padding the
     // screen moves every TOP_*-aligned child down by 20px without touching any of them.
     // BOTTOM_*-aligned children are unaffected, which is what we want for a bar at the top.
