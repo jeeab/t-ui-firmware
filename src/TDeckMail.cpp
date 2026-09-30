@@ -363,18 +363,32 @@ static void hdrField(const char *blob, const char *name, char *out, int cap, boo
             p += nlen;
             while (*p == ' ' || *p == '\t')
                 p++;
+            // ⛔ DECODE FIRST, SHORTEN AFTER. A subject is often one long MIME encoded word
+            // ("=?UTF-8?Q?...?="), and cutting it to the display width first chopped off the
+            // closing "?=" - so decodeWords() could not find the end and the inbox showed the raw
+            // "=?UT..." instead of the words. Seen in Jake's inbox 2026-09-29.
+            char tmp[400];
             int o = 0;
-            while (*p && o < cap - 1) {
+            while (*p && o < (int)sizeof(tmp) - 1) {
                 if (*p == '\r') { p++; continue; }
                 if (*p == '\n') {
-                    if (p[1] == ' ' || p[1] == '\t') { p++; out[o++] = ' '; continue; } // folded
+                    if (p[1] == ' ' || p[1] == '\t') { p++; tmp[o++] = ' '; continue; } // folded
                     break;
                 }
-                out[o++] = *p++;
+                tmp[o++] = *p++;
             }
-            out[o] = 0;
+            tmp[o] = 0;
             if (decode)
-                decodeWords(out);
+                decodeWords(tmp);
+            int n = (int)strlen(tmp);
+            if (n > cap - 1) {
+                n = cap - 1;
+                // and never split a UTF-8 character: back up over continuation bytes
+                while (n > 0 && ((unsigned char)tmp[n] & 0xC0) == 0x80)
+                    n--;
+            }
+            memcpy(out, tmp, n);
+            out[n] = 0;
             return;
         }
         while (*p && *p != '\n')

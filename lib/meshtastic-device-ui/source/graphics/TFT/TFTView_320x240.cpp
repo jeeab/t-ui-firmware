@@ -375,9 +375,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.09.29.1-test"
+#define TUI_VERSION "2026.09.30.1-test"
 #else
-#define TUI_VERSION "2026.09.29.1"
+#define TUI_VERSION "2026.09.30.1"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;

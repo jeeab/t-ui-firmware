@@ -2,6 +2,7 @@
 #include "graphics/view/TFT/TuiStatusBar.h"
 #include "lvgl.h"
 #include "util/ILog.h"
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 
@@ -555,6 +556,17 @@ static void openWho(lv_event_t *)
         char a[96];
         if (n >= 16 || !bareAddr(raw, a, sizeof(a)))
             return;
+        // Nobody reads these - a picker full of noreply@ addresses is noise, not contacts.
+        {
+            char low[96];
+            int i = 0;
+            for (; a[i] && i < (int)sizeof(low) - 1; i++)
+                low[i] = (char)tolower((unsigned char)a[i]);
+            low[i] = 0;
+            if (strstr(low, "noreply") || strstr(low, "no-reply") || strstr(low, "donotreply") ||
+                strstr(low, "do-not-reply") || strstr(low, "mailer-daemon") || strstr(low, "bounce"))
+                return;
+        }
         for (int i = 0; i < n; i++)
             if (!strcasecmp(seen[i], a))
                 return;
@@ -693,8 +705,12 @@ static void onReplyOrForward(bool forward)
         char addr[96];
         const char *ra = tdeck_mail_read_reply_addr();
         lv_textarea_set_text(toArea, (ra && ra[0]) ? ra : (bareAddr(from, addr, sizeof(addr)) ? addr : ""));
-        // The cursor goes ABOVE the quote, where the reply is written.
+        // The cursor goes ABOVE the quote, where the reply is written - and the box has to SHOW
+        // it. Setting the text scrolls to its end; without a layout pass first the cursor move
+        // computed its scroll from stale sizes, and the box opened on the last lines of the quote.
+        lv_obj_update_layout(bodyArea);
         lv_textarea_set_cursor_pos(bodyArea, 0);
+        lv_obj_scroll_to_y(bodyArea, 0, LV_ANIM_OFF);
         if (lv_group_get_default())
             lv_group_focus_obj(bodyArea);
     }
