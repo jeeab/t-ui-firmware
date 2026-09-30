@@ -41,6 +41,29 @@ size_t RedirectablePrint::write(uint8_t c)
 #endif
     // Account for legacy config transition
     bool serialEnabled = config.has_security ? config.security.serial_enabled : config.device.serial_enabled;
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT && defined(ARCH_ESP32)
+    // ⛔ NEVER WAIT ON A USB HOST THAT IS NOT READING. Found 2026-09-29 on the colour T-Deck: plugged
+    // into a PC with no program holding the COM port open, the USB is alive (the host still sends
+    // start-of-frame packets) but nobody drains the device's transmit buffer. HWCDC::write() then
+    // waits up to 20 x 100ms for room - and this function is called ONE CHARACTER AT A TIME, so a
+    // single 100-character log line could take over three minutes. The main loop logs constantly
+    // (GPS alone, several lines a second), so it stopped heartbeating and the ~90s task watchdog
+    // reset the device: every "FROZE (task) stalled_in=GPS / PacketAPI" record with healthy memory.
+    // Reproduced by closing the port and waiting. Log output is diagnostic only, so when the buffer
+    // has been full for 50ms, drop characters instead of blocking; it resumes the moment the host
+    // reads again.
+    if (dest == &Serial) {
+        static uint32_t s_fullSince = 0;
+        if (Serial.availableForWrite() <= 0) {
+            if (!s_fullSince)
+                s_fullSince = millis() | 1;
+            if (millis() - s_fullSince > 50)
+                return 1;
+        } else {
+            s_fullSince = 0;
+        }
+    }
+#endif
     if (!config.has_lora || serialEnabled)
         dest->write(c);
 

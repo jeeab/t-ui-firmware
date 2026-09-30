@@ -478,6 +478,16 @@ extern "C" const char *tdeck_prev_reason_str(void)
         return "wake";
     case ESP_RST_EXT:
         return "ext reset";
+    // Named, because "unknown" hid them: a USB reset is what flashing - and a serial tool toggling
+    // the control lines - does, and it read exactly like a mystery restart.
+    case ESP_RST_USB:
+        return "usb reset";
+    case ESP_RST_JTAG:
+        return "jtag reset";
+    case ESP_RST_PWR_GLITCH:
+        return "power glitch";
+    case ESP_RST_CPU_LOCKUP:
+        return "CRASH (lockup)";
     default:
         return "unknown";
     }
@@ -492,6 +502,8 @@ extern "C" bool tdeck_prev_reason_bad(void)
     case ESP_RST_TASK_WDT:
     case ESP_RST_WDT:
     case ESP_RST_BROWNOUT:
+    case ESP_RST_PWR_GLITCH:
+    case ESP_RST_CPU_LOCKUP:
         return true;
     default:
         return false;

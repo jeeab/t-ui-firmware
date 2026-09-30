@@ -65,6 +65,12 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
     Port.setRX(SERIAL2_RX);
 #endif
     Port.begin(SERIAL_BAUD);
+#ifdef IS_USB_SERIAL
+    // 10ms, not the driver's 100ms: a single blocked write then costs at most 20 x 10ms instead of two
+    // seconds. The real protection against a host that has stopped reading is the drop in
+    // RedirectablePrint::write(); this bounds whatever else writes to the port directly.
+    Port.setTxTimeoutMs(10);
+#endif
     time_t timeout = millis();
     while (!Port) {
         if (Throttle::isWithinTimespanMs(timeout, FIVE_SECONDS_MS)) {
