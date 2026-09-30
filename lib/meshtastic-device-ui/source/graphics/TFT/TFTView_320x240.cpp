@@ -7908,7 +7908,7 @@ void TFTView_320x240::logDiagBoot(void)
     done = true;
     if (!tdeck_prev_reason_bad()) // only log real faults, not clean power-ons/restarts
         return;
-    char line[260];
+    char line[320]; // the stall text grew to name the loop service too
     char when[80];
     tdeck_prev_when(when, sizeof(when)); // uptime, last-seen time and firmware of the run that died
     if (tdeck_prev_stall_ms())

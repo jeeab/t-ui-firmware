@@ -1397,6 +1397,16 @@ extern "C" void tdeck_channel_import_service(void);
 // app-watchdog "FROZE (task)" reboots finally say WHERE the loop froze.
 extern "C" void tdeck_loop_heartbeat(void);
 extern "C" void tdeck_stallwatch_start(void); // TDeckMemInfo.cpp - names whichever task freezes
+// ⭐ WHICH SERVICE THE LOOP IS IN. A stall record used to say only "loop", or the name of the last
+// OSThread to run - which is how a hung weather fetch got blamed on "GPS" and "PacketAPI" for
+// weeks. Each service call below now leaves its name here first; the watcher prints it.
+// Lesson from the connstatus freeze: make the label as fine as the question.
+extern "C" volatile const char *tdeck_loop_where;
+#define TDECK_LOOP_STEP(name, call)                                                                                    \
+    do {                                                                                                               \
+        tdeck_loop_where = name;                                                                                       \
+        call;                                                                                                          \
+    } while (0);
 
 void loop()
 {
@@ -1404,23 +1414,23 @@ void loop()
 
     tdeck_loop_heartbeat();
     tdeck_stallwatch_start(); // once; returns immediately after that
-    tdeck_mesh_switch_service();
-    tdeck_gps_control_service();
-    tdeck_nodes_service();
-    tdeck_nodes_dump();
-    tdeck_sound_service();
-    tdeck_pop_service();
-    tdeck_shot_service();
-    tdeck_share_location_service();
-    tdeck_wx_auto_service();
-    tdeck_clock_service();
-    tdeck_units_service();
-    tdeckgemini::service();
-    tdeck_alarm_service();
-    tdeck_net_service();
-    tdeck_mail_service();
-    tdeck_coverage_service();
-    tdeck_connstatus_service(); // 10s wifi/MQTT status poll, off the UI task - see TFTView
+    TDECK_LOOP_STEP("mesh_switch", tdeck_mesh_switch_service())
+    TDECK_LOOP_STEP("gps_control", tdeck_gps_control_service())
+    TDECK_LOOP_STEP("nodes", tdeck_nodes_service())
+    TDECK_LOOP_STEP("nodes_dump", tdeck_nodes_dump())
+    TDECK_LOOP_STEP("sound", tdeck_sound_service())
+    TDECK_LOOP_STEP("pop", tdeck_pop_service())
+    TDECK_LOOP_STEP("shot", tdeck_shot_service())
+    TDECK_LOOP_STEP("share_location", tdeck_share_location_service())
+    TDECK_LOOP_STEP("wx_auto", tdeck_wx_auto_service())
+    TDECK_LOOP_STEP("clock", tdeck_clock_service())
+    TDECK_LOOP_STEP("units", tdeck_units_service())
+    TDECK_LOOP_STEP("gemini", tdeckgemini::service())
+    TDECK_LOOP_STEP("alarm", tdeck_alarm_service())
+    TDECK_LOOP_STEP("net", tdeck_net_service())
+    TDECK_LOOP_STEP("mail", tdeck_mail_service())
+    TDECK_LOOP_STEP("coverage", tdeck_coverage_service())
+    TDECK_LOOP_STEP("connstatus", tdeck_connstatus_service()) // 10s wifi/MQTT status poll, off the UI task - see TFTView
 #ifdef NETDOOR_SELFTEST
     netDoorSelfTest();
 #endif
@@ -1429,8 +1439,9 @@ void loop()
         s_allocWatchArmed = true;
         tdeck_tls_watch_allocs();
     }
-    tdeck_tz_service();
-    tdeck_channel_import_service();
+    TDECK_LOOP_STEP("tz", tdeck_tz_service())
+    TDECK_LOOP_STEP("channel_import", tdeck_channel_import_service())
+    tdeck_loop_where = "loop-misc"; // upstream loop body until the scheduler
 
 #if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
     if (lockdownDisablePending) {
@@ -1597,9 +1608,12 @@ void loop()
 #endif
 #endif
 #if (HAS_SCREEN || defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS)) && ENABLE_MESSAGE_PERSISTENCE
+    tdeck_loop_where = "msgstore-autosave";
     messageStoreAutosaveTick();
 #endif
+    tdeck_loop_where = "osthreads"; // the OSThread that stalls is named separately
     long delayMsec = mainController.runOrDelay();
+    tdeck_loop_where = "loop-sleep";
 
     // We want to sleep as long as possible here - because it saves power
     if (!runASAP && loopCanSleep()) {

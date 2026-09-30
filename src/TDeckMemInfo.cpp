@@ -76,7 +76,7 @@ static uint32_t s_stallWrittenForMs = 0;   // last stall duration persisted (0 =
 static uint32_t s_prevStallMs = 0;         // read back at boot
 static char s_prevStallThread[24] = {0};
 static volatile void *s_loopTask = nullptr; // the main loop's task handle (for eTaskGetState)
-static char s_prevStallLock[64] = {0};      // spiLock holder + loop state at stall time
+static char s_prevStallLock[96] = {0};      // spiLock holder + loop state at stall time
 
 // ⭐ WHEN, AND ON WHICH FIRMWARE. Until 2026-09-29 a /diaglog.txt line said what happened but not
 // when, so a crash from last month and one from this morning looked identical - and after a fix,
@@ -93,6 +93,11 @@ static char s_prevVer[24] = {0};   // firmware version of the previous run
 // What the tft task was doing when it stalled (TFTView_320x240.cpp).
 extern volatile const char *tdeck_tft_where;
 
+// Set by loop() in main.cpp before each service call (TDECK_LOOP_STEP).
+extern "C" {
+volatile const char *tdeck_loop_where = "boot";
+}
+
 static volatile uint32_t s_lastUiMs = 0;
 static volatile void *s_uiTask = nullptr;
 
@@ -102,7 +107,7 @@ static volatile void *s_uiTask = nullptr;
 // exactly the situation being recorded.
 static void recordStall(const char *who, uint32_t stuckMs)
 {
-    char lockInfo[64];
+    char lockInfo[96];
     char loopState = '?', uiState = '?';
     if (s_loopTask) {
         switch (eTaskGetState((TaskHandle_t)s_loopTask)) {
@@ -123,13 +128,23 @@ static void recordStall(const char *who, uint32_t stuckMs)
         }
     }
     void *ow = spiLock ? (void *)spiLock->owner : nullptr;
+    // Where the LOOP is: the service it was in, and if that is the OSThread scheduler, which thread.
+    char loopAt[40];
+    {
+        const char *w = tdeck_loop_where ? (const char *)tdeck_loop_where : "?";
+        const concurrency::OSThread *t = concurrency::OSThread::currentThread;
+        if (!strcmp(w, "osthreads") && t)
+            snprintf(loopAt, sizeof(loopAt), "os:%s", t->ThreadName.c_str());
+        else
+            snprintf(loopAt, sizeof(loopAt), "%s", w);
+    }
     if (ow) {
         const uint32_t heldMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - spiLock->lockedAtMs;
-        snprintf(lockInfo, sizeof(lockInfo), "%s %lus loop=%c ui=%c in=%s", pcTaskGetName((TaskHandle_t)ow),
-                 (unsigned long)(heldMs / 1000), loopState, uiState,
+        snprintf(lockInfo, sizeof(lockInfo), "%s %lus loop=%c@%s ui=%c in=%s", pcTaskGetName((TaskHandle_t)ow),
+                 (unsigned long)(heldMs / 1000), loopState, loopAt, uiState,
                  tdeck_tft_where ? (const char *)tdeck_tft_where : "?");
     } else {
-        snprintf(lockInfo, sizeof(lockInfo), "free loop=%c ui=%c in=%s", loopState, uiState,
+        snprintf(lockInfo, sizeof(lockInfo), "free loop=%c@%s ui=%c in=%s", loopState, loopAt, uiState,
                  tdeck_tft_where ? (const char *)tdeck_tft_where : "?");
     }
     Preferences p;
