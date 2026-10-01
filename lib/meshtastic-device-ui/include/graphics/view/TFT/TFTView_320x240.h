@@ -287,6 +287,23 @@ class TFTView_320x240 : public MeshtasticView
     void setFoundMarker(float lat, float lon, const char *name);
     void clearFoundMarker(void);
     lv_obj_t *maps_search_btn = nullptr; // the magnifier, bottom-right beside the cog
+    // ---- Maps app: the ruler (distance between two points, snapping to pins) and GPS height ----
+    uint8_t measureStep = 0; // 0 off, 1 waiting for the first point, 2 for the second, 3 showing
+    float measALat = 0, measALon = 0, measBLat = 0, measBLon = 0;
+    char measAName[24] = "", measBName[24] = ""; // the pin each end snapped to, or ""
+    static constexpr uint32_t kMeasureIdA = 0xEFFFFFE0, kMeasureIdB = 0xEFFFFFE1;
+    lv_obj_t *maps_measure_btn = nullptr;
+    lv_obj_t *maps_measure_label = nullptr; // the hint, then the answer, under the top bar
+    lv_obj_t *measure_line = nullptr;
+    lv_obj_t *measure_dot[2] = {nullptr, nullptr};
+    lv_point_precise_t measurePts[2];
+    std::function<void(uint32_t, uint16_t, uint16_t, uint8_t)> drawMeasureCB;
+    void measureToggle(void);
+    void measureTap(float lat, float lon, int16_t sx, int16_t sy);
+    void measureRedraw(void);
+    void measureClear(void);
+    void measureShowText(void);
+    lv_obj_t *maps_alt_label = nullptr; // "Elev 820 ft" bottom-left, from a GPS 3D fix
     // Units: the device-wide Meshtastic setting (the weather widget's F/C is the same switch).
     bool mapsMetric(void) const;
     void fmtDistance(double meters, char *out, size_t n); // "1.4 mi" / "320 ft", or "2.3 km" / "450 m"

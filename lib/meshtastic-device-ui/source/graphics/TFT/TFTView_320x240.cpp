@@ -83,6 +83,7 @@ extern "C" bool tdeck_get_mesh_enabled(void);
 extern "C" uint32_t tdeck_gps_num_sats(void);
 extern "C" bool tdeck_gps_has_lock(void);
 extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon);
+extern "C" bool tdeck_gps_altitude(int32_t *meters); // metres above sea level, 3D fix only
 extern "C" void tdeck_coverage_sample(uint32_t fromNode, int32_t rssi, float snr); // TDeckCoverage.cpp
 extern "C" bool tdeck_coverage_enabled(void);
 extern "C" void tdeck_coverage_set_enabled(bool on);
@@ -376,9 +377,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.09.30.3-test"
+#define TUI_VERSION "2026.09.30.4-test"
 #else
-#define TUI_VERSION "2026.09.30.3"
+#define TUI_VERSION "2026.09.30.4"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -3870,7 +3871,7 @@ void TFTView_320x240::openMaps(void)
         lv_obj_add_event_cb(
             maps_map_container,
             [](lv_event_t *) {
-                if (!THIS->mapsAwaitPinTap || !THIS->userMap)
+                if ((!THIS->mapsAwaitPinTap && !THIS->measureStep) || !THIS->userMap)
                     return;
                 // A pan ends in a click too, so ignore one that travelled - otherwise
                 // dragging the map while armed would drop a pin wherever you let go.
@@ -3885,6 +3886,10 @@ void TFTView_320x240::openMaps(void)
                 lv_obj_get_coords(THIS->maps_map_container, &a);
                 float lat, lon;
                 THIS->userMap->screenToGeo((int16_t)(pt.x - a.x1), (int16_t)(pt.y - a.y1), lat, lon);
+                if (THIS->measureStep) { // the ruler is out: this tap is a point to measure
+                    THIS->measureTap(lat, lon, (int16_t)(pt.x - a.x1), (int16_t)(pt.y - a.y1));
+                    return;
+                }
                 THIS->mapsAwaitPinTap = false;
                 if (THIS->maps_hold_label)
                     lv_obj_add_flag(THIS->maps_hold_label, LV_OBJ_FLAG_HIDDEN);
@@ -4112,6 +4117,47 @@ void TFTView_320x240::openMaps(void)
             },
             LV_EVENT_CLICKED, NULL);
 
+        // The ruler, left of the magnifier. Blue while it is out.
+        maps_measure_btn = lv_btn_create(maps_screen);
+        lv_obj_set_size(maps_measure_btn, 36, 36);
+        lv_obj_set_style_radius(maps_measure_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_measure_btn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_measure_btn, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(maps_measure_btn, 0, LV_PART_MAIN);
+        lv_obj_align(maps_measure_btn, LV_ALIGN_BOTTOM_RIGHT, -90, -6);
+        icBox(maps_measure_btn, 5, 12, 26, 11, 0xffffff, 2); // the ruler
+        icBox(maps_measure_btn, 9, 12, 2, 5, 0x2c2c2e, 0);   // and its marks
+        icBox(maps_measure_btn, 14, 12, 2, 3, 0x2c2c2e, 0);
+        icBox(maps_measure_btn, 19, 12, 2, 5, 0x2c2c2e, 0);
+        icBox(maps_measure_btn, 24, 12, 2, 3, 0x2c2c2e, 0);
+        lv_obj_add_event_cb(
+            maps_measure_btn, [](lv_event_t *) { THIS->measureToggle(); }, LV_EVENT_CLICKED, NULL);
+
+        maps_measure_label = lv_label_create(maps_screen);
+        lv_obj_set_style_text_font(maps_measure_label, &ui_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(maps_measure_label, lv_color_hex(0xffd60a), LV_PART_MAIN);
+        lv_obj_set_style_text_align(maps_measure_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_measure_label, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_measure_label, LV_OPA_70, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(maps_measure_label, 5, LV_PART_MAIN);
+        lv_obj_set_style_radius(maps_measure_label, 6, LV_PART_MAIN);
+        lv_obj_set_width(maps_measure_label, 300);
+        lv_label_set_long_mode(maps_measure_label, LV_LABEL_LONG_WRAP);
+        lv_obj_clear_flag(maps_measure_label, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(maps_measure_label, LV_OBJ_FLAG_HIDDEN);
+
+        // Height above sea level from the GPS, over the zoom readout. Only with a 3D fix.
+        maps_alt_label = lv_label_create(maps_screen);
+        lv_obj_set_style_text_color(maps_alt_label, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_alt_label, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_alt_label, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_set_style_pad_hor(maps_alt_label, 6, LV_PART_MAIN);
+        lv_obj_set_style_pad_ver(maps_alt_label, 2, LV_PART_MAIN);
+        lv_obj_set_style_radius(maps_alt_label, 6, LV_PART_MAIN);
+        lv_obj_align(maps_alt_label, LV_ALIGN_BOTTOM_LEFT, 6, -34);
+        lv_obj_clear_flag(maps_alt_label, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(maps_alt_label, LV_OBJ_FLAG_HIDDEN);
+
         // zoom level readout, bottom-left over the map
         maps_zoom_label = lv_label_create(maps_screen);
         lv_obj_set_style_text_color(maps_zoom_label, lv_color_hex(0xffffff), LV_PART_MAIN);
@@ -4250,6 +4296,18 @@ void TFTView_320x240::updateMapsZoom(void)
 
 void TFTView_320x240::updateMapsSats(void)
 {
+    if (maps_alt_label) {
+        int32_t m = 0;
+        if (tdeck_gps_altitude(&m)) {
+            if (mapsMetric())
+                lv_label_set_text_fmt(maps_alt_label, "Elev %d m", (int)m);
+            else
+                lv_label_set_text_fmt(maps_alt_label, "Elev %d ft", (int)lround(m * 3.28084));
+            lv_obj_clear_flag(maps_alt_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(maps_alt_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     // Once a second while Maps is up: hang up the tile server after a few quiet seconds, so the TLS
     // buffers are only held while squares are actually coming in.
 #ifdef ARDUINO_ARCH_ESP32
@@ -7881,6 +7939,8 @@ void TFTView_320x240::openPinsList(bool search)
         addBtn,
         [](lv_event_t *) {
             THIS->closePinsList();
+            if (THIS->measureStep)
+                THIS->measureClear(); // one thing at a time: the next tap places the pin
             THIS->mapsAwaitPinTap = true;
             if (THIS->maps_hold_label) {
                 lv_label_set_text(THIS->maps_hold_label, "tap the map to place a pin  (Pins to cancel)");
@@ -8124,16 +8184,22 @@ bool TFTView_320x240::mapsMetric(void) const
 
 void TFTView_320x240::fmtDistance(double m, char *out, size_t n)
 {
+    // Feet only up to 1,000 - "4903 ft" (the ruler's first result on the device) is hard to read at
+    // a glance, "0.93 mi" is not. Two decimals under 10, one under 100, whole numbers beyond.
     if (mapsMetric()) {
         if (m < 1000)
             snprintf(out, n, "%d m", (int)(m + 0.5));
+        else if (m < 10000)
+            snprintf(out, n, "%.2f km", m / 1000.0);
         else if (m < 100000)
             snprintf(out, n, "%.1f km", m / 1000.0);
         else
             snprintf(out, n, "%d km", (int)(m / 1000.0 + 0.5));
     } else {
-        if (m < 1609.34)
+        if (m < 304.8)
             snprintf(out, n, "%d ft", (int)(m * 3.28084 + 0.5));
+        else if (m < 16093.4)
+            snprintf(out, n, "%.2f mi", m / 1609.34);
         else if (m < 160934)
             snprintf(out, n, "%.1f mi", m / 1609.34);
         else
@@ -8338,6 +8404,199 @@ void TFTView_320x240::setFoundMarker(float lat, float lon, const char *name)
         userMap->add(kFoundMarkerId, lat, lon, drawFoundCB);
     foundActive = true;
     userMap->forceRedraw(true);
+}
+
+// ---- the ruler: distance and direction between two points --------------------------------------
+// Jake, 2026-09-30: "can we do a measure button, inbetween two pins? idk how." Tap the ruler, tap
+// one point, tap another. A tap near a pin snaps to the pin, so pin-to-pin is just two taps on the
+// pins; anywhere else on the map works too. The line and its two dots are ordinary map objects, so
+// they follow panning and zooming like the pins do.
+namespace {
+void bearingDistance(double la1, double lo1, double la2, double lo2, double &meters, const char *&dir)
+{
+    const double a = la1 * M_PI / 180.0, b = lo1 * M_PI / 180.0;
+    const double c = la2 * M_PI / 180.0, d = lo2 * M_PI / 180.0;
+    const double dLat = c - a, dLon = d - b;
+    const double hv = sin(dLat / 2) * sin(dLat / 2) + cos(a) * cos(c) * sin(dLon / 2) * sin(dLon / 2);
+    meters = 6371000.0 * 2 * atan2(sqrt(hv), sqrt(1 - hv));
+    const double yy = sin(dLon) * cos(c), xx = cos(a) * sin(c) - sin(a) * cos(c) * cos(dLon);
+    double brg = atan2(yy, xx) * 180.0 / M_PI;
+    if (brg < 0)
+        brg += 360.0;
+    static const char *kPts[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    dir = kPts[(int)((brg + 22.5) / 45.0) % 8];
+}
+} // namespace
+
+void TFTView_320x240::measureShowText(void)
+{
+    if (!maps_measure_label)
+        return;
+    if (!measureStep) {
+        lv_obj_add_flag(maps_measure_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    char buf[120];
+    if (measureStep == 1) {
+        snprintf(buf, sizeof(buf), "Measure: tap the first point\n(tap a pin to start from it)");
+    } else if (measureStep == 2) {
+        snprintf(buf, sizeof(buf), "Now tap the second point");
+    } else {
+        double m = 0;
+        const char *dir = "";
+        bearingDistance(measALat, measALon, measBLat, measBLon, m, dir);
+        char dist[20];
+        fmtDistance(m, dist, sizeof(dist));
+        if (measAName[0] && measBName[0])
+            snprintf(buf, sizeof(buf), "%s %s  %s to %s\nTap the map to measure again", dist, dir, measAName, measBName);
+        else if (measAName[0])
+            snprintf(buf, sizeof(buf), "%s %s from %s\nTap the map to measure again", dist, dir, measAName);
+        else if (measBName[0])
+            snprintf(buf, sizeof(buf), "%s %s to %s\nTap the map to measure again", dist, dir, measBName);
+        else
+            snprintf(buf, sizeof(buf), "%s %s, straight line\nTap the map to measure again", dist, dir);
+    }
+    lv_label_set_text(maps_measure_label, buf);
+    lv_obj_clear_flag(maps_measure_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(maps_measure_label, LV_ALIGN_TOP_MID, 0, 38);
+}
+
+// Put the dots and the line where the two points are now. Called by the map whenever it redraws
+// its objects (the two dots are map objects), so it follows every pan and zoom.
+void TFTView_320x240::measureRedraw(void)
+{
+    if (!userMap || !markerParent())
+        return;
+    if (!measure_line) {
+        measure_line = lv_line_create(markerParent());
+        lv_obj_set_style_line_width(measure_line, 3, LV_PART_MAIN);
+        lv_obj_set_style_line_color(measure_line, lv_color_hex(0xffd60a), LV_PART_MAIN);
+        lv_obj_set_style_line_rounded(measure_line, true, LV_PART_MAIN);
+        lv_obj_clear_flag(measure_line, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(measure_line, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < 2; i++) {
+            measure_dot[i] = lv_obj_create(markerParent());
+            lv_obj_remove_style_all(measure_dot[i]);
+            lv_obj_set_size(measure_dot[i], 12, 12);
+            lv_obj_set_style_radius(measure_dot[i], LV_RADIUS_CIRCLE, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(measure_dot[i], lv_color_hex(0xffd60a), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(measure_dot[i], LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_border_color(measure_dot[i], lv_color_hex(0x000000), LV_PART_MAIN);
+            lv_obj_set_style_border_width(measure_dot[i], 2, LV_PART_MAIN);
+            lv_obj_clear_flag(measure_dot[i], LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(measure_dot[i], LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(measure_dot[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    const int pts = measureStep >= 3 ? 2 : (measureStep == 2 ? 1 : 0);
+    int16_t x[2] = {0, 0}, y[2] = {0, 0};
+    bool known[2] = {false, false};
+    for (int i = 0; i < pts; i++) {
+        // geoToScreen fills in x/y even for a point off the edge (it only refuses absurd ones), so
+        // the line still runs off the screen towards a far end you have panned away from.
+        known[i] = userMap->geoToScreen(i ? measBLat : measALat, i ? measBLon : measALon, x[i], y[i]) ||
+                   (x[i] || y[i]);
+    }
+    for (int i = 0; i < 2; i++) {
+        const bool show = i < pts && known[i] && x[i] > -20 && x[i] < 340 && y[i] > -20 && y[i] < 230;
+        if (show) {
+            lv_obj_set_pos(measure_dot[i], x[i] - 6, y[i] - 6);
+            lv_obj_clear_flag(measure_dot[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(measure_dot[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (pts == 2 && known[0] && known[1]) {
+        // An lv_line's points are relative to the line object, so put the object at the corner of
+        // the two ends - that also copes with an end above or left of the screen.
+        const int16_t x0 = x[0] < x[1] ? x[0] : x[1], y0 = y[0] < y[1] ? y[0] : y[1];
+        measurePts[0] = {(lv_value_precise_t)(x[0] - x0), (lv_value_precise_t)(y[0] - y0)};
+        measurePts[1] = {(lv_value_precise_t)(x[1] - x0), (lv_value_precise_t)(y[1] - y0)};
+        lv_line_set_points(measure_line, measurePts, 2);
+        lv_obj_set_pos(measure_line, x0, y0);
+        lv_obj_clear_flag(measure_line, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(measure_line, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void TFTView_320x240::measureClear(void)
+{
+    if (userMap) {
+        userMap->remove(kMeasureIdA);
+        userMap->remove(kMeasureIdB);
+    }
+    measureStep = 0;
+    measAName[0] = measBName[0] = 0;
+    if (measure_line)
+        lv_obj_add_flag(measure_line, LV_OBJ_FLAG_HIDDEN);
+    for (lv_obj_t *d : measure_dot)
+        if (d)
+            lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN);
+    measureShowText();
+    if (maps_measure_btn)
+        lv_obj_set_style_bg_color(maps_measure_btn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+}
+
+// The ruler button: start measuring, or put the ruler away.
+void TFTView_320x240::measureToggle(void)
+{
+    if (measureStep) {
+        measureClear();
+        return;
+    }
+    mapsAwaitPinTap = false; // one thing at a time: the next tap is a measuring tap
+    if (maps_hold_label)
+        lv_obj_add_flag(maps_hold_label, LV_OBJ_FLAG_HIDDEN);
+    measureStep = 1;
+    if (maps_measure_btn)
+        lv_obj_set_style_bg_color(maps_measure_btn, lv_color_hex(0x0a84ff), LV_PART_MAIN);
+    measureShowText();
+}
+
+// A tap on the map while measuring. (sx, sy) is where on the map it landed, for snapping to a pin.
+void TFTView_320x240::measureTap(float lat, float lon, int16_t sx, int16_t sy)
+{
+    if (!userMap)
+        return;
+    // Snap to the nearest pin within a fingertip (24px): pin to pin is what Jake asked for.
+    const char *snapped = "";
+    int best = 24 * 24 + 1;
+    for (auto &p : mapPins) {
+        int16_t px, py;
+        if (!userMap->geoToScreen(p.lat, p.lon, px, py))
+            continue;
+        const int d2 = (px - sx) * (px - sx) + (py - sy) * (py - sy);
+        if (d2 < best) {
+            best = d2;
+            lat = p.lat;
+            lon = p.lon;
+            snapped = p.label;
+        }
+    }
+    if (!drawMeasureCB)
+        drawMeasureCB = [this](uint32_t, uint16_t, uint16_t, uint8_t) { measureRedraw(); };
+    if (measureStep == 1 || measureStep == 3) { // the first point - or a fresh start after a result
+        userMap->remove(kMeasureIdB);
+        measALat = lat;
+        measALon = lon;
+        strncpy(measAName, snapped, sizeof(measAName) - 1);
+        measAName[sizeof(measAName) - 1] = 0;
+        measBName[0] = 0;
+        userMap->remove(kMeasureIdA);
+        userMap->add(kMeasureIdA, lat, lon, drawMeasureCB);
+        measureStep = 2;
+    } else {
+        measBLat = lat;
+        measBLon = lon;
+        strncpy(measBName, snapped, sizeof(measBName) - 1);
+        measBName[sizeof(measBName) - 1] = 0;
+        userMap->remove(kMeasureIdB);
+        userMap->add(kMeasureIdB, lat, lon, drawMeasureCB);
+        measureStep = 3;
+    }
+    measureRedraw();
+    measureShowText();
 }
 
 void TFTView_320x240::clearFoundMarker(void)

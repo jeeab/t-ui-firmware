@@ -50,6 +50,23 @@ extern "C" bool tdeck_gps_position(int32_t *lat, int32_t *lon)
     return true;
 }
 
+// Height above sea level in metres, for the Maps app (Jake, 2026-09-30: "how do we see elevation").
+// Only from a real 3D fix - four satellites or more; with three the receiver solves a flat 2D
+// position and its altitude is a guess. A typed-in fixed position carries whatever was typed.
+extern "C" bool tdeck_gps_altitude(int32_t *meters)
+{
+    if (!gpsStatus || !meters)
+        return false;
+    if (config.position.fixed_position) {
+        *meters = gpsStatus->getAltitude();
+        return *meters != 0;
+    }
+    if (!gpsStatus->getHasLock() || gpsStatus->getNumSatellites() < 4)
+        return false;
+    *meters = gpsStatus->getAltitude();
+    return true;
+}
+
 // Wall-clock date and time for Lua apps (device.clock()). The device has no battery-backed
 // clock: it learns the time from the GPS satellites, so before a fix there is genuinely no
 // date to report and we say so rather than handing back 1970.
