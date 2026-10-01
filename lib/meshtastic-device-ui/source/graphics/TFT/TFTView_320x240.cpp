@@ -376,9 +376,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.09.30.2-test"
+#define TUI_VERSION "2026.09.30.3-test"
 #else
-#define TUI_VERSION "2026.09.30.2"
+#define TUI_VERSION "2026.09.30.3"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -4019,7 +4019,13 @@ void TFTView_320x240::openMaps(void)
                 THIS->mapsShowNotice(buf);
             }
         });
-        barBtn("Pins", 56, LV_ALIGN_TOP_RIGHT, -4, 0x0a84ff, [](lv_event_t *) { THIS->openPinsList(); });
+        // Pins always opens on ALL your pins. The box is shared with the magnifier's search, and
+        // keeping its text meant Pins after a place search showed only that search's matches -
+        // Jake searched "lake cavanough" and could not get back to his pins (2026-09-30).
+        barBtn("Pins", 56, LV_ALIGN_TOP_RIGHT, -4, 0x0a84ff, [](lv_event_t *) {
+            THIS->pinFilter[0] = 0;
+            THIS->openPinsList();
+        });
 
         // satellite readout in the top-bar gap between "+" and "Me" (green = locked)
         maps_sats_label = lv_label_create(maps_screen);
