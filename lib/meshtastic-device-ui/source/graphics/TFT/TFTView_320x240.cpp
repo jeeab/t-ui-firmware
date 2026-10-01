@@ -205,6 +205,7 @@ extern "C" void notif_add(uint32_t from, uint8_t ch, bool isChannel, const char 
 extern "C" const char *tdeck_node_name(uint32_t num); // TDeckNodesBridge.cpp
 // Remote control over the USB cable (src/TDeckRemote.cpp).
 extern "C" int tdeck_remote_take(int *x, int *y, int *x2, int *y2);
+extern "C" const char *tdeck_remote_arg(void); // the text after @@place
 extern "C" void tdeck_remote_reply(const char *what);
 extern "C" void notif_init(void);
 // EmojiText.cpp: emoji have no glyph in this build and LV_USE_FONT_PLACEHOLDER is 0, so they
@@ -375,9 +376,9 @@ extern const char *firmware_version;
 // #define GETAPPS_SELFTEST 1   <-- diagnostics OFF for release
 
 #ifdef GETAPPS_SELFTEST
-#define TUI_VERSION "2026.09.30.1-test"
+#define TUI_VERSION "2026.09.30.2-test"
 #else
-#define TUI_VERSION "2026.09.30.1"
+#define TUI_VERSION "2026.09.30.2"
 #endif
 
 TFTView_320x240 *TFTView_320x240::gui = nullptr;
@@ -3788,6 +3789,7 @@ void TFTView_320x240::mapsInitTileStyle(void)
     mapsStyleInited = savedOnCard || haveSaved;
 }
 
+extern "C" void tdeck_url_tiles_hangup(bool onlyIfIdle); // URLService.cpp - hang up the tile server
 extern "C" void tdeck_chess_release(void); // TDeckChess.cpp - no-op while it is thinking
 
 void TFTView_320x240::openMaps(void)
@@ -3854,7 +3856,9 @@ void TFTView_320x240::openMaps(void)
         lv_obj_set_style_radius(maps_hold_label, 6, LV_PART_MAIN);
         lv_label_set_text(maps_hold_label, "keep holding to drop a pin");
         lv_obj_set_style_text_color(maps_hold_label, lv_color_hex(0xffd60a), LV_PART_MAIN);
-        lv_obj_align(maps_hold_label, LV_ALIGN_BOTTOM_MID, 0, -12);
+        // Just under the top bar: the bottom edge now has the zoom readout, the magnifier and the
+        // cog along it, and this is wide enough to run into all three.
+        lv_obj_align(maps_hold_label, LV_ALIGN_TOP_MID, 0, 38);
         lv_obj_add_flag(maps_hold_label, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(maps_hold_label, LV_OBJ_FLAG_CLICKABLE);
 
@@ -4080,6 +4084,28 @@ void TFTView_320x240::openMaps(void)
         lv_obj_add_event_cb(
             maps_gear_btn, [](lv_event_t *) { THIS->openMapsMenu(); }, LV_EVENT_CLICKED, NULL);
 
+        // Magnifier, beside the cog: straight into search, with an empty box. Jake, 2026-09-30:
+        // "make a shortcut to the search bar as a little magnifying glass in the corner". Drawn
+        // like the cog, because this build's font has no symbol glyphs.
+        maps_search_btn = lv_btn_create(maps_screen);
+        lv_obj_set_size(maps_search_btn, 36, 36);
+        lv_obj_set_style_radius(maps_search_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(maps_search_btn, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(maps_search_btn, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(maps_search_btn, 0, LV_PART_MAIN);
+        lv_obj_align(maps_search_btn, LV_ALIGN_BOTTOM_RIGHT, -48, -6);
+        icRing(maps_search_btn, 7, 6, 17, 0xffffff, 3);   // the lens
+        icBox(maps_search_btn, 21, 21, 5, 5, 0xffffff, 2); // the handle, stepped down-right:
+        icBox(maps_search_btn, 24, 24, 5, 5, 0xffffff, 2); //  icBox cannot rotate, and three
+        icBox(maps_search_btn, 27, 27, 4, 4, 0xffffff, 2); //  steps read as a line at this size
+        lv_obj_add_event_cb(
+            maps_search_btn,
+            [](lv_event_t *) {
+                THIS->pinFilter[0] = 0; // a fresh search, not whatever was typed last time
+                THIS->openPinsList(true);
+            },
+            LV_EVENT_CLICKED, NULL);
+
         // zoom level readout, bottom-left over the map
         maps_zoom_label = lv_label_create(maps_screen);
         lv_obj_set_style_text_color(maps_zoom_label, lv_color_hex(0xffffff), LV_PART_MAIN);
@@ -4096,11 +4122,14 @@ void TFTView_320x240::openMaps(void)
             maps_screen,
             [](lv_event_t *) {
                 THIS->closeMapsMenu();
+                THIS->mapsRememberView(); // "open where I left it" with no GPS fix
+                placenames_release();     // the search's copy of the biggest cities
                 if (THIS->userMap)
                     THIS->userMap->releaseTiles();
                 // ...and the decoded-JPEG cache behind them, which is the 1.5MB part.
 #if defined(HAS_SDCARD) && !defined(HAS_SD_MMC) && !defined(ARCH_PORTDUINO) // where SdFatService is built
                 tdeck_tile_cache_clear();
+                tdeck_url_tiles_hangup(false); // the browse-fill TLS line: ~40KB of internal RAM
 #endif
             },
             LV_EVENT_SCREEN_UNLOADED, NULL);
@@ -4147,24 +4176,41 @@ void TFTView_320x240::openMaps(void)
             userMap->setGpsPositionImage(maps_gps_dot);
         }
 
-        // center like the mesh map does: GPS > saved home > world view
-        if (hasPosition) {
-            if (db.uiConfig.map_data.has_home) {
-                userMap->setHomeLocation(db.uiConfig.map_data.home.latitude * 1e-7, db.uiConfig.map_data.home.longitude * 1e-7);
+        // Where it opens. A live GPS fix wins. Without one - most boots, since the GPS takes a while
+        // to find itself - it is what the gear menu says: the last place you were looking at (the
+        // default) or home. Jake, 2026-09-30: "starting position (if there is no lock)".
+        //
+        // ⛔ NOT setHomeLocation() WITHOUT A FIX. It also moves `current`, which is where the blue
+        // "you are here" dot is drawn - so the old code put that dot on home, or would have put it
+        // on the last view, while the device had no idea where it was. setScrolledPosition() moves
+        // the view and nothing else.
+        loadPins(); // read saved pins from SD (once per boot) - the start choice rides in that file
+        {
+            int32_t gla = 0, glo = 0;
+            const bool fix = tdeck_gps_position(&gla, &glo);
+            const bool homeSet = db.uiConfig.map_data.has_home;
+            if (fix) {
+                userMap->setZoom(mapsLastValid && mapsLastZoom >= 10 ? mapsLastZoom : 13);
+                userMap->setHomeLocation(gla * 1e-7, glo * 1e-7);
+                userMap->setGpsPosition(gla * 1e-7, glo * 1e-7);
+            } else if (mapsStartMode == 0 && mapsLastValid) {
+                userMap->setZoom(mapsLastZoom);
+                userMap->setScrolledPosition(mapsLastLat, mapsLastLon);
+            } else if (homeSet) {
                 userMap->setZoom(db.uiConfig.map_data.home.zoom);
-            } else {
-                userMap->setHomeLocation(myLatitude * 1e-7, myLongitude * 1e-7);
+                userMap->setScrolledPosition(db.uiConfig.map_data.home.latitude * 1e-7,
+                                             db.uiConfig.map_data.home.longitude * 1e-7);
+            } else if (hasPosition) {
                 userMap->setZoom(13);
+                userMap->setScrolledPosition(myLatitude * 1e-7, myLongitude * 1e-7);
+            } else {
+                userMap->setZoom(3);
             }
-            userMap->setGpsPosition(myLatitude * 1e-7, myLongitude * 1e-7);
-        } else if (db.uiConfig.map_data.has_home) {
-            userMap->setHomeLocation(db.uiConfig.map_data.home.latitude * 1e-7, db.uiConfig.map_data.home.longitude * 1e-7);
-            userMap->setZoom(db.uiConfig.map_data.home.zoom);
-        } else {
-            userMap->setZoom(3);
+            // The last position the mesh has for us is still worth a dot - it is where we were.
+            if (!fix && hasPosition)
+                userMap->setGpsPosition(myLatitude * 1e-7, myLongitude * 1e-7);
         }
 
-        loadPins();              // read saved pins from SD (once per boot)
         drawAllPins();           // attach them to our map
         drawAllNodesOnUserMap(); // and every mesh node we already have a position for
         // Tell the user what came back from the card (temporary, while we chase the bug):
@@ -4198,6 +4244,11 @@ void TFTView_320x240::updateMapsZoom(void)
 
 void TFTView_320x240::updateMapsSats(void)
 {
+    // Once a second while Maps is up: hang up the tile server after a few quiet seconds, so the TLS
+    // buffers are only held while squares are actually coming in.
+#ifdef ARDUINO_ARCH_ESP32
+    tdeck_url_tiles_hangup(true);
+#endif
     updateMapsZoom();
     if (!maps_sats_label || lv_screen_active() != maps_screen)
         return;
@@ -4359,11 +4410,47 @@ void mapdlBuildUrl(char *out, size_t cap, const char *tpl, uint8_t z, uint32_t x
     out[o] = 0;
 }
 
+// Place names come in 1x1 degree squares; this many covers the download box. Past
+// kNamesMaxSquares (a view zoomed out over several states) they are skipped: that is tens of MB,
+// and the website has the whole of the USA or Europe as one zip for exactly that.
+const int kNamesMaxSquares = 100;
+int namesSquareCount(float latN, float latS, float lonW, float lonE, int *la0 = nullptr, int *la1 = nullptr,
+                     int *lo0 = nullptr, int *lo1 = nullptr)
+{
+    const int a0 = (int)floorf(latS), a1 = (int)floorf(latN), o0 = (int)floorf(lonW), o1 = (int)floorf(lonE);
+    if (la0) {
+        *la0 = a0;
+        *la1 = a1;
+        *lo0 = o0;
+        *lo1 = o1;
+    }
+    return (a1 - a0 + 1) * (o1 - o0 + 1);
+}
+
 #ifdef ARDUINO_ARCH_ESP32
 // One TLS connection reused for the whole download (a handshake per tile would be
 // brutally slow and heap-hungry). Created on start, freed on stop — TLS holds ~45KB
 // of heap while alive, which the mesh needs back afterwards.
 WiFiClientSecure *mapdlClient = nullptr;
+// ⭐ ONE HTTPClient FOR THE WHOLE DOWNLOAD, alongside the client. HTTPClient's destructor calls
+// stop() on the connection, so the old one-per-tile HTTPClient on the stack hung up after every
+// single tile, and every tile paid for a fresh TLS handshake - by far the slowest part of fetching
+// a 20KB picture. setReuse(true) was there all along; it just never got the chance. Found reading
+// the framework source, 2026-09-30. (Same host each time, so beginInternal keeps the connection.)
+HTTPClient *mapdlHttp = nullptr;
+
+void mapdlDropConnection(void)
+{
+    if (mapdlHttp) { // first: its destructor touches the client
+        delete mapdlHttp;
+        mapdlHttp = nullptr;
+    }
+    if (mapdlClient) {
+        delete mapdlClient;
+        mapdlClient = nullptr;
+        tdeck_tls_reserve_take(); // and put the reserve back, now those buffers are gone
+    }
+}
 
 void mapdlTilePath(char *buf, size_t cap, uint8_t z, uint32_t x, uint32_t y)
 {
@@ -4390,12 +4477,15 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
         mapdlClient->setInsecure(); // public map data; no room for a CA bundle
         mapdlClient->setHandshakeTimeout(15); // default 120s outlives the ~90s watchdog
     }
+    if (!mapdlHttp) {
+        mapdlHttp = new HTTPClient();
+        mapdlHttp->setReuse(true); // keep-alive on the shared client
+        mapdlHttp->setConnectTimeout(8000);
+        mapdlHttp->setTimeout(8000);
+    }
     char url[160];
     mapdlBuildUrl(url, sizeof(url), mapdlSrc().urlTemplate, z, x, y);
-    HTTPClient http;
-    http.setReuse(true); // keep-alive on the shared client
-    http.setConnectTimeout(8000);
-    http.setTimeout(8000);
+    HTTPClient &http = *mapdlHttp;
     if (!http.begin(*mapdlClient, url)) {
         strcpy(mapdlFail, "connect setup");
         mapdlFailStreak++;
@@ -4408,14 +4498,16 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
         // service has no tile at that zoom).
         snprintf(mapdlFail, sizeof(mapdlFail), "error %d", code);
         http.end();
+        // Hang up too. The connection is kept between tiles now, and an error page's body that
+        // has not fully arrived yet would be read as the start of the NEXT tile's reply.
+        if (mapdlClient)
+            mapdlClient->stop();
         // A shared keep-alive connection that has been closed by the far end fails every
         // subsequent tile, for ever, because the client is only built once. Throw it away after a
         // few failures in a row and let the next tile build a fresh one - and hand the TLS
         // reserve back so the new handshake has the contiguous internal RAM it needs.
         if (++mapdlFailStreak >= 4 && mapdlClient) {
-            delete mapdlClient;
-            mapdlClient = nullptr;
-            tdeck_tls_reserve_take();
+            mapdlDropConnection();
             mapdlFailStreak = 0;
             ILOG_INFO("mapdl: connection reset after repeated failures, will rebuild TLS client");
         }
@@ -4426,6 +4518,7 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
         snprintf(mapdlFail, sizeof(mapdlFail), "bad size %d", len);
         mapdlFailStreak++;
         http.end();
+        mapdlClient->stop(); // unread body: see above
         return false;
     }
     uint8_t *buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
@@ -4433,6 +4526,7 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
         strcpy(mapdlFail, "out of memory");
         mapdlFailStreak++;
         http.end();
+        mapdlClient->stop(); // unread body: see above
         return false;
     }
     WiFiClient *stream = http.getStreamPtr();
@@ -4457,6 +4551,10 @@ bool mapdlFetch(uint8_t z, uint32_t x, uint32_t y)
     }
     http.end();
     bool ok = (got == len);
+    if (!ok && mapdlClient)
+        mapdlClient->stop(); // half a body left on a kept-alive line would be read as the next reply
+    if (ok)
+        mapdlFailStreak = 0; // "four in a row" - it was never reset, so it counted every failure ever
     if (ok) {
         char dir[104], path[120];
         snprintf(dir, sizeof(dir), "%s/%s/%u/%lu", MapTileSettings::getPrefix(), mapdlSrc().folder, (unsigned)z,
@@ -4495,6 +4593,365 @@ void mapdlWriteMeta(void)
         f.print("\n");
         f.close();
     }
+}
+
+// ---- place names, fetched alongside the tiles ---------------------------------------------------
+// Jake, 2026-09-30: "Would be nice to have this download alongside with the offline downloader on
+// the tdeck. So that everyone that uses the software can do it" - "maybe if you could just link it
+// with that". The 1x1 degree squares covering the download box, and the world-cities file once,
+// come from jeeab.github.io/t-ui-names before the tiles start (see PlaceNames.h for the files).
+//
+// Streamed a slice per pump tick rather than one file per call: the biggest square is ~1MB and
+// cities.tnm 2.5MB, and holding the UI task for the whole of one freezes the screen - and, since
+// the UI task holds the SPI bus, the radio with it.
+const char *kNamesBase = "https://jeeab.github.io/t-ui-names/names/";
+struct NamesCell {
+    int16_t la, lo; // the square's south-west corner, whole degrees
+};
+struct NamesDl {
+    bool active;        // this download still has place names to fetch
+    bool tooBig;        // a map box of more than kNamesMaxSquares: skipped (the region choices cover it)
+    bool listPending;   // a whole region: its list of squares is still to be fetched
+    bool listFailed;    // ...and fetching it failed
+    char listRel[12];   // "us.lst" / "eu.lst"
+    float cLat, cLon;   // nearest squares first, from here - a half-finished run is still useful
+    NamesCell *cells;   // PSRAM
+    int ncells, next;
+    bool citiesChecked;
+    uint16_t got, had, none, failed, total;
+    uint32_t bytes;     // fetched so far, for the progress line
+    bool open;          // a file is streaming
+    FsFile f;
+    int len, recv;
+    uint32_t lastData;
+    uint32_t tAsk, tGot; // when the request went out and when its headers came back - for the log
+    char path[40], tmp[48];
+    uint8_t *buf;       // 4KB, PSRAM, only while the phase runs
+};
+NamesDl s_names{};
+WiFiClientSecure *namesClient = nullptr;
+HTTPClient *namesHttp = nullptr; // one for the phase - see mapdlHttp for why
+
+void namesEnd(bool ok)
+{
+    if (s_names.f)
+        s_names.f.close();
+    if (namesHttp)
+        namesHttp->end();
+    if (!ok && namesClient)
+        namesClient->stop(); // an unread tail of body must not be taken for the next reply
+    if (ok) {
+        SDFs.remove(s_names.path); // rename will not replace
+        ok = SDFs.rename(s_names.tmp, s_names.path);
+    }
+    if (!ok)
+        SDFs.remove(s_names.tmp); // never leave half a file where the search would find it
+    // One line per file: size, wait for the reply, and the whole time. Download speed was found
+    // to be the problem on the device (2026-09-30), so it is measured, not guessed.
+    ILOG_INFO("names: %s %s %d B, reply %lu ms, total %lu ms", s_names.path + 7, ok ? "ok" : "FAILED", s_names.recv,
+              (unsigned long)(s_names.tGot - s_names.tAsk), (unsigned long)(millis() - s_names.tAsk));
+    if (ok) {
+        s_names.got++;
+        s_names.bytes += (uint32_t)s_names.len;
+    } else {
+        s_names.failed++;
+    }
+    s_names.open = false;
+}
+
+// Phase over, or stopped: give back the TLS memory before the tiles build their own connection.
+void namesFinish(void)
+{
+    if (s_names.open)
+        namesEnd(false);
+    if (namesHttp) { // before the client: its destructor calls stop() on it
+        delete namesHttp;
+        namesHttp = nullptr;
+    }
+    if (namesClient) {
+        delete namesClient;
+        namesClient = nullptr;
+        tdeck_tls_reserve_take();
+    }
+    if (s_names.buf) {
+        heap_caps_free(s_names.buf);
+        s_names.buf = nullptr;
+    }
+    if (s_names.cells) {
+        heap_caps_free(s_names.cells);
+        s_names.cells = nullptr;
+    }
+    s_names.active = false;
+}
+
+void namesReset(void)
+{
+    namesFinish();
+    s_names.tooBig = s_names.listPending = s_names.listFailed = s_names.citiesChecked = s_names.open = false;
+    s_names.listRel[0] = 0;
+    s_names.ncells = s_names.next = 0;
+    s_names.got = s_names.had = s_names.none = s_names.failed = s_names.total = 0;
+    s_names.bytes = 0;
+    s_names.len = s_names.recv = 0;
+}
+
+// Nearest square first, measured from the middle of each square.
+void namesSortCells(void)
+{
+    const float c = cosf(s_names.cLat * (float)M_PI / 180.0f);
+    auto d2 = [c](const NamesCell &a) {
+        const float dy = a.la + 0.5f - s_names.cLat, dx = (a.lo + 0.5f - s_names.cLon) * c;
+        return dx * dx + dy * dy;
+    };
+    std::sort(s_names.cells, s_names.cells + s_names.ncells,
+              [&d2](const NamesCell &a, const NamesCell &b) { return d2(a) < d2(b); });
+}
+
+// The squares covering a box. Returns false when there are more than kNamesMaxSquares.
+bool namesSetBox(float latN, float latS, float lonW, float lonE)
+{
+    int la0, la1, lo0, lo1;
+    const int sq = namesSquareCount(latN, latS, lonW, lonE, &la0, &la1, &lo0, &lo1);
+    if (sq > kNamesMaxSquares || sq <= 0)
+        return false;
+    s_names.cells = (NamesCell *)heap_caps_malloc(sizeof(NamesCell) * sq, MALLOC_CAP_SPIRAM);
+    if (!s_names.cells)
+        return false;
+    s_names.ncells = 0;
+    for (int la = la0; la <= la1; la++)
+        for (int lo = lo0; lo <= lo1; lo++) {
+            int l = lo < -180 ? lo + 360 : (lo > 179 ? lo - 360 : lo);
+            s_names.cells[s_names.ncells++] = {(int16_t)la, (int16_t)l};
+        }
+    namesSortCells();
+    return true;
+}
+
+// Ask for one file. Leaves s_names.open set when there is a body to stream; a 404 is ordinary -
+// the square is sea, or outside the USA and Europe - and just counts as "none".
+void namesBegin(const char *rel)
+{
+    snprintf(s_names.path, sizeof(s_names.path), "/names/%s", rel);
+    snprintf(s_names.tmp, sizeof(s_names.tmp), "%s.part", s_names.path);
+    if (!namesClient) {
+        tdeck_tls_reserve_release(); // the handshake needs the contiguous RAM set aside at boot
+        namesClient = new WiFiClientSecure();
+        namesClient->setInsecure(); // public data; no room for a CA bundle
+        namesClient->setHandshakeTimeout(15);
+    }
+    if (!namesHttp) {
+        namesHttp = new HTTPClient();
+        namesHttp->setReuse(true);
+        namesHttp->setConnectTimeout(8000);
+        namesHttp->setTimeout(8000);
+    }
+    char url[96];
+    snprintf(url, sizeof(url), "%s%s", kNamesBase, rel);
+    if (!namesHttp->begin(*namesClient, url)) {
+        s_names.failed++;
+        return;
+    }
+    s_names.tAsk = millis();
+    const int code = namesHttp->GET();
+    s_names.tGot = millis();
+    if (code == 404) {
+        namesHttp->end();
+        namesClient->stop(); // GitHub's 404 page is a body we did not read; do not reuse the line
+        s_names.none++;
+        return;
+    }
+    const int len = code == HTTP_CODE_OK ? namesHttp->getSize() : -1;
+    if (code != HTTP_CODE_OK || len < 32 || len > 16 * 1024 * 1024) {
+        ILOG_WARN("names: %s -> %d (len %d)", rel, code, len);
+        namesHttp->end();
+        namesClient->stop();
+        s_names.failed++;
+        return;
+    }
+    char dir[40];
+    strncpy(dir, s_names.path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    char *sl = strrchr(dir, '/');
+    if (sl && sl != dir) {
+        *sl = 0;
+        SDFs.mkdir(dir); // SdFat creates missing parents
+    }
+    s_names.f = SDFs.open(s_names.tmp, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!s_names.f) {
+        namesHttp->end();
+        namesClient->stop();
+        s_names.failed++;
+        return;
+    }
+    s_names.len = len;
+    s_names.recv = 0;
+    s_names.lastData = millis();
+    s_names.open = true;
+}
+
+// A whole region: fetch its list of squares ("lat lon" per line, ~12KB) into memory, nearest first.
+// Small enough to take in one go, so it is one blocking request rather than a streamed file.
+void namesFetchList(void)
+{
+    s_names.listPending = false;
+    if (!namesClient) {
+        tdeck_tls_reserve_release();
+        namesClient = new WiFiClientSecure();
+        namesClient->setInsecure();
+        namesClient->setHandshakeTimeout(15);
+    }
+    if (!namesHttp) {
+        namesHttp = new HTTPClient();
+        namesHttp->setReuse(true);
+        namesHttp->setConnectTimeout(8000);
+        namesHttp->setTimeout(8000);
+    }
+    char url[96];
+    snprintf(url, sizeof(url), "%s%s", kNamesBase, s_names.listRel);
+    const int kMaxList = 64 * 1024;
+    char *text = nullptr;
+    int got = 0;
+    if (namesHttp->begin(*namesClient, url) && namesHttp->GET() == HTTP_CODE_OK) {
+        const int len = namesHttp->getSize();
+        if (len > 0 && len < kMaxList && (text = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM))) {
+            WiFiClient *st = namesHttp->getStreamPtr();
+            const uint32_t t0 = millis();
+            while (got < len && millis() - t0 < 8000) {
+                const int avail = st->available();
+                if (avail <= 0) {
+                    delay(5);
+                    continue;
+                }
+                const int r = st->read((uint8_t *)text + got, (avail < len - got) ? avail : len - got);
+                if (r > 0)
+                    got += r;
+            }
+            if (got != len)
+                got = 0;
+            text[got] = 0;
+        }
+    }
+    namesHttp->end();
+    if (!got) {
+        namesClient->stop();
+        if (text)
+            heap_caps_free(text);
+        ILOG_WARN("names: could not fetch %s", s_names.listRel);
+        s_names.listFailed = true;
+        namesFinish();
+        return;
+    }
+    int lines = 0;
+    for (int i = 0; i < got; i++)
+        if (text[i] == '\n')
+            lines++;
+    s_names.cells = (NamesCell *)heap_caps_malloc(sizeof(NamesCell) * (lines + 1), MALLOC_CAP_SPIRAM);
+    s_names.ncells = 0;
+    if (s_names.cells) {
+        char *p = text;
+        while (*p && s_names.ncells <= lines) {
+            char *e = nullptr;
+            const long la = strtol(p, &e, 10);
+            if (e == p)
+                break;
+            p = e;
+            const long lo = strtol(p, &e, 10);
+            if (e == p)
+                break;
+            p = e;
+            if (la >= -90 && la <= 89 && lo >= -180 && lo <= 179)
+                s_names.cells[s_names.ncells++] = {(int16_t)la, (int16_t)lo};
+            while (*p == '\r' || *p == '\n' || *p == ' ')
+                p++;
+        }
+        namesSortCells();
+    }
+    heap_caps_free(text);
+    s_names.total = (uint16_t)(s_names.ncells + 1); // + cities.tnm
+    if (!s_names.ncells) {
+        s_names.listFailed = true;
+        namesFinish();
+    }
+}
+
+// Move what arrives from the connection to the card for up to ~30ms, then give the screen its
+// turn. Reading only what happened to be waiting, once per 50ms tick, let the connection sit idle
+// with its small receive window full for most of every tick.
+void namesStream(void)
+{
+    WiFiClient *st = namesHttp->getStreamPtr();
+    int moved = 0;
+    const uint32_t t0 = millis();
+    while (st && s_names.recv < s_names.len && moved < 65536 && millis() - t0 < 30) {
+        const int avail = st->available();
+        if (avail <= 0) {
+            if (!st->connected())
+                break;
+            delay(1);
+            continue;
+        }
+        int want = s_names.len - s_names.recv;
+        if (want > avail)
+            want = avail;
+        if (want > 4096)
+            want = 4096;
+        const int r = st->read(s_names.buf, want);
+        if (r <= 0)
+            break;
+        if (s_names.f.write(s_names.buf, r) != (size_t)r) {
+            namesEnd(false); // card full or pulled
+            return;
+        }
+        s_names.recv += r;
+        moved += r;
+    }
+    if (s_names.recv >= s_names.len) {
+        namesEnd(true);
+        return;
+    }
+    if (moved)
+        s_names.lastData = millis();
+    else if (!st || !st->connected() || millis() - s_names.lastData > 10000) {
+        ILOG_WARN("names: %s stopped at %d of %d bytes", s_names.path, s_names.recv, s_names.len);
+        namesEnd(false);
+    }
+}
+
+// One step of the place-name phase. True while it is still going (the tiles wait for it).
+bool namesStep(void)
+{
+    if (!s_names.active)
+        return false;
+    if (s_names.open) {
+        namesStream();
+        return true;
+    }
+    if (s_names.listPending) {
+        namesFetchList();
+        return s_names.active;
+    }
+    for (int skip = 0; skip < 24; skip++) { // squares already on the card cost a directory lookup each
+        char rel[24];
+        if (s_names.next < s_names.ncells) {
+            const NamesCell &c = s_names.cells[s_names.next++];
+            snprintf(rel, sizeof(rel), "%d/%d.tnm", c.la, c.lo);
+        } else if (!s_names.citiesChecked) {
+            s_names.citiesChecked = true; // last: the biggest file, and the least local
+            strcpy(rel, "cities.tnm");
+        } else {
+            namesFinish();
+            return false;
+        }
+        char path[40];
+        snprintf(path, sizeof(path), "/names/%s", rel);
+        if (SDFs.exists(path)) {
+            s_names.had++;
+            continue;
+        }
+        namesBegin(rel);
+        return true;
+    }
+    return true;
 }
 #endif // ARDUINO_ARCH_ESP32
 } // namespace
@@ -4725,45 +5182,224 @@ void TFTView_320x240::mapsApplyStyle(const char *style, bool persist)
 void TFTView_320x240::closeMapsMenu(void)
 {
     if (maps_style_ovl) {
-        lv_obj_delete(maps_style_ovl);
+        // Async: every row in this menu closes it from inside its own click handler, and deleting
+        // the parent of the object whose event is running is the shape that has frozen this device
+        // before. Nulled at once, so the menu can be reopened straight away.
+        lv_obj_delete_async(maps_style_ovl);
         maps_style_ovl = nullptr;
     }
 }
 
-// The gear menu: pick a map style (folders under /maps) or open the region downloader.
-void TFTView_320x240::openMapsMenu(void)
+namespace {
+// One row of the Maps settings: a full-width button with its text on the left.
+lv_obj_t *mapsMenuRow(lv_obj_t *parent, const char *txt, uint32_t color, lv_event_cb_t cb, void *ud)
 {
-    if (!maps_screen || maps_style_ovl)
-        return;
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_set_width(b, LV_PCT(100));
+    lv_obj_set_height(b, 34);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
+    lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_width(l, LV_PCT(100));
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    tui_one_line(l); // LONG_DOT needs a pinned height - see TuiLabel.h
+    lv_obj_align(l, LV_ALIGN_LEFT_MID, 2, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    return b;
+}
+
+} // namespace
+
+// Close the menu and build it again once this click is over, so a switch shows its new value.
+void TFTView_320x240::mapsMenuReopen(void)
+{
+    closeMapsMenu();
+    lv_async_call([](void *) { THIS->openMapsMenu(); }, nullptr);
+}
+
+// The empty overlay the settings and the style list both fill: titled, and scrolling when it has
+// more rows than the screen has room for.
+lv_obj_t *TFTView_320x240::mapsMenuShell(const char *title)
+{
     maps_style_ovl = lv_obj_create(maps_screen);
-    lv_obj_set_size(maps_style_ovl, 250, 206);
+    lv_obj_set_size(maps_style_ovl, 292, 228);
     lv_obj_center(maps_style_ovl);
     lv_obj_set_style_bg_color(maps_style_ovl, lv_color_hex(0x1c1c1e), LV_PART_MAIN);
     lv_obj_set_style_border_color(maps_style_ovl, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
     lv_obj_set_style_radius(maps_style_ovl, 12, LV_PART_MAIN);
     lv_obj_set_flex_flow(maps_style_ovl, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(maps_style_ovl, 8, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(maps_style_ovl, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(maps_style_ovl, 5, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(maps_style_ovl, LV_DIR_VER);
+    lv_obj_t *t = lv_label_create(maps_style_ovl);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_color(t, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    return maps_style_ovl;
+}
 
-    auto row = [&](const char *txt, uint32_t color, lv_event_cb_t cb, void *ud) {
-        lv_obj_t *b = lv_btn_create(maps_style_ovl);
-        lv_obj_set_width(b, LV_PCT(100));
-        lv_obj_set_height(b, 36);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), LV_PART_MAIN);
-        lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
-        lv_obj_t *l = lv_label_create(b);
-        lv_label_set_text(l, txt);
-        lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
-        lv_obj_center(l);
-        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
-        return b;
+// The cog. Jake, 2026-09-30: "that settings gear on the bottom right, open more of a menu, with
+// style being an option, offline downloader being an option, units, starting position (if there is
+// no lock) and any other settings you think".
+void TFTView_320x240::openMapsMenu(void)
+{
+    if (!maps_screen || maps_style_ovl)
+        return;
+    lv_obj_t *m = mapsMenuShell("Map settings");
+    char txt[64];
+
+    // Map style: which folder of tiles. Its own list, because a card can hold several.
+    {
+        char cur[28];
+        strncpy(cur, MapTileSettings::getTileStyle(), sizeof(cur) - 1);
+        cur[sizeof(cur) - 1] = 0;
+        const size_t cl = strlen(cur);
+        if (cl && cur[cl - 1] == '/')
+            cur[cl - 1] = 0;
+        snprintf(txt, sizeof(txt), "Map style: %s", cur[0] ? cur : "none");
+        mapsMenuRow(m, txt, 0xffffff,
+                    [](lv_event_t *) {
+                        THIS->closeMapsMenu();
+                        lv_async_call([](void *) { THIS->openMapsStyleMenu(); }, nullptr);
+                    },
+                    NULL);
+    }
+
+    // Offline: the tiles for what is on screen, and now its place names with them.
+    mapsMenuRow(m, mapdl_running ? "Download: see progress..." : "Download this area...", 0x30d158,
+                [](lv_event_t *) {
+                    if (!THIS->mapdl_running)
+                        THIS->mapdl_names_mode = 0;
+                    THIS->closeMapsMenu();
+                    // Async: this switches screens, which unloads the one this menu lives on.
+                    lv_async_call([](void *) { THIS->openMapDownload(); }, nullptr);
+                },
+                NULL);
+
+    // Place names on their own, for search - for a card that already has its maps.
+    mapsMenuRow(m, "Place names for search...", 0x30d158,
+                [](lv_event_t *) {
+                    THIS->closeMapsMenu();
+                    lv_async_call([](void *) { THIS->openNamesMenu(); }, nullptr);
+                },
+                NULL);
+
+    // Units. The device has ONE switch for this (the weather's F/C is the same one), so it says
+    // so rather than letting the map disagree with everything else.
+    snprintf(txt, sizeof(txt), "Units: %s", mapsMetric() ? "km and metres" : "miles and feet");
+    mapsMenuRow(m, txt, 0xffffff,
+                [](lv_event_t *) {
+                    const bool metric = !THIS->mapsMetric();
+                    tdeck_units_set_metric(metric); // saved by the main loop
+                    THIS->db.config.display.units = metric ? meshtastic_Config_DisplayConfig_DisplayUnits_METRIC
+                                                           : meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL;
+                    THIS->mapsMenuReopen();
+                },
+                NULL);
+
+    // Starting position when there is no GPS fix.
+    const bool homeSet = db.uiConfig.map_data.has_home;
+    snprintf(txt, sizeof(txt), "No GPS fix: open at %s",
+             mapsStartMode == 0 ? "last view" : (homeSet ? "home" : "home (not set)"));
+    mapsMenuRow(m, txt, 0xffffff,
+                [](lv_event_t *) {
+                    THIS->mapsStartMode = THIS->mapsStartMode ? 0 : 1;
+                    THIS->savePins();
+                    THIS->mapsMenuReopen();
+                },
+                NULL);
+    mapsMenuRow(m, "Set home to this spot", 0xffffff,
+                [](lv_event_t *) {
+                    if (!THIS->userMap)
+                        return;
+                    float la = 0, lo = 0;
+                    THIS->userMap->getCenter(la, lo);
+                    THIS->db.uiConfig.has_map_data = true;
+                    THIS->db.uiConfig.map_data.has_home = true;
+                    THIS->db.uiConfig.map_data.home.latitude = (int32_t)(la * 1e7f);
+                    THIS->db.uiConfig.map_data.home.longitude = (int32_t)(lo * 1e7f);
+                    THIS->db.uiConfig.map_data.home.zoom = MapTileSettings::getZoomLevel();
+                    THIS->controller->storeUIConfig(THIS->db.uiConfig);
+                    // Setting a home is asking to start there, so say that is what happens now.
+                    THIS->mapsStartMode = 1;
+                    THIS->savePins();
+                    THIS->closeMapsMenu();
+                    THIS->mapsShowNotice("Home set - with no GPS fix, Maps opens here");
+                },
+                NULL);
+
+    snprintf(txt, sizeof(txt), "Nodes on map: %s", showNodesOnUserMap ? "ON" : "off");
+    mapsMenuRow(m, txt, showNodesOnUserMap ? 0x30d158 : 0x8e8e93,
+                [](lv_event_t *) {
+                    THIS->setShowNodesOnUserMap(!THIS->showNodesOnUserMap);
+                    THIS->mapsMenuReopen();
+                },
+                NULL);
+
+    // Coverage mapper. Two rows, deliberately separate: you want to record on a drive without the
+    // overlay cluttering the map, and to study it afterwards without still recording.
+    snprintf(txt, sizeof(txt), "Record coverage: %s", tdeck_coverage_enabled() ? "ON" : "off");
+    mapsMenuRow(m, txt, tdeck_coverage_enabled() ? 0x30d158 : 0x8e8e93,
+                [](lv_event_t *) {
+                    tdeck_coverage_set_enabled(!tdeck_coverage_enabled());
+                    THIS->mapsMenuReopen();
+                },
+                NULL);
+    snprintf(txt, sizeof(txt), "Show coverage (%d): %s", tdeck_coverage_count(), coverage_overlay_on ? "ON" : "off");
+    mapsMenuRow(m, txt, coverage_overlay_on ? 0x30d158 : 0x8e8e93,
+                [](lv_event_t *) {
+                    THIS->coverage_overlay_on = !THIS->coverage_overlay_on;
+                    if (THIS->coverage_overlay_on)
+                        tdeck_coverage_load(); // a survey may be on the card from a previous session
+                    THIS->mapsMenuReopen();
+                },
+                NULL);
+
+    if (foundActive)
+        mapsMenuRow(m, "Clear the search marker", 0xffd60a,
+                    [](lv_event_t *) {
+                        THIS->clearFoundMarker();
+                        THIS->closeMapsMenu();
+                    },
+                    NULL);
+
+    mapsMenuRow(m, "Close", 0x8e8e93, [](lv_event_t *) { THIS->closeMapsMenu(); }, NULL);
+}
+
+// Gear > Place names for search: where to get them for. Downloads run on the map download screen.
+void TFTView_320x240::openNamesMenu(void)
+{
+    if (!maps_screen || maps_style_ovl)
+        return;
+    if (mapdl_running) { // one download at a time: show the one that is going
+        openMapDownload();
+        return;
+    }
+    lv_obj_t *m = mapsMenuShell("Place names for search");
+    auto choose = [](lv_event_t *e) {
+        THIS->mapdl_names_mode = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+        THIS->closeMapsMenu();
+        lv_async_call([](void *) { THIS->openMapDownload(); }, nullptr); // it switches screens
     };
+    mapsMenuRow(m, mapsMetric() ? "Near the map (150 km)" : "Near the map (100 miles)", 0xffffff, choose,
+                (void *)(uintptr_t)1);
+    mapsMenuRow(m, "All of the USA  (70 MB)", 0xffffff, choose, (void *)(uintptr_t)2);
+    mapsMenuRow(m, "All of Europe  (130 MB)", 0xffffff, choose, (void *)(uintptr_t)3);
+    lv_obj_t *note = lv_label_create(m);
+    lv_label_set_text(note, "Over Wi-Fi. Areas already on the card\nare skipped, so it can stop and carry\non later. Download this area brings\nthem too, along with the map.");
+    lv_obj_set_style_text_font(note, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(note, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    mapsMenuRow(m, "Back", 0x8e8e93, [](lv_event_t *) { THIS->mapsMenuReopen(); }, NULL);
+}
 
-    lv_obj_t *title = lv_label_create(maps_style_ovl);
-    lv_label_set_text(title, "Map style");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+// Gear > Map style: one row per style folder on the card.
+void TFTView_320x240::openMapsStyleMenu(void)
+{
+    if (!maps_screen || maps_style_ovl)
+        return;
+    lv_obj_t *m = mapsMenuShell("Map style");
 
-    // one row per style folder on the card; checkmark = the active one
     static char styleNames[6][24]; // callback user_data must outlive this function
     int i = 0;
     if (sdCard) {
@@ -4793,18 +5429,20 @@ void TFTView_320x240::openMapsMenu(void)
                     pre[close - region + 2] = 0;
                 }
             }
-            char lbl[44];
-            snprintf(lbl, sizeof(lbl), "%s%s%s", current ? LV_SYMBOL_OK " " : "", pre, styleNames[i]);
-            row(lbl, 0xffffff,
-                [](lv_event_t *e) {
-                    const char *style = (const char *)lv_event_get_user_data(e);
-                    THIS->closeMapsMenu();
-                    THIS->mapsApplyStyle(style, true);
-                    char msg[40];
-                    snprintf(msg, sizeof(msg), "map: %s", style);
-                    THIS->mapsShowNotice(msg);
-                },
-                styleNames[i]);
+            // The one in use is green and says so. It used to carry LV_SYMBOL_OK, but this build's
+            // font has no symbol glyphs, so the tick drew as nothing and every row looked the same.
+            char lbl[48];
+            snprintf(lbl, sizeof(lbl), "%s%s%s", pre, styleNames[i], current ? "  - in use" : "");
+            mapsMenuRow(m, lbl, current ? 0x30d158 : 0xffffff,
+                        [](lv_event_t *e) {
+                            const char *style = (const char *)lv_event_get_user_data(e);
+                            THIS->closeMapsMenu();
+                            THIS->mapsApplyStyle(style, true);
+                            char msg[40];
+                            snprintf(msg, sizeof(msg), "map: %s", style);
+                            THIS->mapsShowNotice(msg);
+                        },
+                        styleNames[i]);
             i++;
         }
     }
@@ -4814,67 +5452,51 @@ void TFTView_320x240::openMapsMenu(void)
         // told him his card had nothing on it. A restart "fixed" it, which is the tell - the
         // card never changed, only our ability to read it that instant did.
         const bool readFailed = !sdCard || sdCard->cardType() == ISdCard::eNone || tdeckMapStyleScanFailed();
-        lv_obj_t *none = lv_label_create(maps_style_ovl);
+        lv_obj_t *none = lv_label_create(m);
         lv_label_set_text(none, readFailed ? "couldn't read the card" : "no map styles on card");
         lv_obj_set_style_text_color(none, lv_color_hex(readFailed ? 0xff9f0a : 0x8e8e93), LV_PART_MAIN);
         if (readFailed) {
-            // One tap to recover, instead of a reboot. Re-mounts the card and reopens the menu.
-            row("Retry card", 0xffffff,
-                [](lv_event_t *) {
-                    THIS->closeMapsMenu();
-                    // Async for the same reason as the coverage rows below: updateSDCard()
-                    // deletes and rebuilds the card object, and reopening builds a new overlay -
-                    // neither belongs inside the event handler of the overlay being destroyed.
-                    lv_async_call(
-                        [](void *) {
-                            THIS->updateSDCard();
-                            THIS->mapsStyleInited = false; // let the style restore run again
-                            THIS->mapsInitTileStyle();
-                            THIS->openMapsMenu();
+            // One tap to recover, instead of a reboot. Re-mounts the card and reopens the list.
+            mapsMenuRow(m, "Retry card", 0xffffff,
+                        [](lv_event_t *) {
+                            THIS->closeMapsMenu();
+                            // Async: updateSDCard() deletes and rebuilds the card object, and
+                            // reopening builds a new overlay - neither belongs inside the event
+                            // handler of the overlay being destroyed.
+                            lv_async_call(
+                                [](void *) {
+                                    THIS->updateSDCard();
+                                    THIS->mapsStyleInited = false; // let the style restore run again
+                                    THIS->mapsInitTileStyle();
+                                    THIS->openMapsStyleMenu();
+                                },
+                                nullptr);
                         },
-                        nullptr);
-                },
-                NULL);
+                        NULL);
         }
     }
+    mapsMenuRow(m, "Back", 0x8e8e93, [](lv_event_t *) { THIS->mapsMenuReopen(); }, NULL);
+}
 
-    // Coverage mapper. Two rows, deliberately separate: you want to record on a drive without
-    // the overlay cluttering the map, and to study it afterwards without still recording.
-    {
-        char cbuf[48];
-        snprintf(cbuf, sizeof(cbuf), "Record coverage: %s", tdeck_coverage_enabled() ? "ON" : "off");
-        row(cbuf, tdeck_coverage_enabled() ? 0x30d158 : 0x8e8e93,
-            [](lv_event_t *) {
-                tdeck_coverage_set_enabled(!tdeck_coverage_enabled());
-                THIS->closeMapsMenu();
-                // ⛔ REOPEN ASYNC. Closing inside the callback is what every other row here
-                // does, but reopening as well would build a NEW overlay while LVGL is still
-                // inside the deleted one's event handler. lv_async_call runs it after the
-                // event finishes - the same rule that stopped a tap freezing the device in
-                // the Nodes/Favorites apps.
-                lv_async_call([](void *) { THIS->openMapsMenu(); }, nullptr);
-            },
-            NULL);
-        snprintf(cbuf, sizeof(cbuf), "Show coverage (%d): %s", tdeck_coverage_count(),
-                 THIS->coverage_overlay_on ? "ON" : "off");
-        row(cbuf, THIS->coverage_overlay_on ? 0x30d158 : 0x8e8e93,
-            [](lv_event_t *) {
-                THIS->coverage_overlay_on = !THIS->coverage_overlay_on;
-                if (THIS->coverage_overlay_on)
-                    tdeck_coverage_load(); // a survey may be on the card from a previous session
-                THIS->closeMapsMenu();
-                lv_async_call([](void *) { THIS->openMapsMenu(); }, nullptr); // see the row above
-            },
-            NULL);
-    }
-
-    row(mapdl_running ? "Download progress..." : "Download this area...", 0x30d158,
-        [](lv_event_t *) {
-            THIS->closeMapsMenu();
-            THIS->openMapDownload();
-        },
-        NULL);
-    row("Close", 0x8e8e93, [](lv_event_t *) { THIS->closeMapsMenu(); }, NULL);
+// Leaving Maps: note where it was, for "No GPS fix: open at last view". Written to the card only
+// when it actually moved, so flicking in and out of the app does not rewrite the pins file.
+void TFTView_320x240::mapsRememberView(void)
+{
+    if (!userMap)
+        return;
+    float la = 0, lo = 0;
+    userMap->getCenter(la, lo);
+    const uint8_t z = MapTileSettings::getZoomLevel();
+    if (la < -85 || la > 85 || lo < -180 || lo > 180)
+        return;
+    const bool moved = !mapsLastValid || fabsf(la - mapsLastLat) > 0.0005f || fabsf(lo - mapsLastLon) > 0.0005f ||
+                       z != mapsLastZoom;
+    mapsLastLat = la;
+    mapsLastLon = lo;
+    mapsLastZoom = z;
+    mapsLastValid = true;
+    if (moved)
+        savePins();
 }
 
 uint32_t TFTView_320x240::mapdlCountTiles(uint8_t zmin, uint8_t zmax) const
@@ -4901,9 +5523,15 @@ void TFTView_320x240::mapdlUpdateEstimate(void)
     uint32_t tiles = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
     uint32_t mb10 = tiles * mapdlSrc().estKB / 102; // per-source typical KB/tile, shown in tenths of MB
     uint32_t mins = tiles / 180 + 1;                // ~3 tiles/s
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%lu tiles  ~%lu.%lu MB  ~%lu min", (unsigned long)tiles, (unsigned long)(mb10 / 10),
-             (unsigned long)(mb10 % 10), (unsigned long)mins);
+    const int sq = namesSquareCount(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE);
+    char nb[48];
+    if (sq <= kNamesMaxSquares)
+        snprintf(nb, sizeof(nb), "\n+ place names (%d square%s)", sq, sq == 1 ? "" : "s");
+    else
+        snprintf(nb, sizeof(nb), "\nToo wide for place names");
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%lu tiles  ~%lu.%lu MB  ~%lu min%s", (unsigned long)tiles, (unsigned long)(mb10 / 10),
+             (unsigned long)(mb10 % 10), (unsigned long)mins, nb);
     lv_label_set_text(mapdl_status, buf);
 }
 
@@ -4929,10 +5557,10 @@ void TFTView_320x240::openMapDownload(void)
         lv_obj_set_style_bg_color(mapdl_screen, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_clear_flag(mapdl_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *title = lv_label_create(mapdl_screen);
-        lv_label_set_text(title, "Download map area");
-        lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+        mapdl_title = lv_label_create(mapdl_screen);
+        lv_label_set_text(mapdl_title, "Download map area");
+        lv_obj_set_style_text_color(mapdl_title, lv_color_hex(0xffffff), LV_PART_MAIN);
+        lv_obj_align(mapdl_title, LV_ALIGN_TOP_MID, 0, 4);
 
         mapdl_status = lv_label_create(mapdl_screen);
         // wrap + center so a long progress line stays on screen instead of running
@@ -4956,6 +5584,7 @@ void TFTView_320x240::openMapDownload(void)
         lv_label_set_text(mapdl_info, "Area = what the map shows.\nSleep is OK once started.");
 
         lv_obj_t *ls = lv_label_create(mapdl_screen);
+        mapdl_opt_lbls[0] = ls;
         lv_label_set_text(ls, "Source:");
         lv_obj_set_style_text_color(ls, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_align(ls, LV_ALIGN_TOP_LEFT, 12, 128);
@@ -4996,6 +5625,7 @@ void TFTView_320x240::openMapDownload(void)
             LV_EVENT_VALUE_CHANGED, NULL);
 
         lv_obj_t *l1 = lv_label_create(mapdl_screen);
+        mapdl_opt_lbls[1] = l1;
         lv_label_set_text(l1, "Detail:");
         lv_obj_set_style_text_color(l1, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 12, 166);
@@ -5011,6 +5641,7 @@ void TFTView_320x240::openMapDownload(void)
             mapdl_zmin_dd, [](lv_event_t *) { THIS->mapdlUpdateEstimate(); }, LV_EVENT_VALUE_CHANGED, NULL);
 
         lv_obj_t *l2 = lv_label_create(mapdl_screen);
+        mapdl_opt_lbls[2] = l2;
         lv_label_set_text(l2, "to");
         lv_obj_set_style_text_color(l2, lv_color_hex(0xffffff), LV_PART_MAIN);
         lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 172, 166);
@@ -5075,14 +5706,54 @@ void TFTView_320x240::openMapDownload(void)
     }
 
     lv_screen_load_anim(mapdl_screen, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    mapdlShowMode();
     if (mapdl_running) {
         lv_label_set_text(mapdl_btn_lbl, "Stop");
         lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_label_set_text(mapdl_btn_lbl, "Start");
-        mapdlUpdateEstimate();
+        if (!mapdl_names_mode)
+            mapdlUpdateEstimate();
     }
 #endif // ARDUINO_ARCH_ESP32
+}
+
+// Map area, or place names on their own: the same screen, pump and Wi-Fi handling, minus the
+// map-only controls. Sizes are from the published data (placenames/out/names/index.json,
+// 2026-09-30); they only set expectations, nothing depends on them.
+void TFTView_320x240::mapdlShowMode(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (!mapdl_screen)
+        return;
+    const bool namesOnly = mapdl_names_mode != 0;
+    lv_label_set_text(mapdl_title, namesOnly ? "Download place names" : "Download map area");
+    lv_obj_t *mapOnly[] = {mapdl_opt_lbls[0], mapdl_opt_lbls[1], mapdl_opt_lbls[2], mapdl_src_dd, mapdl_zmin_dd,
+                           mapdl_zmax_dd};
+    for (lv_obj_t *o : mapOnly) {
+        if (!o)
+            continue;
+        if (namesOnly)
+            lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (mapdl_running || !namesOnly)
+        return;
+    // Two SHORT lines each - see the layout note in openMapDownload.
+    if (mapdl_names_mode == 1) {
+        lv_label_set_text(mapdl_status, mapsMetric() ? "Place names for about 150 km\naround the middle of the map"
+                                                     : "Place names for about 100 miles\naround the middle of the map");
+        lv_label_set_text(mapdl_info, "Usually a few MB, a minute\nor two. Needs Wi-Fi.");
+    } else if (mapdl_names_mode == 2) {
+        lv_label_set_text(mapdl_status, "All of the USA: about 1,500\nareas, 70 MB on the card");
+        lv_label_set_text(mapdl_info, "Nearest first. Stop any time;\nStart again carries on.");
+    } else {
+        lv_label_set_text(mapdl_status, "All of Europe: about 2,000\nareas, 130 MB on the card");
+        lv_label_set_text(mapdl_info, "Nearest first. Stop any time;\nStart again carries on.");
+    }
+    lv_obj_add_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+#endif
 }
 
 void TFTView_320x240::mapdlStart(void)
@@ -5090,17 +5761,20 @@ void TFTView_320x240::mapdlStart(void)
 #ifdef ARDUINO_ARCH_ESP32
     if (mapdl_running)
         return;
-    mapdl_zmin = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
-    mapdl_zmax = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
-    if (mapdl_zmax < mapdl_zmin)
-        mapdl_zmax = mapdl_zmin;
-    mapdl_total = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
     mapdl_done = mapdl_failed = mapdl_skipped = 0;
-    mapdl_z = mapdl_zmin;
-    uint32_t x0, x1, y0, y1;
-    boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, mapdl_z, x0, x1, y0, y1);
-    mapdl_x = x0;
-    mapdl_y = y0;
+    mapdl_total = 0;
+    if (!mapdl_names_mode) {
+        mapdl_zmin = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmin_dd);
+        mapdl_zmax = 1 + (uint8_t)lv_dropdown_get_selected(mapdl_zmax_dd);
+        if (mapdl_zmax < mapdl_zmin)
+            mapdl_zmax = mapdl_zmin;
+        mapdl_total = mapdlCountTiles(mapdl_zmin, mapdl_zmax);
+        mapdl_z = mapdl_zmin;
+        uint32_t x0, x1, y0, y1;
+        boxTiles(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE, mapdl_z, x0, x1, y0, y1);
+        mapdl_x = x0;
+        mapdl_y = y0;
+    }
 
     // WiFi: use it if it's already up, otherwise bring it up on-demand (fileshare pattern)
     bool already = tdeck_wifi_connected();
@@ -5112,6 +5786,28 @@ void TFTView_320x240::mapdlStart(void)
         return;
     }
     mapdl_deadline = lv_tick_get() + 25000;
+    // Place names go first - small, and the search wants them. Which squares depends on the mode:
+    // the map box, the squares around its middle, or a whole region's list from the website.
+    namesReset();
+    s_names.cLat = (mapdl_latN + mapdl_latS) / 2;
+    s_names.cLon = (mapdl_lonW + mapdl_lonE) / 2;
+    {
+        bool ok = false;
+        if (mapdl_names_mode == 0) {
+            ok = namesSetBox(mapdl_latN, mapdl_latS, mapdl_lonW, mapdl_lonE);
+            s_names.tooBig = !ok;
+        } else if (mapdl_names_mode == 1) {
+            ok = namesSetBox(s_names.cLat + 2, s_names.cLat - 2, s_names.cLon - 2, s_names.cLon + 2); // 5 x 5
+        } else {
+            strcpy(s_names.listRel, mapdl_names_mode == 2 ? "us.lst" : "eu.lst");
+            s_names.listPending = ok = true;
+        }
+        if (ok) {
+            s_names.buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+            s_names.active = (s_names.buf != nullptr);
+            s_names.total = (uint16_t)(s_names.ncells + 1); // + cities.tnm (a region's list sets its own)
+        }
+    }
     mapdl_running = true;
     // Two SHORT lines only — see the layout note in openMapDownload. Leaving this screen
     // currently stops the download (Jake hit this on 16.7); sleeping is safe, so say both.
@@ -5128,7 +5824,8 @@ void TFTView_320x240::mapdlStart(void)
     if (!already)
         lv_label_set_text(mapdl_status, "Turning Wi-Fi on...");
 
-    mapdlWriteMeta(); // style folder is self-describing even if we stop early
+    if (!mapdl_names_mode)
+        mapdlWriteMeta(); // style folder is self-describing even if we stop early
 
     if (!mapdl_timer)
         mapdl_timer = lv_timer_create([](lv_timer_t *) { THIS->mapdlPump(); }, 50, NULL);
@@ -5142,11 +5839,8 @@ void TFTView_320x240::mapdlStop(bool finished)
         lv_timer_delete(mapdl_timer);
         mapdl_timer = nullptr;
     }
-    if (mapdlClient) { // free the TLS heap (~45KB) the moment we're done with it
-        delete mapdlClient;
-        mapdlClient = nullptr;
-        tdeck_tls_reserve_take(); // and put the reserve back, now those buffers are gone
-    }
+    namesFinish();          // a stop during the names phase: close the file, free that connection
+    mapdlDropConnection();  // free the TLS heap (~45KB) the moment we're done with it
     if (mapdl_own_wifi && mapdl_wifi_up)
         tdeck_wifi_disconnect_now();
     if (mapdl_own_wifi && !mapdl_wifi_up)
@@ -5172,10 +5866,33 @@ void TFTView_320x240::mapdlStop(bool finished)
         else
             snprintf(buf, sizeof(buf), "Stopped at %lu of %lu tiles", (unsigned long)(mapdl_done + mapdl_skipped),
                      (unsigned long)mapdl_total);
+        // short lines only - see the layout note in openMapDownload
+        const char *info = "Progress is saved.\nStart continues it.";
+        if (finished)
+            info = s_names.tooBig                    ? "Saved. Too wide for place\nnames: Gear > Place names."
+                   : (s_names.got || s_names.had)    ? "Saved, with place names.\nTap \"Use this map\"."
+                   : s_names.failed                  ? "Saved. Place names failed:\nStart again to retry."
+                                                     : "Saved to the card.\nTap \"Use this map\".";
+        if (mapdl_names_mode) {
+            // Place names on their own: count areas, not tiles.
+            const unsigned seen = s_names.got + s_names.had + s_names.none + s_names.failed;
+            if (s_names.listFailed)
+                snprintf(buf, sizeof(buf), "Couldn't get the list of areas");
+            else if (finished && s_names.failed)
+                snprintf(buf, sizeof(buf), "Done: %u new, %u already here,\n%u failed", (unsigned)s_names.got,
+                         (unsigned)s_names.had, (unsigned)s_names.failed);
+            else if (finished)
+                snprintf(buf, sizeof(buf), "Done: %u new, %u already here", (unsigned)s_names.got, (unsigned)s_names.had);
+            else
+                snprintf(buf, sizeof(buf), "Stopped at %u of %u areas", seen, (unsigned)s_names.total);
+            info = s_names.listFailed ? "Check Wi-Fi, then Start\nagain."
+                   : finished && !s_names.failed ? "Try the magnifier on the\nmap - it knows them now."
+                                                 : "Start again carries on -\nit skips what it has.";
+        }
         lv_label_set_text(mapdl_status, buf);
-        // short lines only — see the layout note in openMapDownload
-        lv_label_set_text(mapdl_info, finished ? "Saved to the card.\nTap \"Use this map\"." : "Progress is saved.\nStart continues it.");
-        lv_obj_clear_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(mapdl_info, info);
+        if (!mapdl_names_mode)
+            lv_obj_clear_flag(mapdl_use_btn, LV_OBJ_FLAG_HIDDEN);
     }
     if (finished)
         playBeep();
@@ -5212,6 +5929,31 @@ void TFTView_320x240::mapdlPump(void)
     for (lv_indev_t *i = lv_indev_get_next(NULL); i; i = lv_indev_get_next(i)) {
         if (lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED)
             return;
+    }
+
+    if (namesStep()) {
+        if (mapdl_screen && lv_screen_active() == mapdl_screen) {
+            char nbuf[64];
+            unsigned at = s_names.got + s_names.had + s_names.none + s_names.failed + 1;
+            if (at > s_names.total)
+                at = s_names.total;
+            const unsigned mb = (unsigned)((s_names.bytes + (s_names.open ? s_names.recv : 0)) / 1048576);
+            if (s_names.listPending || (!s_names.ncells && !s_names.citiesChecked))
+                snprintf(nbuf, sizeof(nbuf), "Getting the list of areas...");
+            else if (s_names.open && s_names.len > 200000) // a big one: show it moving
+                snprintf(nbuf, sizeof(nbuf), "Place names: %u of %u  (%d%%)", at, (unsigned)s_names.total,
+                         (int)(100LL * s_names.recv / s_names.len));
+            else if (mb)
+                snprintf(nbuf, sizeof(nbuf), "Place names: %u of %u  (%u MB)", at, (unsigned)s_names.total, mb);
+            else
+                snprintf(nbuf, sizeof(nbuf), "Place names: %u of %u", at, (unsigned)s_names.total);
+            lv_label_set_text(mapdl_status, nbuf);
+        }
+        return;
+    }
+    if (mapdl_names_mode) { // place names on their own: done when they are
+        mapdlStop(true);
+        return;
     }
 
     uint32_t x0, x1, y0, y1;
@@ -6248,7 +6990,10 @@ lv_obj_t *TFTView_320x240::makePinLabel(const char *name, uint32_t color)
         return nullptr;
     lv_obj_t *l = lv_label_create(markerParent());
     lv_label_set_text(l, name ? name : "");
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
+    // ui_font_montserrat_14, not LVGL's built-in lv_font_montserrat_14: the built-in one is ASCII
+    // only, so "Köln" came out as "Kln" and a node's emoji short name as nothing at all. Ours has
+    // Latin-1, Latin Extended-A, Greek, Cyrillic and the emoji the rest of the UI already shows.
+    lv_obj_set_style_text_font(l, &ui_font_montserrat_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_set_style_bg_color(l, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(l, LV_OPA_60, LV_PART_MAIN);
@@ -6869,6 +7614,11 @@ bool TFTView_320x240::savePins(void)
     // by this build still loads on a build that predates it.
     snprintf(line, sizeof(line), "#nodes|%u\n", showNodesOnUserMap ? 1u : 0u);
     f.print(line);
+    // Where Maps opens with no GPS fix, and the last view it opens at. Same trick as #nodes: a
+    // build that does not know the line skips it.
+    snprintf(line, sizeof(line), "#start|%u|%u|%.5f|%.5f|%u\n", (unsigned)mapsStartMode, mapsLastValid ? 1u : 0u,
+             mapsLastLat, mapsLastLon, (unsigned)mapsLastZoom);
+    f.print(line);
     for (auto &p : mapPins) {
         snprintf(line, sizeof(line), "%u|%.6f|%.6f|%u|%u|%s\n", (unsigned)p.id, p.lat, p.lon, (unsigned)p.color,
                  (unsigned)p.whenEpoch, p.label);
@@ -6924,6 +7674,17 @@ void TFTView_320x240::loadPins(void)
         if (line[0] == '#') {
             if (!strncmp(line, "#nodes|", 7)) {
                 showNodesOnUserMap = (line[7] != '0');
+            } else if (!strncmp(line, "#start|", 7)) {
+                // "#start|mode|valid|lat|lon|zoom"
+                unsigned mode = 0, valid = 0, z = 0;
+                float la = 0, lo = 0;
+                if (sscanf(line + 7, "%u|%u|%f|%f|%u", &mode, &valid, &la, &lo, &z) == 5) {
+                    mapsStartMode = mode ? 1 : 0;
+                    mapsLastValid = valid && z >= 2 && z <= 20 && la >= -85 && la <= 85 && lo >= -180 && lo <= 180;
+                    mapsLastLat = la;
+                    mapsLastLon = lo;
+                    mapsLastZoom = (uint8_t)z;
+                }
             } else if (!strncmp(line, "#retract|", 9)) {
                 // "#retract|wpid|kind|dest|lat|lon|giveup|tries"
                 char *e = line + 9;
@@ -7070,15 +7831,18 @@ void TFTView_320x240::closePinsList(void)
     // never be handed to lv_obj_clean() by a rebuild that arrives after the close.
     pins_list = nullptr;
     pins_search_ta = nullptr;
+    if (places_timer)
+        lv_timer_pause(places_timer); // nothing left to put results in
     if (pins_overlay) {
         lv_obj_delete_async(pins_overlay); // safe to call from within a child's event callback
         pins_overlay = nullptr;
     }
 }
 
-void TFTView_320x240::openPinsList(void)
+void TFTView_320x240::openPinsList(bool search)
 {
     closePinsList();
+    pinsSearchMode = search;
     pins_overlay = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(pins_overlay);
     lv_obj_set_size(pins_overlay, 320, 240);
@@ -7087,7 +7851,7 @@ void TFTView_320x240::openPinsList(void)
     lv_obj_clear_flag(pins_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(pins_overlay);
-    lv_label_set_text(title, "Pins");
+    lv_label_set_text(title, search ? "Find" : "Pins");
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 10);
 
@@ -7137,7 +7901,7 @@ void TFTView_320x240::openPinsList(void)
             nodesBtn,
             [](lv_event_t *) {
                 THIS->setShowNodesOnUserMap(!THIS->showNodesOnUserMap);
-                lv_async_call([](void *) { THIS->openPinsList(); }, nullptr); // rebuild so the label flips
+                lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr); // rebuild so the label flips
             },
             LV_EVENT_CLICKED, NULL);
         lv_obj_t *nl = lv_label_create(nodesBtn);
@@ -7155,7 +7919,7 @@ void TFTView_320x240::openPinsList(void)
     pins_search_ta = lv_textarea_create(pins_overlay);
     lv_textarea_set_one_line(pins_search_ta, true);
     lv_textarea_set_max_length(pins_search_ta, sizeof(pinFilter) - 1);
-    lv_textarea_set_placeholder_text(pins_search_ta, "Find a pin or a node");
+    lv_textarea_set_placeholder_text(pins_search_ta, "Find a town, lake, peak, pin or node");
     lv_textarea_set_text(pins_search_ta, pinFilter); // survives the Nodes toggle rebuilding us
     lv_obj_set_size(pins_search_ta, 304, 34);
     lv_obj_align(pins_search_ta, LV_ALIGN_TOP_MID, 0, 40);
@@ -7180,6 +7944,12 @@ void TFTView_320x240::openPinsList(void)
             // beside it. They are siblings rather than parent and child, so it would probably
             // survive - but "probably" is how this device learned to freeze mid-tap.
             lv_async_call([](void *) { THIS->rebuildPinRows(); }, nullptr);
+            // Places come off the SD card, which takes a moment, so they wait until the typing
+            // pauses. Pins and nodes above still answer every keystroke.
+            if (THIS->places_timer) {
+                lv_timer_reset(THIS->places_timer);
+                lv_timer_resume(THIS->places_timer);
+            }
         },
         LV_EVENT_VALUE_CHANGED, NULL);
     // Focused once, with no re-focusing guard: the guard would fight the trackball every
@@ -7199,6 +7969,23 @@ void TFTView_320x240::openPinsList(void)
     lv_obj_set_flex_flow(pins_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(pins_list, 6, LV_PART_MAIN);
     lv_obj_set_scroll_dir(pins_list, LV_DIR_VER);
+
+    // One timer for the whole session, paused whenever there is nothing to search. Deleting and
+    // recreating it on every open is how a stale pointer gets left behind.
+    if (!places_timer) {
+        places_timer = lv_timer_create(
+            [](lv_timer_t *t) {
+                lv_timer_pause(t);
+                THIS->runPlaceSearch();
+                THIS->rebuildPinRows();
+            },
+            350, NULL); // after typing pauses; a search takes a moment, so not on every key
+    }
+    lv_timer_pause(places_timer);
+    if (pinFilter[0] && strcmp(placeQuery, pinFilter) != 0) { // a kept filter nobody has searched yet
+        lv_timer_reset(places_timer);
+        lv_timer_resume(places_timer);
+    }
 
     rebuildPinRows();
 }
@@ -7317,10 +8104,243 @@ void TFTView_320x240::awayText(double lat, double lon, char *out, size_t n)
         brg += 360.0;
     static const char *kPts[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
     const char *pt = kPts[(int)((brg + 22.5) / 45.0) % 8];
-    if (m < 1609.34)
-        snprintf(out, n, "%d ft %s", (int)(m * 3.28084), pt);
+    char dist[20];
+    fmtDistance(m, dist, sizeof(dist));
+    snprintf(out, n, "%s %s", dist, pt);
+}
+
+// The device's one Units switch - Meshtastic's own config.display.units, the same setting the
+// weather widget's F/C flips. The UI's copy updates the instant it is changed (see the Maps menu).
+bool TFTView_320x240::mapsMetric(void) const
+{
+    return db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC;
+}
+
+void TFTView_320x240::fmtDistance(double m, char *out, size_t n)
+{
+    if (mapsMetric()) {
+        if (m < 1000)
+            snprintf(out, n, "%d m", (int)(m + 0.5));
+        else if (m < 100000)
+            snprintf(out, n, "%.1f km", m / 1000.0);
+        else
+            snprintf(out, n, "%d km", (int)(m / 1000.0 + 0.5));
+    } else {
+        if (m < 1609.34)
+            snprintf(out, n, "%d ft", (int)(m * 3.28084 + 0.5));
+        else if (m < 160934)
+            snprintf(out, n, "%.1f mi", m / 1609.34);
+        else
+            snprintf(out, n, "%d mi", (int)(m / 1609.34 + 0.5));
+    }
+}
+
+// ---- places: the offline place-name search ---------------------------------------------------
+// Jake, 2026-09-30: "How hard would it be to be able to search in cities, lakes, ponds, towns, etc
+// on the TDeck maps?" - then "Do it for all usa", "Same goes for Europe". The data and the search
+// are PlaceNames.cpp; this is the part you see. Searched around the MAP'S CENTRE, not the GPS: you
+// pan to where you are going and ask what is there.
+void TFTView_320x240::runPlaceSearch(void)
+{
+    if (!pins_overlay)
+        return;
+    strncpy(placeQuery, pinFilter, sizeof(placeQuery) - 1);
+    placeQuery[sizeof(placeQuery) - 1] = 0;
+    placeHitCount = 0;
+    memset(&placeInfo, 0, sizeof(placeInfo));
+    if (strlen(pinFilter) < 2 || !sdCard)
+        return; // one letter matches half the world; PlaceNames decides what 2 and 3 letters get
+    if (!placeHits) {
+        placeHits = (PlaceHit *)heap_caps_malloc(sizeof(PlaceHit) * kMaxPlaceHits, MALLOC_CAP_SPIRAM);
+        if (!placeHits)
+            return;
+    }
+    float lat = 0, lon = 0;
+    int32_t gla = 0, glo = 0;
+    if (userMap)
+        userMap->getCenter(lat, lon);
+    else if (tdeck_gps_position(&gla, &glo)) {
+        lat = gla * 1e-7f;
+        lon = glo * 1e-7f;
+    }
+    // 1.5 seconds at most. A normal search takes a fraction of that; the budget is for a card
+    // that is having a slow day, which must never become a frozen screen.
+    placeHitCount = placenames_search(pinFilter, lat, lon, placeHits, kMaxPlaceHits, 1500, &placeInfo);
+    ILOG_INFO("places: %d hits, %u files, %u reads, %lu ms%s", placeHitCount, (unsigned)placeInfo.files,
+              (unsigned)placeInfo.reads, (unsigned long)placeInfo.ms, placeInfo.truncated ? " (time budget hit)" : "");
+}
+
+// One found place: name, what it is and how far, then Pin (keep it) and Go (show me).
+void TFTView_320x240::placeRow(lv_obj_t *list, int idx)
+{
+    const PlaceHit &h = placeHits[idx];
+    lv_obj_t *row = lv_obj_create(list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 302, 40);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x221d12), LV_PART_MAIN); // amber-tinted: a place
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dot = lv_obj_create(row); // the same yellow ring the map draws when you Go to it
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 12, 12);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_border_color(dot, lv_color_hex(0xffd60a), LV_PART_MAIN);
+    lv_obj_set_style_border_width(dot, 3, LV_PART_MAIN);
+    lv_obj_align(dot, LV_ALIGN_LEFT_MID, 8, 0);
+
+    lv_obj_t *nm = lv_label_create(row);
+    lv_label_set_text(nm, h.name);
+    lv_obj_set_style_text_color(nm, lv_color_hex(0xffffff), LV_PART_MAIN);
+    lv_obj_set_width(nm, 176);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    tui_one_line(nm); // LONG_DOT needs a pinned height - see TuiLabel.h
+    lv_obj_align(nm, LV_ALIGN_LEFT_MID, 28, -7);
+
+    // "lake  1.4 mi NE" from where you are when there is a fix, else how far from the map's centre
+    char where[40] = "", sub[64];
+    awayText(h.lat, h.lon, where, sizeof(where));
+    if (!where[0])
+        fmtDistance(h.km * 1000.0, where, sizeof(where));
+    snprintf(sub, sizeof(sub), "%s  %s", placenames_kind_name(h.kind), where);
+    lv_obj_t *sb = lv_label_create(row);
+    lv_label_set_text(sb, sub);
+    lv_obj_set_style_text_font(sb, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sb, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+    lv_obj_set_width(sb, 176);
+    lv_label_set_long_mode(sb, LV_LABEL_LONG_DOT);
+    tui_one_line(sb);
+    lv_obj_align(sb, LV_ALIGN_LEFT_MID, 28, 10);
+
+    lv_obj_t *pin = lv_btn_create(row);
+    lv_obj_set_size(pin, 40, 28);
+    lv_obj_align(pin, LV_ALIGN_RIGHT_MID, -56, 0);
+    lv_obj_set_style_bg_color(pin, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        pin,
+        [](lv_event_t *e) {
+            lv_async_call([](void *ud) { THIS->pinPlace((int)(uintptr_t)ud); }, lv_event_get_user_data(e));
+        },
+        LV_EVENT_CLICKED, (void *)(uintptr_t)idx);
+    lv_obj_t *pl = lv_label_create(pin);
+    lv_label_set_text(pl, "Pin");
+    lv_obj_set_style_text_font(pl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(pl);
+
+    lv_obj_t *go = lv_btn_create(row);
+    lv_obj_set_size(go, 44, 28);
+    lv_obj_align(go, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_add_event_cb(
+        go,
+        [](lv_event_t *e) {
+            // Deferred: Go closes this overlay, and this button is inside it.
+            lv_async_call([](void *ud) { THIS->goToPlace((int)(uintptr_t)ud); }, lv_event_get_user_data(e));
+        },
+        LV_EVENT_CLICKED, (void *)(uintptr_t)idx);
+    lv_obj_t *gl = lv_label_create(go);
+    lv_label_set_text(gl, "Go");
+    lv_obj_set_style_text_font(gl, &ui_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(gl);
+}
+
+void TFTView_320x240::goToPlace(int idx)
+{
+    if (!placeHits || idx < 0 || idx >= placeHitCount)
+        return;
+    const PlaceHit h = placeHits[idx]; // a copy: nothing below may touch the list, but be sure
+    closePinsList();
+    if (!userMap)
+        return;
+    userMap->setZoom(placenames_kind_zoom(h.kind)); // a city seen whole, a spring up close
+    userMap->setScrolledPosition(h.lat, h.lon);
+    updateMapsZoom();
+    setFoundMarker(h.lat, h.lon, h.name);
+}
+
+// Keep a found place as a pin: then it has Share, and it is on the map for good.
+void TFTView_320x240::pinPlace(int idx)
+{
+    if (!placeHits || idx < 0 || idx >= placeHitCount || !userMap)
+        return;
+    const PlaceHit &h = placeHits[idx];
+    MapPin p{};
+    p.id = nextPinId++;
+    p.lat = h.lat;
+    p.lon = h.lon;
+    p.color = kPinColors[p.id % kPinColorCount];
+    p.whenEpoch = (uint32_t)actTime;
+    // The label holds 23 bytes. Cut on a character boundary: half of an "ü" is not a letter, and
+    // LVGL draws it as a box.
+    size_t n = strlen(h.name);
+    if (n > sizeof(p.label) - 1) {
+        n = sizeof(p.label) - 1;
+        while (n > 0 && ((uint8_t)h.name[n] & 0xC0) == 0x80)
+            n--;
+    }
+    memcpy(p.label, h.name, n);
+    p.label[n] = 0;
+    p.marker = makePinMarker(p.color);
+    p.labelObj = makePinLabel(p.label, p.color);
+    mapPins.push_back(p);
+    userMap->add(p.id, p.lat, p.lon, drawPinCB);
+    if (!savePins())
+        mapsShowNotice("Pin SAVE FAILED (SD?)");
+    // Redraw the list, where the new pin now heads the Pins section - that IS the confirmation.
+    lv_async_call([](void *) { THIS->rebuildPinRows(); }, nullptr);
+}
+
+// The yellow ring and name tag on whatever you last searched for. One of them, reused.
+void TFTView_320x240::setFoundMarker(float lat, float lon, const char *name)
+{
+    if (!userMap || !markerParent())
+        return;
+    if (!found_marker) {
+        found_marker = lv_obj_create(markerParent());
+        lv_obj_remove_style_all(found_marker);
+        lv_obj_set_size(found_marker, 20, 20);
+        lv_obj_set_style_radius(found_marker, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(found_marker, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_color(found_marker, lv_color_hex(0xffd60a), LV_PART_MAIN);
+        lv_obj_set_style_border_width(found_marker, 4, LV_PART_MAIN);
+        lv_obj_set_style_outline_color(found_marker, lv_color_hex(0x000000), LV_PART_MAIN); // shows on pale tiles
+        lv_obj_set_style_outline_width(found_marker, 1, LV_PART_MAIN);
+        lv_obj_add_flag(found_marker, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(found_marker, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(found_marker, LV_OBJ_FLAG_CLICKABLE);
+        found_label = makePinLabel(name, 0xffd60a);
+    } else if (found_label) {
+        lv_label_set_text(found_label, name);
+    }
+    if (!drawFoundCB) {
+        drawFoundCB = [this](uint32_t, uint16_t x, uint16_t y, uint8_t zoom) {
+            if (!found_marker)
+                return;
+            if (!x && !y && !zoom) {
+                markerHide(found_marker);
+                markerHide(found_label);
+                return;
+            }
+            markerShow(found_marker, (int16_t)(x - 10), (int16_t)(y - 10), foundLastX, foundLastY);
+            if (found_label)
+                markerShow(found_label, (int16_t)(x + 13), (int16_t)(y - 9), foundLastLX, foundLastLY);
+        };
+    }
+    if (foundActive)
+        userMap->update(kFoundMarkerId, lat, lon);
     else
-        snprintf(out, n, "%.1f mi %s", m / 1609.34, pt);
+        userMap->add(kFoundMarkerId, lat, lon, drawFoundCB);
+    foundActive = true;
+    userMap->forceRedraw(true);
+}
+
+void TFTView_320x240::clearFoundMarker(void)
+{
+    if (foundActive && userMap)
+        userMap->remove(kFoundMarkerId);
+    foundActive = false;
+    markerHide(found_marker);
+    markerHide(found_label);
 }
 
 // The results. Split out of openPinsList so a keystroke redraws the list WITHOUT tearing down
@@ -7346,7 +8366,7 @@ void TFTView_320x240::rebuildPinRows(void)
 
     if (mapPins.empty() && !filtering) {
         lv_obj_t *empty = lv_label_create(list);
-        lv_label_set_text(empty, "No pins yet.\nTap Add pin, then tap the map.\n\nThe box above also finds your nodes.");
+        lv_label_set_text(empty, "No pins yet.\nTap Add pin, then tap the map.\n\nThe box above finds towns, lakes, peaks\nand your nodes too.");
         lv_obj_set_style_text_color(empty, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         return;
     }
@@ -7479,7 +8499,7 @@ void TFTView_320x240::rebuildPinRows(void)
             [](lv_event_t *e) {
                 uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
                 THIS->deletePin(id);
-                lv_async_call([](void *) { THIS->openPinsList(); }, nullptr); // rebuild after this event
+                lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr); // rebuild after this event
             },
             LV_EVENT_CLICKED, (void *)(uintptr_t)p.id);
         lv_obj_t *dl = lv_label_create(del);
@@ -7536,11 +8556,9 @@ void TFTView_320x240::rebuildPinRows(void)
                 brg += 360.0;
             static const char *kPts[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
             const char *pt = kPts[(int)((brg + 22.5) / 45.0) % 8];
-            char away[32];
-            if (m < 1609.34)
-                snprintf(away, sizeof(away), "   %d ft %s", (int)(m * 3.28084), pt);
-            else
-                snprintf(away, sizeof(away), "   %.1f mi %s", m / 1609.34, pt);
+            char dist[20], away[32];
+            fmtDistance(m, dist, sizeof(dist));
+            snprintf(away, sizeof(away), "   %s %s", dist, pt);
             strncat(coords, away, sizeof(coords) - strlen(coords) - 1);
         }
         lv_obj_t *co = lv_label_create(row);
@@ -7551,6 +8569,37 @@ void TFTView_320x240::rebuildPinRows(void)
         lv_label_set_long_mode(co, LV_LABEL_LONG_DOT);
         tui_one_line(co); // LONG_DOT needs a pinned height - see TuiLabel.h
         lv_obj_align(co, LV_ALIGN_TOP_LEFT, 10, 54);
+    }
+
+    // ---- places: from the card - above the nodes, since this is mostly what the box is for now ----
+    // Two groups, in whichever order PlaceNames decided (placenames_search): Cities are world-wide
+    // suggestions, biggest first ("san" -> San Jose, San Francisco, San Diego - Jake, 2026-09-30),
+    // and Nearby is everything around the map's centre. The hits arrive already in display order.
+    int shownPlaces = 0;
+    bool placesPending = false;
+    if (filtering && strlen(pinFilter) >= 2) {
+        if (strcmp(placeQuery, pinFilter) != 0) {
+            placesPending = true; // the timer searches once the typing pauses
+            pinsSectionHeader(list, "Places  (searching...)");
+        } else if (placeHitCount > 0 && placeHits) {
+            int lastGroup = -1;
+            for (int i = 0; i < placeHitCount; i++) {
+                if (placeHits[i].group != lastGroup) {
+                    lastGroup = placeHits[i].group;
+                    if (lastGroup)
+                        pinsSectionHeader(list, "Cities");
+                    else
+                        pinsSectionHeader(list, placeInfo.truncated ? "Nearby  (nearest found so far)" : "Nearby");
+                }
+                placeRow(list, i);
+            }
+            shownPlaces = placeHitCount;
+            // GeoNames is CC BY: credit it wherever its names are shown. USGS asks for the same.
+            lv_obj_t *cr = lv_label_create(list);
+            lv_label_set_text(cr, "Place names: USGS GNIS, GeoNames (CC BY 4.0)");
+            lv_obj_set_style_text_font(cr, &ui_font_montserrat_12, LV_PART_MAIN);
+            lv_obj_set_style_text_color(cr, lv_color_hex(0x5a5a5e), LV_PART_MAIN);
+        }
     }
 
     // ---- nodes, but only while searching -------------------------------------------------
@@ -7585,21 +8634,31 @@ void TFTView_320x240::rebuildPinRows(void)
         }
     }
 
-    if (filtering && shownPins == 0 && shownNodes == 0) {
-        lv_obj_t *none = lv_label_create(list);
-        char msg[96];
-        snprintf(msg, sizeof(msg), "Nothing called \"%s\".\n\nPins and nodes only - map tiles are\npictures, with no names in them.",
-                 pinFilter);
-        lv_label_set_text(none, msg);
-        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
-        lv_obj_set_style_text_font(none, &ui_font_montserrat_12, LV_PART_MAIN);
-    } else if (moreNodes) {
+    if (moreNodes) {
         lv_obj_t *more = lv_label_create(list);
         char msg[48];
         snprintf(msg, sizeof(msg), "and %d more node%s - type a bit more", moreNodes, moreNodes == 1 ? "" : "s");
         lv_label_set_text(more, msg);
         lv_obj_set_style_text_color(more, lv_color_hex(0x8e8e93), LV_PART_MAIN);
         lv_obj_set_style_text_font(more, &ui_font_montserrat_12, LV_PART_MAIN);
+    }
+
+    if (filtering && !shownPins && !shownNodes && !shownPlaces && !placesPending) {
+        // Say WHY nothing came back - "no results" alone cannot tell a typo from a card with no
+        // place names on it, and those need opposite things from you.
+        char msg[200];
+        if (strlen(pinFilter) < 2)
+            snprintf(msg, sizeof(msg), "No pin or node called \"%s\".\nType 2 letters or more to search\ntowns, lakes and peaks too.", pinFilter);
+        else if (!placeInfo.files)
+            snprintf(msg, sizeof(msg), "Nothing called \"%s\".\n\nNo place names on this card yet:\nGear > Place names for search.", pinFilter);
+        else if (!placeInfo.haveHere && strlen(pinFilter) >= 3)
+            snprintf(msg, sizeof(msg), "Nothing called \"%s\" nearby.\n\nThis area's names are not on the\ncard: Gear > Place names for search.", pinFilter);
+        else
+            snprintf(msg, sizeof(msg), "Nothing called \"%s\" near here.\nSearches look around the map's\ncentre - pan there first.", pinFilter);
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, msg);
+        lv_obj_set_style_text_color(none, lv_color_hex(0x8e8e93), LV_PART_MAIN);
+        lv_obj_set_style_text_font(none, &ui_font_montserrat_12, LV_PART_MAIN);
     }
 
     // Deleting a shared pin still leaves us asking the mesh to drop their copies, and that has no
@@ -7667,7 +8726,7 @@ void TFTView_320x240::openSharePicker(uint32_t id)
         closeBtn,
         [](lv_event_t *) {
             THIS->closeSharePicker();
-            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+            lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr);
         },
         LV_EVENT_CLICKED, NULL);
     lv_obj_t *cl = lv_label_create(closeBtn);
@@ -7844,7 +8903,7 @@ void TFTView_320x240::openPinConfirm(uint32_t id, uint8_t kind, uint32_t dest)
             else
                 THIS->sharePin(id, kind, dest);
             THIS->closeSharePicker(); // no-op when the unshare came from the pins list
-            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+            lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr);
         },
         LV_EVENT_CLICKED, NULL);
     lv_obj_t *okl = lv_label_create(ok);
@@ -8031,7 +9090,7 @@ void TFTView_320x240::openRenamePin(uint32_t id)
         [](lv_event_t *) {
             THIS->renamePin(THIS->renaming_pin_id, lv_textarea_get_text(THIS->rename_ta));
             THIS->closeRenamePin();
-            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+            lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr);
         },
         LV_EVENT_READY, NULL);
 
@@ -8046,7 +9105,7 @@ void TFTView_320x240::openRenamePin(uint32_t id)
         [](lv_event_t *) {
             THIS->renamePin(THIS->renaming_pin_id, lv_textarea_get_text(THIS->rename_ta));
             THIS->closeRenamePin();
-            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+            lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr);
         },
         LV_EVENT_CLICKED, NULL);
 
@@ -8061,7 +9120,7 @@ void TFTView_320x240::openRenamePin(uint32_t id)
         cxBtn,
         [](lv_event_t *) {
             THIS->closeRenamePin();
-            lv_async_call([](void *) { THIS->openPinsList(); }, nullptr);
+            lv_async_call([](void *) { THIS->openPinsList(THIS->pinsSearchMode); }, nullptr);
         },
         LV_EVENT_CLICKED, NULL);
 
@@ -10041,6 +11100,28 @@ void TFTView_320x240::remoteService(void)
         if (scr)
             lv_obj_scroll_to_y(scr, x, LV_ANIM_OFF);
         snprintf(buf, sizeof(buf), "scroll %d", x);
+        tdeck_remote_reply(buf);
+        break;
+    }
+    case 16: { // @@place <words>: the offline place search, timed on the real card
+        static PlaceHit hits[4];
+        PlaceSearchInfo inf;
+        float lat = 0, lon = 0;
+        int32_t gla = 0, glo = 0;
+        if (THIS->userMap)
+            THIS->userMap->getCenter(lat, lon);
+        else if (tdeck_gps_position(&gla, &glo)) {
+            lat = gla * 1e-7f;
+            lon = glo * 1e-7f;
+        }
+        const int n = placenames_search(tdeck_remote_arg(), lat, lon, hits, 4, 1500, &inf);
+        // Names and distances only - never a coordinate (the map centre is often home).
+        int w = snprintf(buf, sizeof(buf), "place n=%d files=%u reads=%u ms=%lu%s here=%d cities=%d:", n,
+                         (unsigned)inf.files, (unsigned)inf.reads, (unsigned long)inf.ms, inf.truncated ? " TRUNC" : "",
+                         (int)inf.haveHere, (int)inf.haveCities);
+        for (int i = 0; i < n && w > 0 && w < (int)sizeof(buf) - 8; i++)
+            w += snprintf(buf + w, sizeof(buf) - w, " %.18s/%s/%.0fkm", hits[i].name, placenames_kind_name(hits[i].kind),
+                          hits[i].km);
         tdeck_remote_reply(buf);
         break;
     }

@@ -15,6 +15,7 @@
 #if HAS_WIFI
 #include "NodeDB.h" // the global `config`
 #include <WiFi.h>
+#include <esp_wifi.h> // esp_wifi_set_ps
 #endif
 
 // 0 = off / not configured, 1 = enabled but not yet connected, 2 = connected
@@ -102,6 +103,13 @@ extern "C" bool tdeck_wifi_connect_now(const char *ssid, const char *psk)
     if (!ssid || ssid[0] == 0)
         return false;
     WiFi.mode(WIFI_STA);
+    // Radio power saving OFF while we are on, as Meshtastic's own Wi-Fi path does ("needed to
+    // improve performance", WiFiAPClient.cpp). Left on, the radio dozes between beacons and every
+    // reply waits for it: place names came down at ~4KB/s (measured 2026-09-30). Wi-Fi here is only
+    // ever on for a download, and tdeck_wifi_disconnect_now() turns the radio off afterwards. ESP-IDF
+    // refuses this while Bluetooth is on (coexistence needs modem sleep), hence the log line.
+    const esp_err_t ps = esp_wifi_set_ps(WIFI_PS_NONE);
+    LOG_INFO("wifi on demand: power save off -> %s", esp_err_to_name(ps));
     WiFi.begin(ssid, psk ? psk : "");
     return true;
 #else

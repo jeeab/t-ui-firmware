@@ -71,6 +71,7 @@ static bool s_armed = false; // saw '@' '@' at the start of a line
 static volatile int s_cmd = 0; // 0 none, 1 tap, 2 home, 3 back, 4 shot, 5 info, 6 ping
 static volatile int s_x = 0, s_y = 0;
 static volatile int s_x2 = 0, s_y2 = 0; // swipe end point
+static char s_arg[48];                   // text argument (@@place <query>), copied before queuing
 
 extern "C" void tdeck_shot_stream_begin(void); // src/TDeckScreenshot.cpp
 
@@ -199,6 +200,16 @@ extern "C" void tdeck_remote_feed(uint8_t c)
                              (int)tdeck_coverage_enabled(), tdeck_coverage_count(), (long)(any ? la : 0),
                              (long)(any ? lo : 0), any ? q / 4.0f : 0.0f, any ? rs : 0, any ? n : 0);
                 }
+            } else if (!strncmp(s_line, "place", 5)) {
+                // @@place <words> - search the offline place names from the map's centre and
+                // report timing plus the first few hits. Place names are public data; this never
+                // prints a coordinate, only names and distances.
+                const char *a = s_line + 5;
+                while (*a == ' ')
+                    a++;
+                strncpy(s_arg, a, sizeof(s_arg) - 1);
+                s_arg[sizeof(s_arg) - 1] = 0;
+                s_cmd = 16; // SD + LVGL: run on the UI task
             } else if (!strncmp(s_line, "gem", 3)) {
                 // @@gem [prompt]  - ask Gemini HEADLESSLY, no screen and no unlock needed.
                 // @@gem           - with no prompt, just report where the last ask got to.
@@ -375,6 +386,12 @@ extern "C" void tdeck_remote_feed(uint8_t c)
     }
     if (s_len < kMaxLine - 1)
         s_line[s_len++] = (char)c;
+}
+
+// The text that came with the last command (@@place), for the UI task to read.
+extern "C" const char *tdeck_remote_arg(void)
+{
+    return s_arg;
 }
 
 // Called by the UI poll timer on the tft task. Returns the pending command (and clears

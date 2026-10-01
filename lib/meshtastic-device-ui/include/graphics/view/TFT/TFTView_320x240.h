@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graphics/common/MeshtasticView.h"
+#include "graphics/map/PlaceNames.h" // PlaceHit: offline place-name search on the Maps app
 #include "meshtastic/clientonly.pb.h"
 #include <set>
 
@@ -252,7 +253,7 @@ class TFTView_320x240 : public MeshtasticView
     void drawAllPins(void);
     void loadPins(void);
     bool savePins(void); // returns false if the SD write failed (surfaced on-screen)
-    void openPinsList(void);
+    void openPinsList(bool search = false); // search = opened from the magnifier: titled "Search"
     void rebuildPinRows(void);               // just the results, so typing does not kill the box
     void pinsNodeRow(lv_obj_t *list, uint32_t num, const char *name, int32_t latI, int32_t lonI);
     void pinsSectionHeader(lv_obj_t *list, const char *text);
@@ -263,6 +264,38 @@ class TFTView_320x240 : public MeshtasticView
     char pinFilter[24] = "";                  // outlives a rebuild, so the Nodes toggle is safe
     void closePinsList(void);
     void deletePin(uint32_t id);
+
+    // ---- Maps app: offline place-name search (towns, lakes, peaks...) - see PlaceNames.h ----
+    bool pinsSearchMode = false;        // the overlay was opened from the magnifier
+    lv_timer_t *places_timer = nullptr; // searches the card once typing pauses (paused otherwise)
+    static const int kMaxPlaceHits = 13; // 9 Nearby + 4 Cities (PlaceNames.cpp)
+    PlaceHit *placeHits = nullptr;      // kMaxPlaceHits of them, in PSRAM, kept for the session
+    int placeHitCount = 0;
+    char placeQuery[24] = "";           // the text placeHits answers ("" = nothing searched yet)
+    PlaceSearchInfo placeInfo{};
+    void runPlaceSearch(void);
+    void placeRow(lv_obj_t *list, int idx);
+    void goToPlace(int idx);
+    void pinPlace(int idx);
+    // The ring + name marking what you searched for, until the next search replaces it.
+    static constexpr uint32_t kFoundMarkerId = 0xEFFFFFF0; // below the node markers' range
+    lv_obj_t *found_marker = nullptr;
+    lv_obj_t *found_label = nullptr;
+    int16_t foundLastX = 0, foundLastY = 0, foundLastLX = 0, foundLastLY = 0;
+    bool foundActive = false;
+    std::function<void(uint32_t, uint16_t, uint16_t, uint8_t)> drawFoundCB;
+    void setFoundMarker(float lat, float lon, const char *name);
+    void clearFoundMarker(void);
+    lv_obj_t *maps_search_btn = nullptr; // the magnifier, bottom-right beside the cog
+    // Units: the device-wide Meshtastic setting (the weather widget's F/C is the same switch).
+    bool mapsMetric(void) const;
+    void fmtDistance(double meters, char *out, size_t n); // "1.4 mi" / "320 ft", or "2.3 km" / "450 m"
+    // Where Maps opens with no GPS fix: 0 = the last place you looked at, 1 = home.
+    uint8_t mapsStartMode = 0;
+    bool mapsLastValid = false;
+    float mapsLastLat = 0, mapsLastLon = 0;
+    uint8_t mapsLastZoom = 0;
+    void mapsRememberView(void); // on leaving Maps: note where it was, save if it moved
 
     // ---- Maps app: sharing a pin over the mesh ----
     void sharePin(uint32_t id, uint8_t kind, uint32_t dest); // send it, remember who to
@@ -478,7 +511,10 @@ class TFTView_320x240 : public MeshtasticView
     lv_obj_t *maps_notice = nullptr;        // the transient message label
     uint32_t maps_notice_until = 0;         // lv_tick deadline to hide it (0 = hidden)
     // Maps: style picker (gear cog) + USGS region downloader
-    void openMapsMenu(void);                    // gear -> style list + "Download this area"
+    void openMapsMenu(void);                    // gear -> map settings
+    void openMapsStyleMenu(void);               // gear -> Map style -> one row per style on the card
+    lv_obj_t *mapsMenuShell(const char *title); // the empty overlay both of those fill
+    void mapsMenuReopen(void);                  // close + rebuild after this click, so a switch shows its new value
     void closeMapsMenu(void);
     void mapsApplyStyle(const char *style, bool persist); // set style + per-style .format/.url wiring
     lv_obj_t *maps_gear_btn = nullptr;
@@ -523,6 +559,14 @@ class TFTView_320x240 : public MeshtasticView
     bool getapps_loaded = false;   // catalog fetched (or failed) this visit
 
     void mapdlUpdateEstimate(void);
+    // What the download screen fetches. Jake, 2026-09-30: "somebody already has maps, updates the
+    // TDeck. How do they get the search names on their device?" - so names can come on their own.
+    uint8_t mapdl_names_mode = 0; // 0 = this map area + its place names; 1 = names near the map;
+                                  // 2 = names for all of the USA; 3 = all of Europe
+    lv_obj_t *mapdl_title = nullptr;
+    lv_obj_t *mapdl_opt_lbls[3] = {nullptr, nullptr, nullptr}; // "Source:", "Detail:", "to"
+    void mapdlShowMode(void);  // title, which controls show, and the before-you-start text
+    void openNamesMenu(void);  // gear -> Place names for search -> near the map / USA / Europe
     void mapdlStart(void);
     void mapdlStop(bool finished);
     void mapdlPump(void);                       // one WiFi/fetch step per timer tick (UI task = SD-safe)
